@@ -1,0 +1,15 @@
+.env
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+secrets/.env.local
+secrets/*.env
+data/projects/*
+data/assets/*
+data/temp/*
+data/exports/*
+!.gitkeep
+db/**/*.sqlite

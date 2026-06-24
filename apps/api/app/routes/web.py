@@ -1,0 +1,1640 @@
+from html import escape
+from pathlib import Path
+import re
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+from fastapi import APIRouter, Depends, Form, HTTPException
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.concurrency import run_in_threadpool
+
+from app.deps import settings_dep
+from pipeline.adapters.llm.lava_settings import get_llm_brain_status
+from pipeline.models.asset_manifest import RightsStatus
+from pipeline.models.production_artifact import ProductionArtifact
+from pipeline.models.review import DecisionLogEntry, ReviewStatus
+from pipeline.models.transcript import TranscriptFormat
+from pipeline.settings import Settings
+from pipeline.stages.compliance_checker import check_compliance
+from pipeline.stages.run_mvp import run_mvp_pipeline
+from pipeline.stages.transcript_importer import import_transcript
+from pipeline.utils.files import read_json_model, write_json, ensure_project_dir
+from pipeline.stages.llm_executors import run_topic_research, run_script_outline, run_packaging
+from pipeline.stages.script_splitter import split_script_into_shorts
+from pipeline.models.metrics import MetricsDecision, ScaleDecision
+
+router = APIRouter(include_in_schema=False)
+
+
+class WebException(Exception):
+    def __init__(self, detail: str, status_code: int = 400, back_link: str = "/"):
+        self.detail = detail
+        self.status_code = status_code
+        self.back_link = back_link
+
+
+def error_page(title: str, message: str, back_link: str = "/", status_code: int = 400) -> HTMLResponse:
+    return HTMLResponse(
+        content=page(
+            title=title,
+            body=f"""
+            <section class="app-shell">
+              <header class="topbar">
+                <div>
+                  <p class="eyebrow" style="color: var(--danger);">System Error</p>
+                  <h1>{escape(title)}</h1>
+                </div>
+              </header>
+              <section class="panel" style="border-color: var(--danger); padding: 24px;">
+                <p style="font-size: 16px; margin-bottom: 20px; line-height: 1.6;">{escape(message)}</p>
+                <a class="button-link primary" href="{escape(back_link)}">Go Back</a>
+              </section>
+            </section>
+            """
+        ),
+        status_code=status_code
+    )
+
+
+PROJECT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+ALLOWED_FILES = {
+    "production_artifact.json",
+    "cue_ledger.json",
+    "asset_manifest.json",
+    "compliance_report.json",
+    "subtitles.srt",
+    "upload_package.md",
+    "preview.mp4",
+    "transcript_import.json",
+    "visual_contract.json",
+    "visual_qc_report.json",
+}
+
+STEPS = [
+    ("cues", "Cues"),
+    ("assets", "Assets"),
+    ("preview", "Preview"),
+    ("approved", "Approved"),
+]
+
+SAMPLE_SCRIPT = """<VISUAL_BREAK: clean workflow diagram>
+Start with a reviewed script and turn it into a cue ledger.
+<BROLL: editing timeline and analytics dashboard>
+Then create an asset manifest, subtitles, a preview, and an upload package.
+<RISK_DISCLOSURE: no guaranteed revenue>
+Human review remains the final gate before publishing."""
+
+
+@router.get("/", response_class=HTMLResponse)
+def home(settings: Settings = Depends(settings_dep)) -> str:
+    projects = list_projects(settings)
+    rows = "\n".join(project_row(item) for item in projects)
+    if not rows:
+        rows = '<tr><td colspan="5" class="muted empty">No projects yet</td></tr>'
+
+    total_assets = sum(len(p.asset_manifest.assets) for p in projects if p.asset_manifest)
+    approved_assets = sum(
+        1
+        for p in projects
+        if p.asset_manifest
+        for asset in p.asset_manifest.assets
+        if asset.rights_status == RightsStatus.APPROVED
+    )
+    ready_count = sum(1 for p in projects if p.compliance_report and p.compliance_report.upload_ready)
+
+    return page(
+        title="Video Pipeline",
+        body=f"""
+        <section class="app-shell">
+          <header class="topbar">
+            <div>
+              <p class="eyebrow">Local production desk</p>
+              <h1>Video Pipeline</h1>
+            </div>
+            <a class="ghost-button" href="/docs">API Docs</a>
+          </header>
+
+          <section class="overview-grid">
+            {stat_card("Projects", str(len(projects)), "built locally")}
+            {stat_card("Upload Ready", str(ready_count), "final approved")}
+            {stat_card("Asset Rights", f"{approved_assets}/{total_assets}", "approved")}
+          </section>
+
+          <section class="workspace">
+            <div class="create-pane">
+              <div class="section-head">
+                <h2>New Project</h2>
+                <span class="pill">CPU-first</span>
+              </div>
+              <form action="/" method="post" class="project-form">
+                <div class="field">
+                  <label for="project-title">Title</label>
+                  <input id="project-title" name="title" required value="CPU First Video Pipeline MVP" />
+                </div>
+                <div class="split">
+                  <div class="field">
+                    <label for="project-language">Language</label>
+                    <input id="project-language" name="language" value="en" />
+                  </div>
+                  <div class="field">
+                    <label for="project-persona">Persona</label>
+                    <input id="project-persona" name="persona" value="operator" />
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="project-script">Script</label>
+                  <textarea id="project-script" name="script_markdown" required>{escape(SAMPLE_SCRIPT)}</textarea>
+                </div>
+                <button type="submit" class="primary">Build Project</button>
+              </form>
+              <div class="section-head" style="margin-top: 25px; border-top: 1px solid var(--line); padding-top: 20px;">
+                <h2>AI Niche Research</h2>
+                <span class="pill">LAVA Brain</span>
+              </div>
+              <form action="/projects/trend-research" method="post" class="project-form">
+                <div class="field">
+                  <label for="research-topic">Keyword / Topic</label>
+                  <input id="research-topic" name="topic_prompt" required value="AI SaaS变现" />
+                </div>
+                <button type="submit" class="primary">Research Trends</button>
+              </form>
+            </div>
+            <div class="list-pane">
+              <div class="section-head">
+                <h2>Recent Projects</h2>
+                <span class="muted">{len(projects)} total</span>
+              </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Project</th>
+                    <th>Title</th>
+                    <th>Cues</th>
+                    <th>Status</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>{rows}</tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+        """,
+    )
+
+
+@router.post("/")
+async def create_project_from_form(
+    title: str = Form(...),
+    script_markdown: str = Form(...),
+    language: str = Form("en"),
+    persona: str = Form(""),
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    title_stripped = title.strip() if title else ""
+    script_stripped = script_markdown.strip() if script_markdown else ""
+    if not title_stripped:
+        raise WebException(detail="Project title cannot be empty", status_code=400)
+    if not script_stripped:
+        raise WebException(detail="Script content cannot be empty", status_code=400)
+
+    try:
+        artifact = await run_mvp_pipeline(
+            settings=settings,
+            title=title_stripped,
+            script_markdown=script_stripped,
+            language=language,
+            persona=persona or None,
+        )
+    except Exception as e:
+        logger.error(f"Failed to create project: {e}")
+        raise WebException(detail=f"Failed to run pipeline: {str(e)}", status_code=500)
+
+    artifact.decision_log.append(
+        DecisionLogEntry(
+            action="project_created",
+            note="Pipeline artifacts generated from the web console.",
+            to_status=artifact.review_status,
+        )
+    )
+    artifact.compliance_report = check_compliance(artifact)
+    await run_in_threadpool(save_project, settings, artifact)
+    return RedirectResponse(url=f"/projects/{artifact.project_id}/view", status_code=303)
+
+
+@router.get("/projects/{project_id}/view", response_class=HTMLResponse)
+def project_detail(project_id: str, settings: Settings = Depends(settings_dep)) -> str:
+    artifact = load_project(settings, project_id)
+    asset_count = len(artifact.asset_manifest.assets) if artifact.asset_manifest else 0
+    approved_asset_count = approved_assets_count(artifact)
+    cue_count = len(artifact.cue_ledger.cues) if artifact.cue_ledger else 0
+    upload_ready = bool(artifact.compliance_report and artifact.compliance_report.upload_ready)
+
+    preview = preview_panel(settings, artifact)
+    cue_strip = cue_strip_panel(artifact)
+    cue_rows = "\n".join(cue_row(cue) for cue in (artifact.cue_ledger.cues if artifact.cue_ledger else []))
+    if not cue_rows:
+        cue_rows = '<tr><td colspan="5" class="muted empty">No cues</td></tr>'
+
+    return page(
+        title=artifact.title,
+        body=f"""
+        <section class="app-shell detail-page">
+          <header class="project-hero">
+            <div>
+              <a class="text-link" href="/">Back to Projects</a>
+              <h1>{escape(artifact.title)}</h1>
+              <p class="muted mono">{escape(project_id)} | {escape(artifact.language)} | {escape(artifact.persona or "no persona")}</p>
+            </div>
+            <div class="actions">
+              {file_link(project_id, "upload_package.md", "Upload Package")}
+              {file_link(project_id, "subtitles.srt", "Subtitles")}
+              {file_link(project_id, "production_artifact.json", "Artifact JSON")}
+            </div>
+          </header>
+
+          {stepper(artifact.review_status)}
+
+          <section class="overview-grid">
+            {stat_card("Cues", str(cue_count), "timeline units")}
+            {stat_card("Asset Rights", f"{approved_asset_count}/{asset_count}", "approved")}
+            {stat_card("Review State", status_label(artifact.review_status), "current gate")}
+            {stat_card("Upload Ready", "Yes" if upload_ready else "No", "hard stop/go")}
+          </section>
+
+          <section class="review-layout">
+            <main class="main-col">
+              {preview}
+              {transcript_panel(artifact)}
+              {cue_strip}
+              {visual_quality_panel(artifact)}
+              <section class="panel">
+                <div class="section-head">
+                  <h2>Cue Ledger</h2>
+                  {file_link(project_id, "cue_ledger.json", "Download JSON")}
+                </div>
+                <table>
+                  <thead><tr><th>Cue</th><th>Time</th><th>Voice</th><th>Visual</th><th>Short</th></tr></thead>
+                  <tbody>{cue_rows}</tbody>
+                </table>
+              </section>
+            </main>
+            <aside class="side-col">
+              {llm_brain_panel(project_id)}
+              {review_panel(artifact)}
+              {packaging_panel(artifact)}
+              {shorts_panel(artifact)}
+              {metrics_panel(artifact)}
+              {asset_panel(artifact)}
+              {compliance_panel(artifact)}
+              {decision_log_panel(artifact)}
+            </aside>
+          </section>
+        </section>
+        """,
+    )
+
+
+@router.post("/projects/{project_id}/transcript/import")
+async def import_project_transcript(
+    project_id: str,
+    transcript_format: TranscriptFormat = Form(TranscriptFormat.AUTO),
+    transcript_content: str = Form(...),
+    source_name: str = Form("paste"),
+    actor: str = Form("local"),
+    note: str = Form(""),
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    artifact = await run_in_threadpool(load_project, settings, project_id)
+    try:
+        artifact = await import_transcript(
+            settings=settings,
+            artifact=artifact,
+            transcript_format=transcript_format,
+            content=transcript_content,
+            source_name=source_name or "paste",
+            actor=actor or "local",
+            note=note or None,
+        )
+    except Exception as error:
+        artifact.decision_log.append(
+            DecisionLogEntry(
+                action="transcript_import_failed",
+                actor=actor or "local",
+                note=str(error)[:300],
+                from_status=artifact.review_status,
+                to_status=artifact.review_status,
+            )
+        )
+        artifact.touch()
+    await run_in_threadpool(save_project, settings, artifact)
+    return RedirectResponse(url=f"/projects/{project_id}/view#transcript", status_code=303)
+
+
+@router.post("/projects/{project_id}/lava/run")
+def trigger_lava_workflow(
+    project_id: str,
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    artifact = load_project(settings, project_id)
+    
+    # Send non-blocking task to Celery worker
+    from celery import Celery
+    celery_app = Celery("video_pipeline", broker=settings.celery_broker_url)
+    celery_app.send_task("video_pipeline.run_lava_workflow", args=[project_id])
+    
+    artifact.decision_log.append(
+        DecisionLogEntry(
+            action="lava_workflow_triggered",
+            actor="local",
+            note="Triggered LAVA workflow (Bible + Storyboard + TTS + ASR + Image Gen) via Web UI."
+        )
+    )
+    artifact.touch()
+    save_project(settings, artifact)
+    return RedirectResponse(url=f"/projects/{project_id}/view", status_code=303)
+
+
+@router.post("/projects/{project_id}/review/{action}")
+def review_action(
+    project_id: str,
+    action: str,
+    actor: str = Form("local"),
+    note: str = Form(""),
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    artifact = load_project(settings, project_id)
+    from_status = artifact.review_status
+    to_status = next_status_for_action(artifact, action)
+    artifact.review_status = to_status
+    artifact.decision_log.append(
+        DecisionLogEntry(
+            action=action,
+            actor=actor or "local",
+            note=note or None,
+            from_status=from_status,
+            to_status=to_status,
+        )
+    )
+    artifact.compliance_report = check_compliance(artifact)
+    artifact.touch()
+    save_project(settings, artifact)
+    return RedirectResponse(url=f"/projects/{project_id}/view", status_code=303)
+
+
+@router.post("/projects/{project_id}/assets/{asset_id}/rights")
+def update_asset_rights(
+    project_id: str,
+    asset_id: str,
+    rights_status: RightsStatus = Form(...),
+    actor: str = Form("local"),
+    note: str = Form(""),
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    artifact = load_project(settings, project_id)
+    if artifact.asset_manifest is None:
+        raise WebException(detail="Asset manifest not found", status_code=404, back_link=f"/projects/{project_id}/view")
+
+    asset = next((item for item in artifact.asset_manifest.assets if item.asset_id == asset_id), None)
+    if asset is None:
+        raise WebException(detail="Asset not found", status_code=404, back_link=f"/projects/{project_id}/view")
+
+    previous = asset.rights_status
+    asset.rights_status = rights_status
+    if note:
+        asset.notes = note
+    artifact.decision_log.append(
+        DecisionLogEntry(
+            action="asset_rights_updated",
+            actor=actor or "local",
+            note=f"{asset_id}: {previous} -> {rights_status}" + (f"; {note}" if note else ""),
+            from_status=artifact.review_status,
+            to_status=artifact.review_status,
+        )
+    )
+    artifact.compliance_report = check_compliance(artifact)
+    artifact.touch()
+    save_project(settings, artifact)
+    return RedirectResponse(url=f"/projects/{project_id}/view#assets", status_code=303)
+
+
+@router.get("/projects/{project_id}/files/{filename}")
+def project_file(project_id: str, filename: str, settings: Settings = Depends(settings_dep)) -> FileResponse:
+    if filename not in ALLOWED_FILES:
+        raise WebException(detail="File not found", status_code=404, back_link=f"/projects/{project_id}/view")
+    path = project_file_path(settings, project_id, filename)
+    if not path.exists() or not path.is_file():
+        raise WebException(detail="File not found", status_code=404, back_link=f"/projects/{project_id}/view")
+    return FileResponse(path)
+
+
+def next_status_for_action(artifact: ProductionArtifact, action: str) -> ReviewStatus:
+    current = artifact.review_status
+    if action == "approve_cues":
+        if current not in {ReviewStatus.CUES_READY, ReviewStatus.CHANGES_REQUESTED}:
+            raise WebException(detail="Cues are not ready for approval", status_code=400, back_link=f"/projects/{artifact.project_id}/view")
+        return ReviewStatus.ASSETS_REVIEW
+
+    if action == "approve_assets":
+        if current != ReviewStatus.ASSETS_REVIEW:
+            raise WebException(detail="Asset review is not the current stage", status_code=400, back_link=f"/projects/{artifact.project_id}/view")
+        if not all_assets_approved(artifact):
+            raise WebException(detail="All assets must be approved first", status_code=400, back_link=f"/projects/{artifact.project_id}/view")
+        return ReviewStatus.PREVIEW_READY
+
+    if action == "approve_final":
+        if current != ReviewStatus.PREVIEW_READY:
+            raise WebException(detail="Preview is not ready for final approval", status_code=400, back_link=f"/projects/{artifact.project_id}/view")
+        if not all_assets_approved(artifact):
+            raise WebException(detail="All assets must be approved first", status_code=400, back_link=f"/projects/{artifact.project_id}/view")
+        return ReviewStatus.APPROVED
+
+    if action == "request_changes":
+        return ReviewStatus.CHANGES_REQUESTED
+
+    raise WebException(detail="Unknown review action", status_code=404, back_link=f"/projects/{artifact.project_id}/view")
+
+
+def list_projects(settings: Settings) -> list[ProductionArtifact]:
+    projects_dir = Path(settings.data_dir) / "projects"
+    if not projects_dir.exists():
+        return []
+
+    artifacts: list[ProductionArtifact] = []
+    for artifact_path in projects_dir.glob("*/production_artifact.json"):
+        try:
+            artifact = read_json_model(artifact_path, ProductionArtifact)
+            artifact.compliance_report = check_compliance(artifact)
+            artifacts.append(artifact)
+        except Exception:
+            continue
+    return sorted(artifacts, key=lambda item: item.updated_at, reverse=True)
+
+
+def load_project(settings: Settings, project_id: str) -> ProductionArtifact:
+    path = project_file_path(settings, project_id, "production_artifact.json")
+    if not path.exists():
+        raise WebException(detail="Project not found", status_code=404)
+    artifact = read_json_model(path, ProductionArtifact)
+    artifact.compliance_report = check_compliance(artifact)
+    return artifact
+
+
+def save_project(settings: Settings, artifact: ProductionArtifact) -> None:
+    project_dir = Path(settings.data_dir) / "projects" / artifact.project_id
+    if artifact.transcript_import:
+        write_json(project_dir / "transcript_import.json", artifact.transcript_import)
+    write_json(project_dir / "asset_manifest.json", artifact.asset_manifest or {})
+    write_json(project_dir / "visual_contract.json", artifact.visual_contract or {})
+    write_json(project_dir / "visual_qc_report.json", artifact.visual_qc_report or {})
+    write_json(project_dir / "compliance_report.json", artifact.compliance_report or {})
+    write_json(project_dir / "production_artifact.json", artifact)
+
+
+def project_file_path(settings: Settings, project_id: str, filename: str) -> Path:
+    if not PROJECT_ID_RE.match(project_id):
+        raise WebException(detail="Project not found", status_code=404)
+    return Path(settings.data_dir) / "projects" / project_id / filename
+
+
+def all_assets_approved(artifact: ProductionArtifact) -> bool:
+    if artifact.asset_manifest is None or not artifact.asset_manifest.assets:
+        return False
+    return all(asset.rights_status == RightsStatus.APPROVED for asset in artifact.asset_manifest.assets)
+
+
+def approved_assets_count(artifact: ProductionArtifact) -> int:
+    if artifact.asset_manifest is None:
+        return 0
+    return sum(1 for asset in artifact.asset_manifest.assets if asset.rights_status == RightsStatus.APPROVED)
+
+
+def page(title: str, body: str) -> str:
+    return f"""
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{escape(title)}</title>
+        <style>{styles()}</style>
+      </head>
+      <body>{body}</body>
+    </html>
+    """
+
+
+def project_row(artifact: ProductionArtifact) -> str:
+    cues = len(artifact.cue_ledger.cues) if artifact.cue_ledger else 0
+    ready = bool(artifact.compliance_report and artifact.compliance_report.upload_ready)
+    return f"""
+    <tr>
+      <td class="mono">{escape(artifact.project_id)}</td>
+      <td>{escape(artifact.title)}</td>
+      <td>{cues}</td>
+      <td>{status_chip(artifact.review_status, ready)}</td>
+      <td><a class="button-link" href="/projects/{escape(artifact.project_id)}/view">Open</a></td>
+    </tr>
+    """
+
+
+def preview_panel(settings: Settings, artifact: ProductionArtifact) -> str:
+    project_id = artifact.project_id
+    if not project_file_path(settings, project_id, "preview.mp4").exists():
+        return ""
+    return f"""
+    <section class="panel preview-panel">
+      <div class="section-head">
+        <h2>Preview</h2>
+        <a class="text-link" href="/projects/{escape(project_id)}/files/preview.mp4">Download</a>
+      </div>
+      <video controls preload="metadata" src="/projects/{escape(project_id)}/files/preview.mp4"></video>
+    </section>
+    """
+
+
+def cue_strip_panel(artifact: ProductionArtifact) -> str:
+    cues = artifact.cue_ledger.cues if artifact.cue_ledger else []
+    blocks = "\n".join(cue_block(cue) for cue in cues)
+    if not blocks:
+        blocks = '<div class="muted empty">No cue strip</div>'
+    return f"""
+    <section class="panel">
+      <div class="section-head">
+        <h2>Timeline Strip</h2>
+        <span class="muted">{len(cues)} cues</span>
+      </div>
+      <div class="cue-strip">{blocks}</div>
+    </section>
+    """
+
+
+def cue_block(cue) -> str:
+    return f"""
+    <div class="cue-block {escape(cue.asset_type)}" title="{escape(cue.voice_text)}">
+      <span class="mono">{escape(cue.cue_id.replace("cue_", "#"))}</span>
+      <strong>{escape(cue.asset_type)}</strong>
+      <small>{format_ms(cue.start_ms)}</small>
+    </div>
+    """
+
+
+def review_panel(artifact: ProductionArtifact) -> str:
+    approve_cues = review_form(artifact, "approve_cues", "Approve Cues", artifact.review_status in {ReviewStatus.CUES_READY, ReviewStatus.CHANGES_REQUESTED})
+    approve_assets = review_form(
+        artifact,
+        "approve_assets",
+        "Approve Assets",
+        artifact.review_status == ReviewStatus.ASSETS_REVIEW and all_assets_approved(artifact),
+    )
+    approve_final = review_form(
+        artifact,
+        "approve_final",
+        "Approve Final Preview",
+        artifact.review_status == ReviewStatus.PREVIEW_READY and all_assets_approved(artifact),
+    )
+    request_changes = review_form(artifact, "request_changes", "Request Changes", True, include_note=True, danger=True)
+    return f"""
+    <section class="panel command-panel">
+      <div class="section-head">
+        <h2>Review Gate</h2>
+        {status_chip(artifact.review_status)}
+      </div>
+      <div class="gate-stack">
+        {approve_cues}
+        {approve_assets}
+        {approve_final}
+        {request_changes}
+      </div>
+    </section>
+    """
+
+
+def transcript_panel(artifact: ProductionArtifact) -> str:
+    imported = artifact.transcript_import
+    summary = "No transcript imported yet"
+    warnings = ""
+    if imported:
+        duration = format_ms(imported.duration_ms)
+        summary = f"{len(imported.segments)} segments | {duration} | {imported.format}"
+        if imported.warnings:
+            warnings = "<ul class=\"warning-list\">" + "".join(
+                f"<li>{escape(item)}</li>" for item in imported.warnings[:5]
+            ) + "</ul>"
+    options = "\n".join(
+        f'<option value="{escape(fmt)}">{escape(fmt)}</option>'
+        for fmt in TranscriptFormat
+    )
+    return f"""
+    <section id="transcript" class="panel">
+      <div class="section-head">
+        <h2>Import Transcript</h2>
+        <span class="muted">{escape(summary)}</span>
+      </div>
+      <form method="post" action="/projects/{escape(artifact.project_id)}/transcript/import" class="transcript-form">
+        <div class="split">
+          <div class="field">
+            <label for="transcript-format">Format</label>
+            <select id="transcript-format" name="transcript_format">{options}</select>
+          </div>
+          <div class="field">
+            <label for="transcript-source">Source</label>
+            <input id="transcript-source" name="source_name" value="paste" />
+          </div>
+        </div>
+        <input type="hidden" name="actor" value="local" />
+        <div class="field">
+          <label for="transcript-content">SRT / VTT / JSON / Text</label>
+          <textarea id="transcript-content" name="transcript_content" required placeholder="Paste external ASR output here"></textarea>
+        </div>
+        <div class="split">
+          <input name="note" placeholder="Import note" />
+          <button class="primary" type="submit">Rebuild Timeline</button>
+        </div>
+      </form>
+      {warnings}
+    </section>
+    """
+
+
+def visual_quality_panel(artifact: ProductionArtifact) -> str:
+    contract = artifact.visual_contract
+    report = artifact.visual_qc_report
+    if not contract or not report:
+        return ""
+    shots = "\n".join(visual_shot_card(shot) for shot in contract.shots[:12])
+    findings = "\n".join(
+        f'<li><span class="status {severity_class(finding.severity)}">{escape(finding.severity)}</span> '
+        f'{escape(finding.cue_id or "")} {escape(finding.message)}</li>'
+        for finding in report.findings
+    )
+    if not findings:
+        findings = '<li class="muted">No visual QC findings</li>'
+    return f"""
+    <section class="panel">
+      <div class="section-head">
+        <h2>Visual Quality Contract</h2>
+        <div class="actions">
+          <span class="status {'ok' if report.score >= 85 else 'warn'}">score {report.score}</span>
+          {file_link(artifact.project_id, "visual_contract.json", "Contract")}
+          {file_link(artifact.project_id, "visual_qc_report.json", "QC")}
+        </div>
+      </div>
+      <div class="visual-shot-grid">{shots}</div>
+      <ul class="warning-list">{findings}</ul>
+    </section>
+    """
+
+
+def visual_shot_card(shot) -> str:
+    return f"""
+    <article class="visual-shot">
+      <span class="mono">{escape(shot.cue_id)}</span>
+      <strong>{escape(shot.shot_type)}</strong>
+      <p>{escape(shot.prompt)}</p>
+    </article>
+    """
+
+
+def llm_brain_panel(project_id: str) -> str:
+    status = get_llm_brain_status()
+    binding_map = {binding.task_id: binding.connection_id for binding in status.bindings}
+    connection_map = {connection.connection_id: connection for connection in status.connections}
+    rows = []
+    for task in status.tasks:
+        connection = connection_map.get(binding_map.get(task.task_id, ""))
+        provider = connection.provider if connection else "unbound"
+        model = connection.model_id if connection else "-"
+        configured = bool(connection and connection.api_key_env in status.configured_env_keys)
+        rows.append(
+            f"<tr><td>{escape(task.label)}</td><td>{escape(provider)}</td><td>{escape(model)}</td>"
+            f"<td>{'<span class=\"status ok\">key ready</span>' if configured else '<span class=\"status warn\">key missing</span>'}</td></tr>"
+        )
+        
+    trigger_btn = f"""
+    <div style="margin-top: 15px; border-top: 1px solid #374151; padding-top: 15px;">
+      <form method="post" action="/projects/{escape(project_id)}/lava/run">
+        <button class="primary" type="submit" style="width: 100%;">Run LAVA Brain Workflow</button>
+      </form>
+    </div>
+    """
+    
+    return f"""
+    <section class="panel">
+      <div class="section-head">
+        <h2>LLM Brain</h2>
+        <span class="pill">LAVA-style bindings</span>
+      </div>
+      <table>
+        <thead><tr><th>Task</th><th>Provider</th><th>Model</th><th>Key</th></tr></thead>
+        <tbody>{"".join(rows)}</tbody>
+      </table>
+      {trigger_btn}
+    </section>
+    """
+
+
+def review_form(
+    artifact: ProductionArtifact,
+    action: str,
+    label: str,
+    enabled: bool,
+    include_note: bool = False,
+    danger: bool = False,
+) -> str:
+    disabled = "" if enabled else "disabled"
+    note = '<input name="note" placeholder="Reason" />' if include_note else ""
+    cls = "danger" if danger else "primary"
+    return f"""
+    <form method="post" action="/projects/{escape(artifact.project_id)}/review/{escape(action)}" class="gate-form">
+      <input type="hidden" name="actor" value="local" />
+      {note}
+      <button class="{cls}" type="submit" {disabled}>{escape(label)}</button>
+    </form>
+    """
+
+
+def asset_panel(artifact: ProductionArtifact) -> str:
+    cards = "\n".join(asset_card(artifact, asset) for asset in (artifact.asset_manifest.assets if artifact.asset_manifest else []))
+    if not cards:
+        cards = '<div class="muted empty">No assets needed</div>'
+    return f"""
+    <section id="assets" class="panel">
+      <div class="section-head">
+        <h2>Asset Rights</h2>
+        {file_link(artifact.project_id, "asset_manifest.json", "JSON")}
+      </div>
+      <div class="asset-grid">{cards}</div>
+    </section>
+    """
+
+
+def asset_card(artifact: ProductionArtifact, asset) -> str:
+    options = "\n".join(
+        f'<option value="{escape(status)}" {"selected" if asset.rights_status == status else ""}>{escape(status)}</option>'
+        for status in RightsStatus
+    )
+    return f"""
+    <article class="asset-card {escape(asset.rights_status)}">
+      <div class="asset-thumb {escape(asset.asset_type)}">{escape(asset.asset_type.replace("_", " "))}</div>
+      <div class="asset-body">
+        <div class="asset-title">
+          <span class="mono">{escape(asset.asset_id)}</span>
+          <span class="status {rights_class(asset.rights_status)}">{escape(asset.rights_status)}</span>
+        </div>
+        <p>{escape(asset.prompt_or_search or "")}</p>
+        <form method="post" action="/projects/{escape(artifact.project_id)}/assets/{escape(asset.asset_id)}/rights" class="asset-form">
+          <input type="hidden" name="actor" value="local" />
+          <select name="rights_status">{options}</select>
+          <input name="note" placeholder="Rights note" />
+          <button type="submit">Save</button>
+        </form>
+      </div>
+    </article>
+    """
+
+
+def compliance_panel(artifact: ProductionArtifact) -> str:
+    findings = artifact.compliance_report.findings if artifact.compliance_report else []
+    rows = "\n".join(finding_row(finding) for finding in findings)
+    if not rows:
+        rows = '<tr><td colspan="4" class="muted empty">No findings</td></tr>'
+    return f"""
+    <section class="panel">
+      <div class="section-head">
+        <h2>Compliance</h2>
+        {file_link(artifact.project_id, "compliance_report.json", "JSON")}
+      </div>
+      <table>
+        <thead><tr><th>Severity</th><th>Code</th><th>Message</th><th>Cue</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </section>
+    """
+
+
+def decision_log_panel(artifact: ProductionArtifact) -> str:
+    entries = list(reversed(artifact.decision_log[-8:]))
+    rows = "\n".join(log_row(entry) for entry in entries)
+    if not rows:
+        rows = '<tr><td colspan="4" class="muted empty">No decisions yet</td></tr>'
+    return f"""
+    <section class="panel">
+      <div class="section-head">
+        <h2>Decision Log</h2>
+        <span class="muted">{len(artifact.decision_log)} entries</span>
+      </div>
+      <table>
+        <thead><tr><th>Time</th><th>Action</th><th>Status</th><th>Note</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </section>
+    """
+
+
+def cue_row(cue) -> str:
+    return f"""
+    <tr>
+      <td class="mono">{escape(cue.cue_id)}</td>
+      <td>{format_ms(cue.start_ms)}-{format_ms(cue.end_ms)}</td>
+      <td>{escape(cue.voice_text)}</td>
+      <td>{escape(cue.visual_prompt or cue.asset_type)}</td>
+      <td class="mono">{escape(cue.shorts_id or "")}</td>
+    </tr>
+    """
+
+
+def finding_row(finding) -> str:
+    severity = escape(finding.severity)
+    return f"""
+    <tr>
+      <td><span class="status {severity_class(severity)}">{severity}</span></td>
+      <td class="mono">{escape(finding.code)}</td>
+      <td>{escape(finding.message)}</td>
+      <td class="mono">{escape(finding.cue_id or "")}</td>
+    </tr>
+    """
+
+
+def log_row(entry: DecisionLogEntry) -> str:
+    status = ""
+    if entry.from_status or entry.to_status:
+        status = f"{entry.from_status or ''} -> {entry.to_status or ''}"
+    return f"""
+    <tr>
+      <td>{entry.created_at.strftime("%H:%M:%S")}</td>
+      <td class="mono">{escape(entry.action)}</td>
+      <td>{escape(status)}</td>
+      <td>{escape(entry.note or "")}</td>
+    </tr>
+    """
+
+
+def stepper(status: ReviewStatus) -> str:
+    active = step_index(status)
+    items = []
+    for index, (_, label) in enumerate(STEPS):
+        if status == ReviewStatus.CHANGES_REQUESTED:
+            state = "blocked" if index == active else ("done" if index < active else "todo")
+        elif index < active:
+            state = "done"
+        elif index == active:
+            state = "current"
+        else:
+            state = "todo"
+        aria = ' aria-current="true"' if state in {"current", "blocked"} else ""
+        items.append(
+            f'<li class="{state}"{aria}><span>{index + 1}</span><strong>{escape(label)}</strong></li>'
+        )
+    return f'<ol class="stepper">{"".join(items)}</ol>'
+
+
+def step_index(status: ReviewStatus) -> int:
+    if status in {ReviewStatus.DRAFT, ReviewStatus.CUES_READY, ReviewStatus.CHANGES_REQUESTED}:
+        return 0
+    if status == ReviewStatus.ASSETS_REVIEW:
+        return 1
+    if status == ReviewStatus.PREVIEW_READY:
+        return 2
+    return 3
+
+
+def file_link(project_id: str, filename: str, label: str) -> str:
+    return f'<a class="button-link" href="/projects/{escape(project_id)}/files/{escape(filename)}">{escape(label)}</a>'
+
+
+def stat_card(label: str, value: str, detail: str) -> str:
+    return f"""
+    <div class="stat-card">
+      <span>{escape(label)}</span>
+      <strong>{escape(value)}</strong>
+      <small>{escape(detail)}</small>
+    </div>
+    """
+
+
+def status_chip(status: ReviewStatus, ready: bool = False) -> str:
+    if ready:
+        return '<span class="status ok">upload ready</span>'
+    cls = "block" if status == ReviewStatus.CHANGES_REQUESTED else "warn"
+    if status == ReviewStatus.APPROVED:
+        cls = "ok"
+    return f'<span class="status {cls}">{escape(status_label(status))}</span>'
+
+
+def status_label(status: ReviewStatus) -> str:
+    return status.value.replace("_", " ")
+
+
+def rights_class(status: RightsStatus) -> str:
+    if status == RightsStatus.APPROVED:
+        return "ok"
+    if status == RightsStatus.REJECTED:
+        return "block"
+    return "warn"
+
+
+def packaging_panel(artifact: ProductionArtifact) -> str:
+    pkg = artifact.video_packaging
+    title_info = "No title optimized yet"
+    desc_info = "No SEO description yet"
+    thumb_info = "No thumbnail prompt yet"
+    if pkg:
+        selected = pkg.get("selected_title") or (pkg.get("candidate_titles", [""])[0] if pkg.get("candidate_titles") else "")
+        title_info = f"<strong>Selected Title:</strong> {escape(selected)}"
+        desc_info = f"<strong>Description Draft:</strong><pre style='white-space: pre-wrap; font-size:12px;'>{escape(pkg.get('description', '')[:200])}...</pre>"
+        thumb_info = f"<strong>Thumbnail Prompt:</strong> <small>{escape(pkg.get('thumbnail_prompt', ''))}</small>"
+        
+    return f"""
+    <section class="panel">
+      <div class="section-head">
+        <h2>Video Packaging & SEO</h2>
+        <span class="pill">LAVA Brain</span>
+      </div>
+      <div style="display:grid; gap:8px; margin-bottom: 12px;">
+        <div>{title_info}</div>
+        <div>{desc_info}</div>
+        <div>{thumb_info}</div>
+      </div>
+      <form method="post" action="/projects/{escape(artifact.project_id)}/optimize-packaging">
+        <button class="primary" type="submit" style="width: 100%;">Optimize Packaging via LLM</button>
+      </form>
+    </section>
+    """
+
+
+def shorts_panel(artifact: ProductionArtifact) -> str:
+    if "_short_" in artifact.project_id:
+        return ""
+    has_script = bool(artifact.approved_script_markdown and "<SHORT_BREAK>" in artifact.approved_script_markdown)
+    disabled = "" if has_script else "disabled"
+    return f"""
+    <section class="panel">
+      <div class="section-head">
+        <h2>Short-Video Splitting</h2>
+        <span class="pill">Shorts Boundary</span>
+      </div>
+      <p style="margin-bottom: 12px; font-size: 12px; color: var(--muted);">
+        Splits script by &lt;SHORT_BREAK&gt; into up to 10 subprojects.
+      </p>
+      <form method="post" action="/projects/{escape(artifact.project_id)}/split">
+        <button class="primary" type="submit" style="width: 100%;" {disabled}>Split Script to Shorts</button>
+      </form>
+    </section>
+    """
+
+
+def metrics_panel(artifact: ProductionArtifact) -> str:
+    metrics = artifact.metrics_decision
+    results_html = ""
+    if metrics:
+        results_html = f"""
+        <div style="margin-bottom: 12px; border-bottom: 1px solid var(--line); padding-bottom: 10px;">
+          <strong>CTR:</strong> {metrics.ctr}% | 
+          <strong>AVD:</strong> {metrics.average_view_duration_seconds}s | 
+          <strong>RPM:</strong> ${metrics.rpm} <br>
+          <strong>Decision:</strong> <span class="status ok">{metrics.decision}</span>
+        </div>
+        """
+    return f"""
+    <section class="panel">
+      <div class="section-head">
+        <h2>Metrics & Optimization</h2>
+        <span class="pill">Feedback Loop</span>
+      </div>
+      {results_html}
+      <form method="post" action="/projects/{escape(artifact.project_id)}/metrics" class="project-form">
+        <div class="split">
+          <div class="field">
+            <label for="metrics-ctr">CTR (%)</label>
+            <input id="metrics-ctr" name="ctr" type="number" step="0.1" required value="4.5" />
+          </div>
+          <div class="field">
+            <label for="metrics-avd">AVD (sec)</label>
+            <input id="metrics-avd" name="avd" type="number" step="1" required value="120" />
+          </div>
+        </div>
+        <div class="split">
+          <div class="field">
+            <label for="metrics-rpm">RPM ($)</label>
+            <input id="metrics-rpm" name="rpm" type="number" step="0.01" required value="8.50" />
+          </div>
+          <div class="field">
+            <label for="metrics-decision">Scale Decision</label>
+            <select id="metrics-decision" name="decision">
+              <option value="scale">Scale (加碼)</option>
+              <option value="iterate">Iterate (優化題材)</option>
+              <option value="kill">Kill (停止投資)</option>
+            </select>
+          </div>
+        </div>
+        <button class="primary" type="submit" style="width: 100%;">Feedback Metrics</button>
+      </form>
+    </section>
+    """
+
+
+@router.post("/projects/trend-research", response_class=HTMLResponse)
+async def trend_research_list(
+    topic_prompt: str = Form(...),
+) -> str:
+    try:
+        report = await run_topic_research(topic_prompt)
+    except Exception as e:
+        logger.error(f"Topic research failed: {e}")
+        report = {
+            "primary_keyword": topic_prompt,
+            "competitor_gaps": ["LAVA Brain connection error; using fallback niche suggestions."],
+            "cpm_tier": "medium",
+            "search_intent": "How to automate video production",
+            "suggested_angles": [
+                f"{topic_prompt}：一字不差的半自動影音生產線",
+                f"2026年最新 {topic_prompt} 的極速變現法",
+                f"別再全自動！為何半自動 {topic_prompt} 才是唯一能做長期的產線"
+            ]
+        }
+
+    angles_html = ""
+    for idx, angle in enumerate(report.get("suggested_angles", [])):
+        angles_html += f"""
+        <div class="asset-card" style="margin-bottom:12px;">
+          <div class="asset-thumb generated_image">Angle {idx+1}</div>
+          <div class="asset-body">
+            <h3 style="margin:0 0 5px 0; font-size:15px; color:var(--text);">{escape(angle)}</h3>
+            <p style="font-size:12px; margin-bottom:8px;"><strong>Keyword:</strong> {escape(report.get('primary_keyword'))} | <strong>CPM:</strong> {escape(report.get('cpm_tier'))}</p>
+            <form method="post" action="/projects/trend-research/create">
+              <input type="hidden" name="title" value="{escape(angle)}" />
+              <input type="hidden" name="primary_keyword" value="{escape(report.get('primary_keyword'))}" />
+              <input type="hidden" name="angle" value="{escape(angle)}" />
+              <button class="primary" type="submit">Create Project & Draft Script via LLM</button>
+            </form>
+          </div>
+        </div>
+        """
+
+    return page(
+        title="AI Trend Research Results",
+        body=f"""
+        <section class="app-shell">
+          <header class="project-hero">
+            <div>
+              <a class="text-link" href="/">Back to Dashboard</a>
+              <h1 style="margin-top:8px;">AI Niche Research: {escape(topic_prompt)}</h1>
+              <p class="muted">Primary Keyword: {escape(report.get('primary_keyword'))} | Search Intent: {escape(report.get('search_intent'))}</p>
+            </div>
+          </header>
+          
+          <section class="review-layout">
+            <main class="main-col">
+              <section class="panel">
+                <h2>Suggested Video Angles</h2>
+                <div style="margin-top: 15px;">{angles_html}</div>
+              </section>
+            </main>
+            <aside class="side-col">
+              <section class="panel">
+                <h2>Competitor Gaps & Pain points</h2>
+                <ul class="warning-list">
+                  {"".join(f"<li>{escape(gap)}</li>" for gap in report.get('competitor_gaps', []))}
+                </ul>
+              </section>
+            </aside>
+          </section>
+        </section>
+        """
+    )
+
+
+@router.post("/projects/trend-research/create")
+async def create_project_from_trend(
+    title: str = Form(...),
+    primary_keyword: str = Form(...),
+    angle: str = Form(...),
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    title_stripped = title.strip() if title else ""
+    if not title_stripped:
+        raise WebException(detail="Project title cannot be empty", status_code=400, back_link="/")
+
+    topic_research = {
+        "primary_keyword": primary_keyword,
+        "suggested_angles": [angle],
+        "cpm_tier": "high",
+        "search_intent": "automated video production"
+    }
+    
+    try:
+        script_data = await run_script_outline(topic_research, tone="informative, conversational, professional", persona="expert host")
+        script_markdown = script_data.get("script_markdown", f"# {title_stripped}\nThis is a drafted script for: {angle}\n<SHORT_BREAK>\nStay tuned for more updates!")
+    except Exception as e:
+        logger.error(f"Failed to draft script via LLM: {e}")
+        script_markdown = f"# {title_stripped}\nThis is a drafted script for: {angle}\n<SHORT_BREAK>\nStay tuned for more updates!"
+
+    try:
+        artifact = await run_mvp_pipeline(
+            settings=settings,
+            title=title_stripped,
+            script_markdown=script_markdown,
+            language="en",
+            persona="operator"
+        )
+    except Exception as e:
+        logger.error(f"Failed to create project from trend: {e}")
+        raise WebException(detail=f"Failed to run pipeline: {str(e)}", status_code=500, back_link="/")
+    
+    artifact.genre = "tech"
+    artifact.decision_log.append(
+        DecisionLogEntry(
+            action="trend_script_created",
+            actor="lava_brain",
+            note=f"Project generated from AI Trend Research angle: {angle}"
+        )
+    )
+    await run_in_threadpool(save_project, settings, artifact)
+    
+    return RedirectResponse(url=f"/projects/{artifact.project_id}/view", status_code=303)
+
+
+@router.post("/projects/{project_id}/split")
+def split_project_script(
+    project_id: str,
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    artifact = load_project(settings, project_id)
+    try:
+        shorts = split_script_into_shorts(artifact, settings)
+        artifact.decision_log.append(
+            DecisionLogEntry(
+                action="shorts_splitting_completed",
+                actor="local",
+                note=f"Successfully split script into {len(shorts)} Shorts subprojects."
+            )
+        )
+    except Exception as e:
+        artifact.decision_log.append(
+            DecisionLogEntry(
+                action="shorts_splitting_failed",
+                actor="local",
+                note=f"Splitting failed: {str(e)}"
+            )
+        )
+    artifact.touch()
+    save_project(settings, artifact)
+    return RedirectResponse(url=f"/projects/{project_id}/view", status_code=303)
+
+
+@router.post("/projects/{project_id}/optimize-packaging")
+async def optimize_project_packaging(
+    project_id: str,
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    artifact = await run_in_threadpool(load_project, settings, project_id)
+    
+    topic_research = {
+        "primary_keyword": artifact.title,
+        "suggested_angles": [artifact.title],
+        "cpm_tier": "medium",
+        "search_intent": "video search"
+    }
+    
+    try:
+        pkg_data = await run_packaging(artifact.approved_script_markdown or "", topic_research)
+        artifact.video_packaging = pkg_data
+        
+        from pipeline.stages.packaging_generator import write_upload_package
+        project_dir = ensure_project_dir(settings.data_dir, project_id)
+        artifact.upload_package_path = await run_in_threadpool(write_upload_package, project_dir, artifact)
+        
+        artifact.decision_log.append(
+            DecisionLogEntry(
+                action="packaging_optimized",
+                actor="lava_brain",
+                note="YouTube titles, thumbnail prompt, and descriptions successfully optimized by LAVA Brain."
+            )
+        )
+    except Exception as e:
+        artifact.decision_log.append(
+            DecisionLogEntry(
+                action="packaging_optimization_failed",
+                actor="lava_brain",
+                note=f"Packaging optimization failed: {str(e)}"
+            )
+        )
+    artifact.touch()
+    await run_in_threadpool(save_project, settings, artifact)
+    return RedirectResponse(url=f"/projects/{project_id}/view", status_code=303)
+
+
+@router.post("/projects/{project_id}/metrics")
+def update_project_metrics(
+    project_id: str,
+    ctr: float = Form(...),
+    avd: float = Form(...),
+    rpm: float = Form(...),
+    decision: str = Form(...),
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    artifact = load_project(settings, project_id)
+    scale_decision = ScaleDecision.UNKNOWN
+    if decision == "scale":
+        scale_decision = ScaleDecision.SCALE
+    elif decision == "iterate":
+        scale_decision = ScaleDecision.ITERATE
+    elif decision == "kill":
+        scale_decision = ScaleDecision.KILL
+        
+    metrics = MetricsDecision(
+        project_id=project_id,
+        ctr=ctr,
+        average_view_duration_seconds=avd,
+        rpm=rpm,
+        decision=scale_decision,
+        notes="Metrics successfully feedback to pipeline."
+    )
+    artifact.metrics_decision = metrics
+    artifact.decision_log.append(
+        DecisionLogEntry(
+            action="metrics_feedback_registered",
+            actor="local",
+            note=f"Feedback: CTR={ctr}%, AVD={avd}s, RPM=${rpm}, Decision={decision}."
+        )
+    )
+    artifact.touch()
+    save_project(settings, artifact)
+    return RedirectResponse(url=f"/projects/{project_id}/view", status_code=303)
+
+
+def severity_class(severity: str) -> str:
+    if severity == "blocker":
+        return "block"
+    if severity == "warning":
+        return "warn"
+    return "ok"
+
+
+def format_ms(ms: int) -> str:
+    seconds = ms // 1000
+    minutes, seconds = divmod(seconds, 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def styles() -> str:
+    return """
+    :root {
+      color-scheme: dark;
+      --bg: #121311;
+      --panel: #1a1c19;
+      --panel-2: #22251f;
+      --panel-3: #292d25;
+      --line: #3a4037;
+      --text: #f4f2ec;
+      --muted: #aaa99f;
+      --accent: #37b67a;
+      --accent-strong: #75dfa7;
+      --amber: #d7a942;
+      --danger: #df6761;
+      --cyan: #58b9ce;
+      --input: #0d0e0c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Arial, "Microsoft JhengHei", sans-serif;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+    a { color: inherit; }
+    h1, h2, p { margin: 0; }
+    h1 { font-size: 28px; line-height: 1.2; }
+    h2 { font-size: 16px; line-height: 1.3; }
+    .app-shell {
+      display: grid;
+      gap: 16px;
+      min-height: 100vh;
+      padding: 16px;
+    }
+    .topbar, .project-hero, .panel, .stat-card, .create-pane, .list-pane {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .topbar, .project-hero {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+      padding: 18px;
+    }
+    .eyebrow {
+      color: var(--accent-strong);
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+    }
+    .overview-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .stat-card {
+      min-height: 92px;
+      padding: 14px;
+      display: grid;
+      gap: 7px;
+      border-left: 4px solid var(--accent);
+    }
+    .stat-card span, .stat-card small, .muted { color: var(--muted); }
+    .stat-card strong { font-size: 24px; }
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(360px, 520px) minmax(0, 1fr);
+      gap: 16px;
+    }
+    .create-pane, .list-pane, .panel { padding: 16px; }
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .project-form { display: grid; gap: 12px; }
+    .field { display: grid; gap: 6px; }
+    label { color: var(--muted); font-size: 12px; }
+    input, textarea, select {
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--input);
+      color: var(--text);
+      padding: 9px 10px;
+      font: inherit;
+      outline: none;
+    }
+    input:focus, textarea:focus, select:focus { border-color: var(--accent); }
+    textarea {
+      min-height: 360px;
+      resize: vertical;
+      line-height: 1.5;
+      font-family: Consolas, "Microsoft JhengHei", monospace;
+    }
+    .split {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    button, .button-link, .ghost-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 36px;
+      padding: 0 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-2);
+      color: var(--text);
+      text-decoration: none;
+      font-weight: 700;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    button.primary {
+      border-color: #2e8d60;
+      background: var(--accent);
+      color: #07140e;
+    }
+    button.danger {
+      border-color: #8a3935;
+      background: #3a1d1c;
+      color: #ffd2cd;
+    }
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.42;
+    }
+    .text-link {
+      color: var(--muted);
+      text-decoration: none;
+      font-weight: 700;
+    }
+    .pill, .status {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 0 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .status.ok { color: #84e8ad; border-color: #2c7a55; }
+    .status.warn { color: #f0c86b; border-color: #7b6429; }
+    .status.block { color: #ff9b95; border-color: #884141; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 8px;
+      text-align: left;
+      vertical-align: top;
+      overflow-wrap: anywhere;
+    }
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      background: #151713;
+    }
+    .mono { font-family: Consolas, monospace; font-size: 12px; }
+    .empty { text-align: center; padding: 28px 8px; }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    .stepper {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      padding: 0;
+      margin: 0;
+      list-style: none;
+    }
+    .stepper li {
+      position: relative;
+      display: grid;
+      grid-template-columns: 30px 1fr;
+      align-items: center;
+      gap: 9px;
+      min-height: 56px;
+      padding: 10px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .stepper span {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: var(--panel-3);
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .stepper .done span, .stepper .current span { background: var(--accent); color: #07140e; }
+    .stepper .blocked span { background: var(--danger); color: #160706; }
+    .stepper .current, .stepper .blocked { border-color: var(--accent); }
+    .stepper .todo { opacity: 0.7; }
+    .review-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(340px, 0.8fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .main-col, .side-col {
+      display: grid;
+      gap: 16px;
+    }
+    video {
+      width: 100%;
+      max-height: 520px;
+      background: #000;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+    }
+    .cue-strip {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+      gap: 8px;
+    }
+    .cue-block {
+      min-height: 86px;
+      display: grid;
+      gap: 5px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+      border-top: 4px solid var(--muted);
+    }
+    .cue-block.generated_image { border-top-color: var(--accent); }
+    .cue-block.broll { border-top-color: var(--amber); }
+    .cue-block.screencast { border-top-color: var(--cyan); }
+    .cue-block strong { font-size: 13px; overflow-wrap: anywhere; }
+    .cue-block small { color: var(--muted); }
+    .gate-stack, .asset-grid {
+      display: grid;
+      gap: 10px;
+    }
+    .gate-form {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+    }
+    .gate-form input[type="hidden"] { display: none; }
+    .gate-form button:only-child { grid-column: 1 / -1; }
+    .asset-card {
+      display: grid;
+      grid-template-columns: 96px minmax(0, 1fr);
+      gap: 12px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+    }
+    .asset-thumb {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 96px;
+      border-radius: 6px;
+      background: #10110f;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      text-align: center;
+      font-size: 12px;
+      padding: 8px;
+    }
+    .asset-thumb.generated_image { box-shadow: inset 0 0 0 2px rgba(55, 182, 122, 0.35); }
+    .asset-thumb.broll { box-shadow: inset 0 0 0 2px rgba(215, 169, 66, 0.35); }
+    .asset-thumb.screencast { box-shadow: inset 0 0 0 2px rgba(88, 185, 206, 0.35); }
+    .asset-body { display: grid; gap: 8px; min-width: 0; }
+    .asset-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+    }
+    .asset-card p {
+      color: var(--text);
+      line-height: 1.45;
+    }
+    .asset-form {
+      display: grid;
+      grid-template-columns: minmax(110px, 0.7fr) minmax(120px, 1fr) auto;
+      gap: 8px;
+    }
+    .transcript-form {
+      display: grid;
+      gap: 12px;
+    }
+    .transcript-form textarea {
+      min-height: 180px;
+    }
+    .visual-shot-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .visual-shot {
+      display: grid;
+      gap: 7px;
+      min-height: 150px;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+    }
+    .visual-shot p {
+      color: var(--muted);
+      line-height: 1.45;
+      font-size: 12px;
+    }
+    .warning-list {
+      display: grid;
+      gap: 8px;
+      margin: 10px 0 0 0;
+      padding: 0;
+      list-style: none;
+    }
+    .warning-list li {
+      padding: 8px;
+      border-radius: 6px;
+      background: #151713;
+      border: 1px solid var(--line);
+      line-height: 1.45;
+    }
+    @media (max-width: 1100px) {
+      .workspace, .review-layout, .overview-grid, .stepper { grid-template-columns: 1fr; }
+      .project-hero, .topbar { display: grid; }
+      .actions { justify-content: flex-start; }
+    }
+    @media (max-width: 720px) {
+      .split, .asset-card, .asset-form, .gate-form { grid-template-columns: 1fr; }
+      h1 { font-size: 23px; }
+    }
+    """

@@ -1,0 +1,2 @@
+"""Core video pipeline package."""
+

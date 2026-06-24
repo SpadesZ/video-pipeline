@@ -1,0 +1,4 @@
+# Optional CPU ASR layer for a future asr-worker image.
+# Keep this out of the default image until the core pipeline is proven.
+faster-whisper>=1.0,<2.0
+
