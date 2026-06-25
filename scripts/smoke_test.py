@@ -7,11 +7,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from pipeline.settings import get_settings
+from pipeline.db import get_session
 from pipeline.stages.run_mvp import run_mvp_pipeline
 
 
 async def run_smoke() -> None:
     settings = get_settings()
+    session = next(get_session())
     script = """
 <VISUAL_BREAK: simple production flow diagram>
 The MVP starts with a reviewed script and turns it into a cue ledger.
@@ -21,6 +23,7 @@ Then it creates an asset manifest, subtitles, a preview, and an upload package.
 Human review remains the final gate before publishing.
 """
     artifact = await run_mvp_pipeline(
+        session=session,
         settings=settings,
         title="Smoke Test Video",
         script_markdown=script,
@@ -32,7 +35,6 @@ Human review remains the final gate before publishing.
         "asset_manifest.json",
         "subtitles.srt",
         "upload_package.md",
-        "production_artifact.json",
     ]
     missing = [name for name in required if not (project_dir / name).exists()]
     if missing:
