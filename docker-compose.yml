@@ -67,5 +67,30 @@ services:
       postgres:
         condition: service_healthy
 
+  asr-worker:
+    profiles: ["asr"]
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile.asr
+    environment:
+      DATA_DIR: /data
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/1}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://video_pipeline:video_pipeline@postgres:5432/video_pipeline}
+      SECRETS_FILE: /run/secrets/video-pipeline/.env.local
+      ASR_MODEL_SIZE: ${ASR_MODEL_SIZE:-tiny}
+      ASR_COMPUTE_TYPE: ${ASR_COMPUTE_TYPE:-int8}
+      ASR_LANGUAGE: ${ASR_LANGUAGE:-}
+      ASR_WORKER_CONCURRENCY: ${ASR_WORKER_CONCURRENCY:-1}
+    volumes:
+      - ./data:/data
+      - ./secrets:/run/secrets/video-pipeline:ro
+      - ./scripts:/app/scripts:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
 volumes:
   postgres_data:

@@ -28,7 +28,7 @@ from pipeline.adapters.platforms.image_generator import generate_ai_image
 from pipeline.utils.files import write_json
 from pipeline.models.review import DecisionLogEntry, ReviewStatus
 from pipeline.stages.compliance_checker import check_compliance
-from pipeline.db import engine
+from pipeline.db import engine, init_db
 from sqlmodel import Session
 
 settings = get_settings()
@@ -222,4 +222,54 @@ def preview_project(project_id: str) -> dict:
 def run_lava_workflow(project_id: str, run_tts: bool = True) -> dict:
     """Celery wrapper for executing the asynchronous LAVA pipeline workflow."""
     return asyncio.run(run_lava_workflow_async(project_id, run_tts=run_tts))
+
+
+@celery_app.task(
+    name="video_pipeline.run_asr_job",
+    time_limit=1800,
+    soft_time_limit=1740,
+)
+def run_asr_job(project_id: str) -> dict:
+    from pipeline.stages.asr_transcriber import run_local_asr
+
+    init_db()
+    project_dir = Path(settings.data_dir) / "projects" / project_id
+
+    with Session(engine) as session:
+        artifact = session.get(ProductionArtifact, project_id)
+        if not artifact:
+            raise ValueError(f"Project not found: {project_id}")
+
+        audio_path: Path | None = None
+        if artifact.voiceover_path and Path(artifact.voiceover_path).exists():
+            audio_path = Path(artifact.voiceover_path)
+        else:
+            for candidate in ("voiceover.wav", "voiceover.mp3", "audio.wav", "audio.mp3"):
+                candidate_path = project_dir / candidate
+                if candidate_path.exists():
+                    audio_path = candidate_path
+                    break
+
+        if not audio_path:
+            raise ValueError(f"No ASR audio file found for project {project_id}.")
+
+        artifact.decision_log.append(
+            DecisionLogEntry(
+                action="local_asr_started",
+                actor="asr_worker",
+                note=f"Starting local CPU ASR for {audio_path.name}.",
+            )
+        )
+        artifact.touch()
+        artifact = save_project(settings, artifact, session=session)
+
+        artifact = run_local_asr(settings, artifact, audio_path, actor="asr_worker")
+        artifact = save_project(settings, artifact, session=session)
+
+        return {
+            "project_id": project_id,
+            "status": "success",
+            "segments": len(artifact.transcript_import.segments) if artifact.transcript_import else 0,
+            "subtitles_path": artifact.cue_ledger.subtitles_path if artifact.cue_ledger else None,
+        }
 

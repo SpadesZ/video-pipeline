@@ -1,13 +1,22 @@
 from pathlib import Path
+from datetime import datetime
 
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import Session, select
 
 from pipeline.db import engine
+from pipeline.models.asset_manifest import AssetManifest
+from pipeline.models.compliance import ComplianceReport
+from pipeline.models.cue_ledger import CueLedger
+from pipeline.models.metrics import MetricsDecision
 from pipeline.models.production_artifact import ProductionArtifact
+from pipeline.models.review import DecisionLogEntry, ReviewStatus
+from pipeline.models.shorts_manifest import ShortsManifest
 from pipeline.settings import Settings
 from pipeline.stages.compliance_checker import check_compliance
+from pipeline.models.transcript import TranscriptImport
+from pipeline.models.visual_contract import VisualQualityContract, VisualQualityReport
 from pipeline.utils.files import ensure_project_dir, read_json_model, safe_project_path, write_json
 
 
@@ -24,6 +33,48 @@ JSON_FIELDS = (
     "video_packaging",
     "decision_log",
 )
+
+MODEL_FIELDS = {
+    "transcript_import": TranscriptImport,
+    "cue_ledger": CueLedger,
+    "asset_manifest": AssetManifest,
+    "visual_contract": VisualQualityContract,
+    "visual_qc_report": VisualQualityReport,
+    "compliance_report": ComplianceReport,
+    "metrics_decision": MetricsDecision,
+    "shorts_manifest": ShortsManifest,
+}
+
+
+def _parse_datetime(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    normalized = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return value
+
+
+def normalize_project_artifact(artifact: ProductionArtifact) -> ProductionArtifact:
+    for field_name, model_type in MODEL_FIELDS.items():
+        value = getattr(artifact, field_name, None)
+        if isinstance(value, dict):
+            setattr(artifact, field_name, model_type.model_validate(value))
+
+    if isinstance(artifact.review_status, str):
+        artifact.review_status = ReviewStatus(artifact.review_status)
+
+    artifact.created_at = _parse_datetime(artifact.created_at)
+    artifact.updated_at = _parse_datetime(artifact.updated_at)
+
+    if isinstance(artifact.decision_log, list):
+        artifact.decision_log = [
+            item if isinstance(item, DecisionLogEntry) else DecisionLogEntry.model_validate(item)
+            for item in artifact.decision_log
+        ]
+
+    return artifact
 
 
 def project_file_path(settings: Settings, project_id: str, filename: str) -> Path:
@@ -76,6 +127,7 @@ def load_project(
     def _load(active_session: Session) -> ProductionArtifact | None:
         artifact = active_session.get(ProductionArtifact, project_id)
         if artifact:
+            artifact = normalize_project_artifact(artifact)
             artifact.compliance_report = check_compliance(artifact)
             return save_project(settings, artifact, session=active_session)
 
@@ -83,6 +135,7 @@ def load_project(
         if not artifact_path.exists():
             return None
         artifact = read_json_model(artifact_path, ProductionArtifact)
+        artifact = normalize_project_artifact(artifact)
         artifact.compliance_report = check_compliance(artifact)
         return save_project(settings, artifact, session=active_session)
 
@@ -98,6 +151,7 @@ def list_projects(settings: Settings, session: Session | None = None) -> list[Pr
         seen_ids: set[str] = set()
 
         for artifact in active_session.exec(select(ProductionArtifact)).all():
+            artifact = normalize_project_artifact(artifact)
             artifact.compliance_report = check_compliance(artifact)
             artifact = save_project(settings, artifact, session=active_session)
             artifacts.append(artifact)
@@ -112,6 +166,7 @@ def list_projects(settings: Settings, session: Session | None = None) -> list[Pr
                     continue
                 if artifact.project_id in seen_ids:
                     continue
+                artifact = normalize_project_artifact(artifact)
                 artifact.compliance_report = check_compliance(artifact)
                 artifacts.append(save_project(settings, artifact, session=active_session))
                 seen_ids.add(artifact.project_id)

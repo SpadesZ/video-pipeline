@@ -411,6 +411,32 @@ async def import_project_transcript(
     return RedirectResponse(url=f"/projects/{project_id}/view#transcript", status_code=303)
 
 
+@router.post("/projects/{project_id}/asr/run")
+def trigger_local_asr(
+    project_id: str,
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    artifact = load_project(settings, project_id)
+
+    from app.services.task_client import enqueue_asr_job
+
+    async_result = enqueue_asr_job(project_id)
+    task_id = getattr(async_result, "id", None)
+    task_note = "Queued local CPU ASR. Start the Docker ASR profile if it is not already running."
+    if task_id:
+        task_note = f"{task_note} Celery task: {task_id}"
+    artifact.decision_log.append(
+        DecisionLogEntry(
+            action="local_asr_enqueued",
+            actor="local",
+            note=task_note,
+        )
+    )
+    artifact.touch()
+    save_project(settings, artifact)
+    return RedirectResponse(url=f"/projects/{project_id}/view#transcript", status_code=303)
+
+
 @router.post("/projects/{project_id}/lava/run")
 def trigger_lava_workflow(
     project_id: str,
@@ -721,6 +747,15 @@ def transcript_panel(artifact: ProductionArtifact) -> str:
         </div>
       </form>
       {warnings}
+      <div class="asr-run-box">
+        <div>
+          <strong>Local CPU ASR</strong>
+          <span class="muted">Uses the optional Docker ASR worker and the project voiceover file.</span>
+        </div>
+        <form method="post" action="/projects/{escape(artifact.project_id)}/asr/run">
+          <button class="ghost-button" type="submit">Run CPU ASR</button>
+        </form>
+      </div>
     </section>
     """
 
@@ -1787,6 +1822,19 @@ def styles() -> str:
     }
     .transcript-form textarea {
       min-height: 180px;
+    }
+    .asr-run-box {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }
+    .asr-run-box > div {
+      display: grid;
+      gap: 4px;
     }
     .visual-shot-grid {
       display: grid;

@@ -1,0 +1,22 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY requirements-asr-cpu.txt /app/requirements-asr-cpu.txt
+RUN pip install --no-cache-dir -r /app/requirements-asr-cpu.txt
+
+COPY pipeline /app/pipeline
+COPY apps/worker/worker.py /app/worker.py
+COPY scripts /app/scripts
+
+CMD ["sh", "-c", "celery -A worker.celery_app worker --loglevel=INFO -Q asr --concurrency=${ASR_WORKER_CONCURRENCY:-1}"]
