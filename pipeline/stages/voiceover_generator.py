@@ -1,3 +1,14 @@
+# 檔案路徑: video-pipeline/pipeline/stages/voiceover_generator.py
+# 產生時間: 2026-06-25 17:00 +08:00
+# 版本: v1.1
+# 模組定位:
+#   配音生成器模組 (TTS Voiceover Generator)。
+# 主要責任:
+#   1. 對接 ElevenLabs API 生成高品質人聲配音 (MP3/WAV)。
+#   2. 當無 API Key 或 API 呼叫失敗時，自動降級生成無聲 WAV 音檔，防止流水線因外部 API 異常而卡住。
+#   3. 使用 FFmpeg 完成 MP3 到 WAV 的格式轉換以相容後續 ASR 流程。
+# --------------------------------------------------------------------------
+
 import os
 import wave
 import httpx

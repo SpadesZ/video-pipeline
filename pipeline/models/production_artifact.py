@@ -22,6 +22,7 @@ from pipeline.models.compliance import ComplianceReport
 from pipeline.models.cue_ledger import CueLedger
 from pipeline.models.metrics import MetricsDecision
 from pipeline.models.review import DecisionLogEntry, ReviewStatus
+from pipeline.models.shorts_manifest import ShortsManifest
 from pipeline.models.transcript import TranscriptImport
 from pipeline.models.visual_contract import VisualQualityContract, VisualQualityReport
 
@@ -103,6 +104,10 @@ class ProductionArtifact(SQLModel, table=True):
     metrics_decision: MetricsDecision | None = Field(
         default=None,
         sa_column=Column(PydanticJSON(MetricsDecision))
+    )
+    shorts_manifest: ShortsManifest | None = Field(
+        default=None,
+        sa_column=Column(PydanticJSON(ShortsManifest))
     )
     review_status: ReviewStatus = ReviewStatus.CUES_READY
 

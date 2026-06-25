@@ -2,6 +2,7 @@ from pipeline.models.asset_manifest import AssetItem, AssetManifest
 from pipeline.models.compliance import ComplianceFinding, ComplianceReport
 from pipeline.models.cue_ledger import AssetType, CueItem, CueLedger
 from pipeline.models.metrics import MetricsDecision
+from pipeline.models.shorts_manifest import ShortItem, ShortsManifest
 from pipeline.models.production_artifact import ProductionArtifact
 from pipeline.models.review import DecisionLogEntry, ReviewStatus
 from pipeline.models.transcript import TranscriptFormat, TranscriptImport, TranscriptSegment
@@ -16,6 +17,8 @@ __all__ = [
     "CueItem",
     "CueLedger",
     "MetricsDecision",
+    "ShortItem",
+    "ShortsManifest",
     "ProductionArtifact",
     "DecisionLogEntry",
     "ReviewStatus",
