@@ -419,6 +419,19 @@ def trigger_local_asr(
     artifact = load_project(settings, project_id)
 
     from app.services.task_client import enqueue_asr_job
+    from pipeline.stages.asr_transcriber import find_asr_audio_path
+
+    if not find_asr_audio_path(settings, artifact):
+        artifact.decision_log.append(
+            DecisionLogEntry(
+                action="local_asr_missing_audio",
+                actor="local",
+                note="No project audio file was found. Add voiceover.wav, voiceover.mp3, audio.wav, or audio.mp3 before running local ASR.",
+            )
+        )
+        artifact.touch()
+        save_project(settings, artifact)
+        return RedirectResponse(url=f"/projects/{project_id}/view#transcript", status_code=303)
 
     async_result = enqueue_asr_job(project_id)
     task_id = getattr(async_result, "id", None)

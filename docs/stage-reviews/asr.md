@@ -75,4 +75,4 @@ Implemented: HTTP health, existing project page HTML checks, ASR worker log insp
 9. Large audio chunking/retry logic is not implemented.
 10. End-to-end video output is not part of this stage and remains for later closure stages.
 
-Implemented now: none of these are required to close the ASR foundation safely. Carry them into the next stages instead of widening this patch.
+Implemented after Antigravity verification: missing audio is now caught before enqueue, and zero-segment ASR results fail without overwriting the existing timeline. Carry the remaining hardening items into later stages instead of widening this patch further.

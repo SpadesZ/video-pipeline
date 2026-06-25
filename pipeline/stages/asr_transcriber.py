@@ -16,6 +16,27 @@ from pipeline.utils.files import ensure_project_dir, write_json
 logger = logging.getLogger("ASRTranscriber")
 logger.setLevel(logging.INFO)
 
+ASR_AUDIO_CANDIDATES = ("voiceover.wav", "voiceover.mp3", "audio.wav", "audio.mp3")
+
+
+def find_asr_audio_path(settings: Settings, artifact: ProductionArtifact) -> Path | None:
+    project_dir = ensure_project_dir(Path(settings.data_dir), artifact.project_id)
+    candidate_paths: list[Path] = []
+
+    if artifact.voiceover_path:
+        voiceover_path = Path(artifact.voiceover_path)
+        candidate_paths.append(voiceover_path)
+        if not voiceover_path.is_absolute():
+            candidate_paths.append(Path(settings.data_dir) / voiceover_path)
+        candidate_paths.append(project_dir / voiceover_path.name)
+
+    candidate_paths.extend(project_dir / candidate for candidate in ASR_AUDIO_CANDIDATES)
+
+    for candidate_path in candidate_paths:
+        if candidate_path.exists():
+            return candidate_path
+    return None
+
 
 def run_local_asr(
     settings: Settings,
@@ -24,10 +45,10 @@ def run_local_asr(
     actor: str = "local_asr",
 ) -> ProductionArtifact:
     segments = transcribe_with_faster_whisper(audio_path)
-    warnings: list[str] = []
     if not segments:
-        warnings.append("ASR completed but produced no transcript segments.")
-        logger.warning("Transcription produced no segments for %s", audio_path)
+        message = f"ASR produced no transcript segments for {audio_path.name}; existing timeline was left unchanged."
+        logger.warning(message)
+        raise ValueError(message)
 
     duration_ms = max((segment.end_ms for segment in segments), default=0)
     transcript_import = TranscriptImport(
@@ -35,7 +56,7 @@ def run_local_asr(
         source_name="faster_whisper_cpu",
         segments=segments,
         duration_ms=duration_ms,
-        warnings=warnings,
+        warnings=[],
     )
 
     old_cues = artifact.cue_ledger.cues if artifact.cue_ledger else []

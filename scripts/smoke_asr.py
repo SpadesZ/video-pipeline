@@ -87,6 +87,26 @@ def main() -> None:
     for output_path in (transcript_path, cue_path, subtitles_path, artifact_path):
         assert_ok(output_path.exists(), f"Missing ASR output file: {output_path}")
 
+    original_subtitles = subtitles_path.read_text(encoding="utf-8")
+    original_cue_count = len(loaded.cue_ledger.cues)
+
+    def empty_transcribe(path: Path) -> list[TranscriptSegment]:
+        return []
+
+    asr_transcriber.transcribe_with_faster_whisper = empty_transcribe
+    try:
+        asr_transcriber.run_local_asr(settings, loaded, audio_path, actor="smoke_asr")
+    except ValueError as exc:
+        assert_ok("no transcript segments" in str(exc), "Unexpected zero-segment ASR error")
+    else:
+        raise SystemExit("Zero-segment ASR should fail without overwriting existing timeline")
+
+    reloaded = load_project(settings, project_id)
+    assert_ok(reloaded is not None, "ASR smoke project could not be reloaded after zero-segment check")
+    assert_ok(reloaded.cue_ledger is not None, "cue_ledger disappeared after zero-segment check")
+    assert_ok(len(reloaded.cue_ledger.cues) == original_cue_count, "Zero-segment ASR changed cue count")
+    assert_ok(subtitles_path.read_text(encoding="utf-8") == original_subtitles, "Zero-segment ASR overwrote subtitles")
+
     print(
         "OK ASR smoke "
         f"project_id={project_id} "

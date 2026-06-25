@@ -230,27 +230,26 @@ def run_lava_workflow(project_id: str, run_tts: bool = True) -> dict:
     soft_time_limit=1740,
 )
 def run_asr_job(project_id: str) -> dict:
-    from pipeline.stages.asr_transcriber import run_local_asr
+    from pipeline.stages.asr_transcriber import find_asr_audio_path, run_local_asr
 
     init_db()
-    project_dir = Path(settings.data_dir) / "projects" / project_id
 
     with Session(engine) as session:
         artifact = session.get(ProductionArtifact, project_id)
         if not artifact:
             raise ValueError(f"Project not found: {project_id}")
 
-        audio_path: Path | None = None
-        if artifact.voiceover_path and Path(artifact.voiceover_path).exists():
-            audio_path = Path(artifact.voiceover_path)
-        else:
-            for candidate in ("voiceover.wav", "voiceover.mp3", "audio.wav", "audio.mp3"):
-                candidate_path = project_dir / candidate
-                if candidate_path.exists():
-                    audio_path = candidate_path
-                    break
-
+        audio_path = find_asr_audio_path(settings, artifact)
         if not audio_path:
+            artifact.decision_log.append(
+                DecisionLogEntry(
+                    action="local_asr_missing_audio",
+                    actor="asr_worker",
+                    note="No ASR audio file found. Add voiceover.wav, voiceover.mp3, audio.wav, or audio.mp3 to the project directory.",
+                )
+            )
+            artifact.touch()
+            save_project(settings, artifact, session=session)
             raise ValueError(f"No ASR audio file found for project {project_id}.")
 
         artifact.decision_log.append(
@@ -263,8 +262,20 @@ def run_asr_job(project_id: str) -> dict:
         artifact.touch()
         artifact = save_project(settings, artifact, session=session)
 
-        artifact = run_local_asr(settings, artifact, audio_path, actor="asr_worker")
-        artifact = save_project(settings, artifact, session=session)
+        try:
+            artifact = run_local_asr(settings, artifact, audio_path, actor="asr_worker")
+            artifact = save_project(settings, artifact, session=session)
+        except Exception as exc:
+            artifact.decision_log.append(
+                DecisionLogEntry(
+                    action="local_asr_failed",
+                    actor="asr_worker",
+                    note=str(exc),
+                )
+            )
+            artifact.touch()
+            save_project(settings, artifact, session=session)
+            raise
 
         return {
             "project_id": project_id,
