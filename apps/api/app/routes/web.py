@@ -1,11 +1,12 @@
 # 檔案路徑: video-pipeline/apps/api/app/routes/web.py
-# 產生時間: 2026-06-25 14:20 +08:00
-# 版本: v1.0
+# 產生時間: 2026-06-25 17:00 +08:00
+# 版本: v1.1
 # 模組定位:
 #   FastAPI Web 控制台前端 HTML 路由頁面渲染模組。
 # 主要責任:
 #   1. 提供視覺化專案列表、專案詳情頁面渲染（配合 HTML 元件）。
 #   2. 管理人工作業審核閘門、ASR 字幕匯入及素材標記審查。
+#   3. 新增 YouTube Analytics API 指標同步與本地 CSV 匯入，閉環選題優化接入。
 # --------------------------------------------------------------------------
 
 from html import escape
@@ -27,11 +28,17 @@ from pipeline.models.asset_manifest import RightsStatus
 from pipeline.models.production_artifact import ProductionArtifact
 from pipeline.models.review import DecisionLogEntry, ReviewStatus
 from pipeline.models.transcript import TranscriptFormat
+from pipeline.project_store import (
+    list_projects as store_list_projects,
+    load_project as store_load_project,
+    project_file_path as store_project_file_path,
+    save_project as store_save_project,
+)
 from pipeline.settings import Settings
 from pipeline.stages.compliance_checker import check_compliance
 from pipeline.stages.run_mvp import run_mvp_pipeline
 from pipeline.stages.transcript_importer import import_transcript
-from pipeline.utils.files import read_json_model, write_json, ensure_project_dir
+from pipeline.utils.files import ensure_project_dir
 from pipeline.stages.llm_executors import run_topic_research, run_script_outline, run_packaging
 from pipeline.stages.script_splitter import split_script_into_shorts
 from pipeline.models.metrics import MetricsDecision, ScaleDecision
@@ -115,6 +122,65 @@ def home(settings: Settings = Depends(settings_dep)) -> str:
     )
     ready_count = sum(1 for p in projects if p.compliance_report and p.compliance_report.upload_ready)
 
+    # Load Topic Performance Index
+    try:
+        from pipeline.stages.topic_optimizer import get_topic_performance_summary
+        perf_summary = get_topic_performance_summary(settings)
+    except Exception as e:
+        logger.error(f"Failed to load topic performance summary: {e}")
+        perf_summary = []
+
+    perf_rows = ""
+    for item in perf_summary:
+        trend_arrow = "→"
+        if item["trend"] == "up":
+            trend_arrow = "▲"
+        elif item["trend"] == "down":
+            trend_arrow = "▼"
+        
+        avg_ctr_str = f"{item['avg_ctr']:.1f}%" if item['avg_ctr'] is not None else "0.0%"
+        avg_avd_str = f"{int(item['avg_avd_seconds'])}s" if item['avg_avd_seconds'] is not None else "0s"
+        avg_rpm_str = f"${item['avg_rpm']:.2f}" if item['avg_rpm'] is not None else "$0.00"
+        
+        perf_rows += f"""
+        <tr>
+          <td><span class="status ok" style="background:#2a3b4c; color:#a5d6ff; border:none; padding:4px 8px; border-radius:4px; font-weight:bold;">{escape(item["genre"])}</span></td>
+          <td class="mono">{item["project_count"]}</td>
+          <td class="mono">{avg_ctr_str}</td>
+          <td class="mono">{avg_avd_str}</td>
+          <td class="mono">{avg_rpm_str}</td>
+          <td><span class="pill" style="font-weight:bold; text-transform:uppercase;">{escape(item["dominant_decision"])}</span></td>
+          <td class="mono" style="font-weight:bold; color:{'#3fb950' if item['trend']=='up' else '#f85149' if item['trend']=='down' else '#8b949e'}">{trend_arrow}</td>
+        </tr>
+        """
+    if not perf_rows:
+        perf_rows = '<tr><td colspan="7" class="muted empty" style="text-align:center; padding:15px;">No performance index data yet</td></tr>'
+        
+    perf_dashboard_html = f"""
+    <div class="workspace-card" style="margin-top: 30px; border: 1px solid var(--line); border-radius: 8px; padding: 20px; background: var(--panel);">
+      <div class="section-head" style="margin-bottom: 15px; display:flex; justify-content:space-between; align-items:center;">
+        <h2 style="margin:0; font-size:18px;">Topic Performance Index</h2>
+        <span class="pill" style="background:#1f6feb; color:white; border:none;">Closed Loop Feedback</span>
+      </div>
+      <table style="width: 100%; border-collapse: collapse; font-size:14px;">
+        <thead>
+          <tr style="text-align: left; border-bottom: 1px solid var(--line); font-size: 13px; color: var(--muted); height:35px;">
+            <th style="padding: 8px;">Genre</th>
+            <th style="padding: 8px;">Count</th>
+            <th style="padding: 8px;">Avg CTR</th>
+            <th style="padding: 8px;">Avg AVD</th>
+            <th style="padding: 8px;">Avg RPM</th>
+            <th style="padding: 8px;">Dominant Action</th>
+            <th style="padding: 8px;">Trend</th>
+          </tr>
+        </thead>
+        <tbody>
+          {perf_rows}
+        </tbody>
+      </table>
+    </div>
+    """
+
     return page(
         title="Video Pipeline",
         body=f"""
@@ -126,13 +192,13 @@ def home(settings: Settings = Depends(settings_dep)) -> str:
             </div>
             <a class="ghost-button" href="/docs">API Docs</a>
           </header>
-
+ 
           <section class="overview-grid">
             {stat_card("Projects", str(len(projects)), "built locally")}
             {stat_card("Upload Ready", str(ready_count), "final approved")}
             {stat_card("Asset Rights", f"{approved_assets}/{total_assets}", "approved")}
           </section>
-
+ 
           <section class="workspace">
             <div class="create-pane">
               <div class="section-head">
@@ -167,7 +233,7 @@ def home(settings: Settings = Depends(settings_dep)) -> str:
               <form action="/projects/trend-research" method="post" class="project-form">
                 <div class="field">
                   <label for="research-topic">Keyword / Topic</label>
-                  <input id="research-topic" name="topic_prompt" required value="AI SaaS变现" />
+                  <input id="research-topic" name="topic_prompt" required value="AI SaaS變現" />
                 </div>
                 <button type="submit" class="primary">Research Trends</button>
               </form>
@@ -189,6 +255,7 @@ def home(settings: Settings = Depends(settings_dep)) -> str:
                 </thead>
                 <tbody>{rows}</tbody>
               </table>
+              {perf_dashboard_html}
             </div>
           </section>
         </section>
@@ -344,6 +411,45 @@ async def import_project_transcript(
     return RedirectResponse(url=f"/projects/{project_id}/view#transcript", status_code=303)
 
 
+@router.post("/projects/{project_id}/asr/run")
+def trigger_local_asr(
+    project_id: str,
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    artifact = load_project(settings, project_id)
+
+    from app.services.task_client import enqueue_asr_job
+    from pipeline.stages.asr_transcriber import find_asr_audio_path
+
+    if not find_asr_audio_path(settings, artifact):
+        artifact.decision_log.append(
+            DecisionLogEntry(
+                action="local_asr_missing_audio",
+                actor="local",
+                note="No project audio file was found. Add voiceover.wav, voiceover.mp3, audio.wav, or audio.mp3 before running local ASR.",
+            )
+        )
+        artifact.touch()
+        save_project(settings, artifact)
+        return RedirectResponse(url=f"/projects/{project_id}/view#transcript", status_code=303)
+
+    async_result = enqueue_asr_job(project_id)
+    task_id = getattr(async_result, "id", None)
+    task_note = "Queued local CPU ASR. Start the Docker ASR profile if it is not already running."
+    if task_id:
+        task_note = f"{task_note} Celery task: {task_id}"
+    artifact.decision_log.append(
+        DecisionLogEntry(
+            action="local_asr_enqueued",
+            actor="local",
+            note=task_note,
+        )
+    )
+    artifact.touch()
+    save_project(settings, artifact)
+    return RedirectResponse(url=f"/projects/{project_id}/view#transcript", status_code=303)
+
+
 @router.post("/projects/{project_id}/lava/run")
 def trigger_lava_workflow(
     project_id: str,
@@ -469,45 +575,33 @@ def next_status_for_action(artifact: ProductionArtifact, action: str) -> ReviewS
 
 
 def list_projects(settings: Settings) -> list[ProductionArtifact]:
-    projects_dir = Path(settings.data_dir) / "projects"
-    if not projects_dir.exists():
-        return []
-
-    artifacts: list[ProductionArtifact] = []
-    for artifact_path in projects_dir.glob("*/production_artifact.json"):
-        try:
-            artifact = read_json_model(artifact_path, ProductionArtifact)
-            artifact.compliance_report = check_compliance(artifact)
-            artifacts.append(artifact)
-        except Exception:
-            continue
-    return sorted(artifacts, key=lambda item: item.updated_at, reverse=True)
+    return store_list_projects(settings)
 
 
 def load_project(settings: Settings, project_id: str) -> ProductionArtifact:
-    path = project_file_path(settings, project_id, "production_artifact.json")
-    if not path.exists():
+    if not PROJECT_ID_RE.match(project_id):
         raise WebException(detail="Project not found", status_code=404)
-    artifact = read_json_model(path, ProductionArtifact)
+    try:
+        artifact = store_load_project(settings, project_id)
+    except ValueError:
+        raise WebException(detail="Project not found", status_code=404)
+    if not artifact:
+        raise WebException(detail="Project not found", status_code=404)
     artifact.compliance_report = check_compliance(artifact)
     return artifact
 
 
 def save_project(settings: Settings, artifact: ProductionArtifact) -> None:
-    project_dir = Path(settings.data_dir) / "projects" / artifact.project_id
-    if artifact.transcript_import:
-        write_json(project_dir / "transcript_import.json", artifact.transcript_import)
-    write_json(project_dir / "asset_manifest.json", artifact.asset_manifest or {})
-    write_json(project_dir / "visual_contract.json", artifact.visual_contract or {})
-    write_json(project_dir / "visual_qc_report.json", artifact.visual_qc_report or {})
-    write_json(project_dir / "compliance_report.json", artifact.compliance_report or {})
-    write_json(project_dir / "production_artifact.json", artifact)
+    store_save_project(settings, artifact)
 
 
 def project_file_path(settings: Settings, project_id: str, filename: str) -> Path:
     if not PROJECT_ID_RE.match(project_id):
         raise WebException(detail="Project not found", status_code=404)
-    return Path(settings.data_dir) / "projects" / project_id / filename
+    try:
+        return store_project_file_path(settings, project_id, filename)
+    except ValueError:
+        raise WebException(detail="Project not found", status_code=404)
 
 
 def all_assets_approved(artifact: ProductionArtifact) -> bool:
@@ -666,6 +760,15 @@ def transcript_panel(artifact: ProductionArtifact) -> str:
         </div>
       </form>
       {warnings}
+      <div class="asr-run-box">
+        <div>
+          <strong>Local CPU ASR</strong>
+          <span class="muted">Uses the optional Docker ASR worker and the project voiceover file.</span>
+        </div>
+        <form method="post" action="/projects/{escape(artifact.project_id)}/asr/run">
+          <button class="ghost-button" type="submit">Run CPU ASR</button>
+        </form>
+      </div>
     </section>
     """
 
@@ -719,9 +822,10 @@ def llm_brain_panel(project_id: str) -> str:
         provider = connection.provider if connection else "unbound"
         model = connection.model_id if connection else "-"
         configured = bool(connection and connection.api_key_env in status.configured_env_keys)
+        key_badge = '<span class="status ok">key ready</span>' if configured else '<span class="status warn">key missing</span>'
         rows.append(
             f"<tr><td>{escape(task.label)}</td><td>{escape(provider)}</td><td>{escape(model)}</td>"
-            f"<td>{'<span class=\"status ok\">key ready</span>' if configured else '<span class=\"status warn\">key missing</span>'}</td></tr>"
+            f"<td>{key_badge}</td></tr>"
         )
         
     trigger_btn = f"""
@@ -1016,6 +1120,8 @@ def metrics_panel(artifact: ProductionArtifact) -> str:
         <span class="pill">Feedback Loop</span>
       </div>
       {results_html}
+      
+      <h3 style="margin: 10px 0; font-size: 14px; color: var(--text);">Manual Metrics Feedback</h3>
       <form method="post" action="/projects/{escape(artifact.project_id)}/metrics" class="project-form">
         <div class="split">
           <div class="field">
@@ -1043,6 +1149,28 @@ def metrics_panel(artifact: ProductionArtifact) -> str:
         </div>
         <button class="primary" type="submit" style="width: 100%;">Feedback Metrics</button>
       </form>
+
+      <div style="margin: 20px 0; border-top: 1px solid var(--line);"></div>
+
+      <h3 style="margin: 10px 0; font-size: 14px; color: var(--text);">Sync with YouTube API</h3>
+      <form method="post" action="/projects/{escape(artifact.project_id)}/metrics/youtube" class="project-form">
+        <div class="field">
+          <label for="metrics-youtube-id">YouTube Video ID</label>
+          <input id="metrics-youtube-id" name="video_id" required placeholder="e.g. dQw4w9WgXcQ" />
+        </div>
+        <button class="primary" type="submit" style="width: 100%;">Sync via OAuth</button>
+      </form>
+
+      <div style="margin: 20px 0; border-top: 1px solid var(--line);"></div>
+
+      <h3 style="margin: 10px 0; font-size: 14px; color: var(--text);">Import from Local CSV</h3>
+      <form method="post" action="/projects/{escape(artifact.project_id)}/metrics/csv" class="project-form">
+        <div class="field">
+          <label for="metrics-csv-path">Local CSV Path</label>
+          <input id="metrics-csv-path" name="csv_path" required placeholder="e.g. C:/path/to/metrics.csv" />
+        </div>
+        <button class="primary" type="submit" style="width: 100%;">Import CSV</button>
+      </form>
     </section>
     """
 
@@ -1050,9 +1178,12 @@ def metrics_panel(artifact: ProductionArtifact) -> str:
 @router.post("/projects/trend-research", response_class=HTMLResponse)
 async def trend_research_list(
     topic_prompt: str = Form(...),
+    settings: Settings = Depends(settings_dep),
 ) -> str:
     try:
-        report = await run_topic_research(topic_prompt)
+        from pipeline.stages.topic_optimizer import suggest_next_topics
+        res = await suggest_next_topics(settings, topic_prompt)
+        report = res["topic_research"]
     except Exception as e:
         logger.error(f"Topic research failed: {e}")
         report = {
@@ -1178,6 +1309,9 @@ def split_project_script(
     artifact = load_project(settings, project_id)
     try:
         shorts = split_script_into_shorts(artifact, settings)
+        # Register generated shorts in the database
+        for s in shorts:
+            save_project(settings, s)
         artifact.decision_log.append(
             DecisionLogEntry(
                 action="shorts_splitting_completed",
@@ -1276,6 +1410,101 @@ def update_project_metrics(
     )
     artifact.touch()
     save_project(settings, artifact)
+    return RedirectResponse(url=f"/projects/{project_id}/view", status_code=303)
+
+
+@router.post("/projects/{project_id}/metrics/youtube")
+def sync_youtube_metrics(
+    project_id: str,
+    video_id: str = Form(...),
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    artifact = load_project(settings, project_id)
+    project_root = Path(__file__).resolve().parent.parent.parent.parent.parent
+    secrets_dir = project_root / "secrets"
+    
+    from pipeline.adapters.platforms.youtube_analytics import fetch_video_metrics
+    from pipeline.stages.metrics_importer import import_metrics_from_json
+    
+    try:
+        metrics_data = fetch_video_metrics(video_id, secrets_dir)
+        if not metrics_data:
+            raise WebException(
+                detail=f"Failed to fetch YouTube metrics for Video ID '{video_id}'. "
+                       "Please ensure Google API credentials are set up in the secrets/.env file and the Video ID is correct.",
+                back_link=f"/projects/{project_id}/view"
+            )
+            
+        mapped_data = {
+            "project_id": project_id,
+            "window": "youtube_api",
+            "ctr": metrics_data.get("impressions_ctr"),
+            "average_view_duration_seconds": metrics_data.get("average_view_duration_seconds"),
+            "rpm": metrics_data.get("estimated_rpm"),
+            "notes": f"Synced from YouTube API with Video ID: {video_id}."
+        }
+        
+        # Calculate video duration from cues
+        video_duration_seconds = 60.0
+        if artifact.cue_ledger and artifact.cue_ledger.cues:
+            video_duration_seconds = artifact.cue_ledger.cues[-1].end_ms / 1000.0
+        mapped_data["video_duration_seconds"] = video_duration_seconds
+        
+        artifact = import_metrics_from_json(mapped_data, artifact, settings)
+        save_project(settings, artifact)
+        
+    except WebException as e:
+        return error_page(
+            title="YouTube Analytics Error",
+            message=e.detail,
+            back_link=e.back_link
+        )
+    except Exception as e:
+        logger.error(f"Failed to sync YouTube metrics: {e}")
+        return error_page(
+            title="YouTube Sync Failed",
+            message=f"An unexpected error occurred during YouTube metrics sync: {str(e)}",
+            back_link=f"/projects/{project_id}/view"
+        )
+        
+    return RedirectResponse(url=f"/projects/{project_id}/view", status_code=303)
+
+
+@router.post("/projects/{project_id}/metrics/csv")
+def import_csv_metrics(
+    project_id: str,
+    csv_path: str = Form(...),
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    artifact = load_project(settings, project_id)
+    path = Path(csv_path)
+    
+    from pipeline.stages.metrics_importer import import_metrics_from_csv
+    
+    try:
+        if not path.exists():
+            raise WebException(
+                detail=f"CSV file not found at path: {csv_path}",
+                back_link=f"/projects/{project_id}/view"
+            )
+            
+        artifact = import_metrics_from_csv(path, artifact, settings)
+        save_project(settings, artifact)
+        
+    except WebException as e:
+        return error_page(
+            title="CSV Import Error",
+            message=e.detail,
+            back_link=e.back_link
+        )
+    except Exception as e:
+        logger.error(f"Failed to import CSV metrics: {e}")
+        return error_page(
+            title="CSV Import Failed",
+            message=f"An unexpected error occurred during CSV import: {str(e)}",
+            back_link=f"/projects/{project_id}/view"
+        )
+        
     return RedirectResponse(url=f"/projects/{project_id}/view", status_code=303)
 
 
@@ -1606,6 +1835,19 @@ def styles() -> str:
     }
     .transcript-form textarea {
       min-height: 180px;
+    }
+    .asr-run-box {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }
+    .asr-run-box > div {
+      display: grid;
+      gap: 4px;
     }
     .visual-shot-grid {
       display: grid;

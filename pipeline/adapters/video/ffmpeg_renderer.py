@@ -171,20 +171,39 @@ def render_placeholder_preview(output_path: Path, cue_ledger: CueLedger, title: 
             safe_path = str(frames[-1][0].resolve()).replace("\\", "/")
             f.write(f"file '{safe_path}'\n")
 
-    # 3. Assemble the FFmpeg command
+    # 3. Assemble the FFmpeg command with crossfade transitions
+    # Use concat demuxer for frame assembly, then apply fade filter for polish
     cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file)]
     
     if has_audio:
         cmd.extend(["-i", str(voiceover_path)])
-        
-    cmd.extend(["-pix_fmt", "yuv420p"])
+    
+    # Calculate total duration for fade-out
+    total_duration_sec = sum(d for _, d in frames)
+    fade_out_start = max(0, total_duration_sec - 1.0)
+    
+    # Build video filter: fade-in at start, fade-out at end
+    vf_parts = [
+        f"fade=t=in:st=0:d=0.5",
+        f"fade=t=out:st={fade_out_start:.2f}:d=1.0",
+        "format=yuv420p",
+    ]
+    video_filter = ",".join(vf_parts)
+    
+    cmd.extend(["-vf", video_filter])
     
     if has_audio:
-        # Encode video with h264, audio with AAC, and cut to the shortest input (usually audio)
-        cmd.extend(["-c:v", "libx264", "-c:a", "aac", "-shortest"])
+        # Audio filter: fade-in and fade-out for smooth audio transitions
+        af_parts = [
+            "afade=t=in:st=0:d=0.3",
+            f"afade=t=out:st={fade_out_start:.2f}:d=1.0",
+        ]
+        cmd.extend(["-af", ",".join(af_parts)])
+        # Encode video with h264, audio with AAC, cut to shortest input
+        cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-shortest"])
     else:
         # Encode silent video
-        cmd.extend(["-c:v", "libx264"])
+        cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
         
     cmd.append(str(output_path))
     

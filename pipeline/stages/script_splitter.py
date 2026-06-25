@@ -22,6 +22,7 @@ from pipeline.stages.visual_contract_builder import build_visual_contract
 from pipeline.stages.asset_manifest_builder import build_asset_manifest
 from pipeline.stages.preview_renderer import render_preview
 from pipeline.stages.run_mvp import to_srt
+from pipeline.models.shorts_manifest import ShortItem, ShortsManifest
 
 logger = logging.getLogger("Script_Splitter")
 logger.setLevel(logging.INFO)
@@ -41,6 +42,7 @@ def split_script_into_shorts(parent_artifact: ProductionArtifact, settings: Sett
     parts = [p.strip() for p in re.split(r"<SHORT_BREAK>", script) if p.strip()]
     shorts_artifacts: list[ProductionArtifact] = []
     render_tasks = []
+    short_items: list[ShortItem] = []
 
     for index, part in enumerate(parts[:10]):
         short_id = f"{parent_artifact.project_id}_short_{index + 1:02d}"
@@ -71,7 +73,7 @@ def split_script_into_shorts(parent_artifact: ProductionArtifact, settings: Sett
         cue_ledger = CueLedger(project_id=short_id, cues=cues)
         subtitles_path = project_dir / "subtitles.srt"
         subtitles_path.write_text(to_srt(cue_ledger), encoding="utf-8")
-        cue_ledger.subtitles_path = subtitles_path
+        cue_ledger.subtitles_path = str(subtitles_path)
 
         asset_manifest = build_asset_manifest(short_id, cue_ledger)
 
@@ -114,6 +116,22 @@ def split_script_into_shorts(parent_artifact: ProductionArtifact, settings: Sett
         shorts_artifacts.append(short_artifact)
         render_tasks.append((project_dir, cue_ledger, short_artifact.title, short_artifact))
 
+        # Collect info for ShortsManifest
+        short_items.append(
+            ShortItem(
+                short_id=short_id,
+                parent_project_id=parent_artifact.project_id,
+                title=short_artifact.title,
+                hook_text=sentences[0] if sentences else "",
+                cue_ids=[cue.cue_id for cue in cues],
+                start_ms=0,
+                end_ms=current_ms,
+                estimated_duration_seconds=current_ms / 1000.0,
+                word_count=sum(len(c.voice_text.split()) for c in cues),
+                status="draft",
+            )
+        )
+
     # Parallelize preview rendering
     logger.info(f"Starting parallel preview rendering for {len(render_tasks)} Shorts subprojects")
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -125,10 +143,23 @@ def split_script_into_shorts(parent_artifact: ProductionArtifact, settings: Sett
             p_dir, art = future_to_art[future]
             try:
                 preview_path = future.result()
-                art.preview_mp4 = preview_path
+                art.preview_mp4 = str(preview_path)
                 write_json(p_dir / "production_artifact.json", art)
                 logger.info(f"Successfully generated Short subproject: {art.project_id}")
+                
+                # Update status in shorts manifest item
+                for item in short_items:
+                    if item.short_id == art.project_id:
+                        item.status = "rendered"
             except Exception as e:
                 logger.error(f"Failed to render preview for {art.project_id}: {e}")
+
+    # Set the generated ShortsManifest on the parent artifact
+    parent_artifact.shorts_manifest = ShortsManifest(
+        parent_project_id=parent_artifact.project_id,
+        shorts=short_items,
+        total_shorts=len(short_items),
+        max_short_duration_seconds=60.0
+    )
 
     return shorts_artifacts

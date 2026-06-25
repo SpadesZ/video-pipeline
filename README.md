@@ -102,10 +102,42 @@ Importing a transcript rebuilds `cue_ledger.json`, `subtitles.srt`,
 `preview.mp4`, `asset_manifest.json`, and the visual quality contract, then
 returns review status to `cues_ready`.
 
+## Local CPU ASR
+
+The default Docker stack keeps ASR import lightweight. Local transcription runs
+through the optional CPU ASR worker profile, which installs `faster-whisper` at
+image build time so restarts do not require manual package installation.
+
+```powershell
+docker compose --profile asr up --build -d
+```
+
+In the project detail page, use `Run CPU ASR` after the project has a
+`voiceover.wav`, `voiceover.mp3`, `audio.wav`, or `audio.mp3` in its project
+directory. The ASR job writes:
+
+```text
+transcript_import.json
+cue_ledger.json
+subtitles.srt
+production_artifact.json
+```
+
+Run the deterministic ASR smoke without downloading a Whisper model:
+
+```powershell
+docker compose --profile asr run --rm asr-worker python scripts/smoke_asr.py
+```
+
+The smoke uses a deterministic mocked transcript by default so it is stable on
+CPU-only Windows hosts and does not depend on model downloads. Real local ASR is
+exercised by running the ASR worker on a project that already has a voiceover or
+uploaded audio file.
+
 ## Next Build Steps
 
-1. Add transcript/SRT import so cue timing can come from real ASR output.
-2. Replace rough cue timing with CPU-friendly faster-whisper output.
-3. Persist project state in Postgres instead of JSON files only.
-4. Add YouTube analytics CSV import for 24h, 7d, and 28d decisions.
+1. Expand LAVA settings/config UI and task registry coverage.
+2. Improve navigation, project state visibility, and user-facing status flow.
+3. Add quality scoring gates for transcript, script, visual, audio, and video.
+4. Add image/asset generation with safe fallbacks.
 5. Add optional GPU/WhisperX profile only after the CPU workflow is stable.

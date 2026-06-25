@@ -17,3 +17,10 @@ data/exports/*
 !data/assets/.gitkeep
 !data/temp/.gitkeep
 !data/exports/.gitkeep
+
+# Local SQLite artifacts
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
