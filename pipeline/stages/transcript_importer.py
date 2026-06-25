@@ -1,3 +1,13 @@
+# 檔案路徑: video-pipeline/pipeline/stages/transcript_importer.py
+# 產生時間: 2026-06-25 14:20 +08:00
+# 版本: v1.0
+# 模組定位:
+#   ASR 外部字幕匯入與時間軸重新生成階段模組。
+# 主要責任:
+#   1. 解析多種格式字幕（SRT, VTT, JSON, Plain Text）。
+#   2. 生成並重建專案的時間軸 Cue Ledger。
+# --------------------------------------------------------------------------
+
 from pathlib import Path
 import asyncio
 

@@ -1,3 +1,13 @@
+# 檔案路徑: video-pipeline/pipeline/models/production_artifact.py
+# 產生時間: 2026-06-25 14:20 +08:00
+# 版本: v1.0
+# 模組定位:
+#   流水線主幹資料 ProductionArtifact SQLModel 資料表定義。
+# 主要責任:
+#   1. 定義 SQLModel table，使專案狀態能直接持久化至 PostgreSQL。
+#   2. 實作 PydanticJSON 進行巢狀型別裝飾器的 JSON 序列化。
+# --------------------------------------------------------------------------
+
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Type

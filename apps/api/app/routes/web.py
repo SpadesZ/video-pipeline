@@ -1,3 +1,13 @@
+# 檔案路徑: video-pipeline/apps/api/app/routes/web.py
+# 產生時間: 2026-06-25 14:20 +08:00
+# 版本: v1.0
+# 模組定位:
+#   FastAPI Web 控制台前端 HTML 路由頁面渲染模組。
+# 主要責任:
+#   1. 提供視覺化專案列表、專案詳情頁面渲染（配合 HTML 元件）。
+#   2. 管理人工作業審核閘門、ASR 字幕匯入及素材標記審查。
+# --------------------------------------------------------------------------
+
 from html import escape
 from pathlib import Path
 import re

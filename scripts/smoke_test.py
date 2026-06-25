@@ -1,3 +1,13 @@
+# 檔案路徑: video-pipeline/scripts/smoke_test.py
+# 產生時間: 2026-06-25 14:20 +08:00
+# 版本: v1.0
+# 模組定位:
+#   流水線本地冒煙整合測試腳本。
+# 主要責任:
+#   1. 模擬完整 MVP 管線執行流程。
+#   2. 驗證產出成品（Cue ledger、subtitles.srt、upload package）之正確性。
+# --------------------------------------------------------------------------
+
 import asyncio
 import sys
 from pathlib import Path
