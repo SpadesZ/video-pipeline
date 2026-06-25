@@ -15,6 +15,7 @@
 from pathlib import Path
 from uuid import uuid4
 import asyncio
+from sqlmodel import Session
 
 from pipeline.models.production_artifact import ProductionArtifact
 from pipeline.settings import Settings
@@ -38,6 +39,7 @@ async def run_mvp_pipeline(
     settings: Settings,
     title: str,
     script_markdown: str,
+    session: Session | None = None,
     project_id: str | None = None,
     language: str = "en",
     persona: str | None = None,
@@ -53,7 +55,7 @@ async def run_mvp_pipeline(
     )
     subtitles_path = project_dir / "subtitles.srt"
     subtitles_path.write_text(to_srt(cue_ledger), encoding="utf-8")
-    cue_ledger.subtitles_path = subtitles_path
+    cue_ledger.subtitles_path = str(subtitles_path)
 
     asset_manifest = build_asset_manifest(resolved_project_id, cue_ledger)
 
@@ -78,8 +80,8 @@ async def run_mvp_pipeline(
     )
     artifact.compliance_report = check_compliance(artifact)
     loop = asyncio.get_running_loop()
-    artifact.preview_mp4 = await loop.run_in_executor(None, render_preview, project_dir, cue_ledger, title)
-    artifact.upload_package_path = write_upload_package(project_dir, artifact)
+    artifact.preview_mp4 = str(await loop.run_in_executor(None, render_preview, project_dir, cue_ledger, title))
+    artifact.upload_package_path = str(write_upload_package(project_dir, artifact))
     artifact.touch()
 
     write_json(project_dir / "cue_ledger.json", cue_ledger)
@@ -87,7 +89,12 @@ async def run_mvp_pipeline(
     write_json(project_dir / "visual_contract.json", artifact.visual_contract)
     write_json(project_dir / "visual_qc_report.json", artifact.visual_qc_report)
     write_json(project_dir / "compliance_report.json", artifact.compliance_report)
-    write_json(project_dir / "production_artifact.json", artifact)
+
+    if session:
+        session.add(artifact)
+        session.commit()
+        session.refresh(artifact)
+
     return artifact
 
 

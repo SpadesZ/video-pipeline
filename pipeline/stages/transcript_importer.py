@@ -46,7 +46,7 @@ async def import_transcript(
     project_dir = Path(settings.data_dir) / "projects" / artifact.project_id
     subtitles_path = project_dir / "subtitles.srt"
     subtitles_path.write_text(to_srt(cue_ledger), encoding="utf-8")
-    cue_ledger.subtitles_path = subtitles_path
+    cue_ledger.subtitles_path = str(subtitles_path)
 
     artifact.transcript_import = transcript_import
     artifact.cue_ledger = cue_ledger

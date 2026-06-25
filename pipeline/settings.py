@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     data_dir: Path = Path("/data")
     log_level: str = "INFO"
 
-    database_url: SecretStr = SecretStr("postgresql+psycopg://video_pipeline:video_pipeline@postgres:5432/video_pipeline")
+    database_url: SecretStr = SecretStr("sqlite:///./test.db")
     redis_url: SecretStr = SecretStr("redis://redis:6379/0")
     celery_broker_url: SecretStr = SecretStr("redis://redis:6379/0")
     celery_result_backend: SecretStr = SecretStr("redis://redis:6379/1")

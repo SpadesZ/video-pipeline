@@ -26,6 +26,8 @@ from pipeline.adapters.platforms.image_generator import generate_ai_image
 from pipeline.utils.files import read_json_model, write_json
 from pipeline.models.review import DecisionLogEntry, ReviewStatus
 from pipeline.stages.compliance_checker import check_compliance
+from pipeline.db import engine
+from sqlmodel import Session
 
 settings = get_settings()
 
@@ -38,26 +40,28 @@ celery_app = Celery(
 
 async def run_lava_workflow_async(project_id: str, run_tts: bool = True) -> dict:
     project_dir = Path(settings.data_dir) / "projects" / project_id
-    artifact_path = project_dir / "production_artifact.json"
-    artifact = read_json_model(artifact_path, ProductionArtifact)
-    
-    # Step 1: Voiceover TTS Generation (if requested and we have script)
-    if run_tts and artifact.approved_script_markdown:
-        voiceover_path = project_dir / "voiceover.wav"
-        # Extract plain text from markdown script (strip out labels like <SHORT_BREAK> etc.)
-        import re
-        clean_text = re.sub(r"<[^>]+>", "", artifact.approved_script_markdown).strip()
+    with Session(engine) as session:
+        artifact = session.get(ProductionArtifact, project_id)
+        if not artifact:
+            raise ValueError("Project not found")
         
-        artifact.decision_log.append(
-            DecisionLogEntry(
-                action="tts_generation_started",
-                actor="lava_brain",
-                note="Requesting ElevenLabs TTS voiceover..."
+        # Step 1: Voiceover TTS Generation (if requested and we have script)
+        if run_tts and artifact.approved_script_markdown:
+            voiceover_path = project_dir / "voiceover.wav"
+            # Extract plain text from markdown script (strip out labels like <SHORT_BREAK> etc.)
+            import re
+            clean_text = re.sub(r"<[^>]+>", "", artifact.approved_script_markdown).strip()
+
+            artifact.decision_log.append(
+                DecisionLogEntry(
+                    action="tts_generation_started",
+                    actor="lava_brain",
+                    note="Requesting ElevenLabs TTS voiceover..."
+                )
             )
-        )
-        
-        await generate_voiceover(clean_text, voiceover_path)
-        artifact.voiceover_path = voiceover_path
+
+            await generate_voiceover(clean_text, voiceover_path)
+            artifact.voiceover_path = str(voiceover_path)
         
         # Step 2: ASR Alignment
         # Convert script into segments for alignment
@@ -122,30 +126,32 @@ async def run_lava_workflow_async(project_id: str, run_tts: bool = True) -> dict
             neg_prompt = visual_contract.style_guide.negative_prompts if visual_contract.style_guide else []
             await generate_ai_image(prompt, img_path, negative_prompt=", ".join(neg_prompt))
             
-    # Step 5: Render final preview
-    if artifact.cue_ledger:
-        loop = asyncio.get_running_loop()
-        artifact.preview_mp4 = await loop.run_in_executor(None, render_preview, project_dir, artifact.cue_ledger, artifact.title)
+        # Step 5: Render final preview
+        if artifact.cue_ledger:
+            loop = asyncio.get_running_loop()
+            artifact.preview_mp4 = str(await loop.run_in_executor(None, render_preview, project_dir, artifact.cue_ledger, artifact.title))
+
+        artifact.compliance_report = check_compliance(artifact)
+        artifact.review_status = ReviewStatus.CUES_READY
         
-    artifact.compliance_report = check_compliance(artifact)
-    artifact.review_status = ReviewStatus.CUES_READY
-    
-    artifact.decision_log.append(
-        DecisionLogEntry(
-            action="lava_workflow_completed",
-            actor="lava_brain",
-            note=f"LAVA Brain completed. Score: {artifact.visual_qc_report.score if artifact.visual_qc_report else 100}",
-            to_status=artifact.review_status
+        artifact.decision_log.append(
+            DecisionLogEntry(
+                action="lava_workflow_completed",
+                actor="lava_brain",
+                note=f"LAVA Brain completed. Score: {artifact.visual_qc_report.score if artifact.visual_qc_report else 100}",
+                to_status=artifact.review_status
+            )
         )
-    )
-    artifact.touch()
-    
-    write_json(artifact_path, artifact)
-    return {
-        "project_id": project_id,
-        "preview_mp4": str(artifact.preview_mp4) if artifact.preview_mp4 else None,
-        "score": artifact.visual_qc_report.score if artifact.visual_qc_report else 100
-    }
+        artifact.touch()
+
+        session.add(artifact)
+        session.commit()
+        session.refresh(artifact)
+        return {
+            "project_id": project_id,
+            "preview_mp4": str(artifact.preview_mp4) if artifact.preview_mp4 else None,
+            "score": artifact.visual_qc_report.score if artifact.visual_qc_report else 100
+        }
 
 
 # 設定軟超時為 540 秒，硬超時為 600 秒，避免遇到 API 懸掛或 FFmpeg 死鎖時無限阻塞 Worker 進程。
@@ -156,18 +162,23 @@ async def run_lava_workflow_async(project_id: str, run_tts: bool = True) -> dict
 )
 def preview_project(project_id: str) -> dict:
     project_dir = Path(settings.data_dir) / "projects" / project_id
-    artifact_path = project_dir / "production_artifact.json"
-    artifact = read_json_model(artifact_path, ProductionArtifact)
-    if artifact.cue_ledger is None:
-        raise ValueError("Project has no cue ledger")
+    with Session(engine) as session:
+        artifact = session.get(ProductionArtifact, project_id)
+        if not artifact:
+            raise ValueError("Project not found")
+        if artifact.cue_ledger is None:
+            raise ValueError("Project has no cue ledger")
 
-    artifact.preview_mp4 = render_preview(project_dir, artifact.cue_ledger, artifact.title)
-    artifact.touch()
-    write_json(artifact_path, artifact)
-    return {
-        "project_id": project_id,
-        "preview_mp4": str(artifact.preview_mp4) if artifact.preview_mp4 else None,
-    }
+        artifact.preview_mp4 = str(render_preview(project_dir, artifact.cue_ledger, artifact.title))
+        artifact.touch()
+
+        session.add(artifact)
+        session.commit()
+        session.refresh(artifact)
+        return {
+            "project_id": project_id,
+            "preview_mp4": str(artifact.preview_mp4) if artifact.preview_mp4 else None,
+        }
 
 
 # 執行整個 LAVA 工作流（腳本分割、TTS 語音、ASR 對齊、畫作生成、影片渲染），設置超時防範死鎖。

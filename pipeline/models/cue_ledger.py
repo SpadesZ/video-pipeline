@@ -33,5 +33,5 @@ class CueItem(BaseModel):
 class CueLedger(BaseModel):
     project_id: str
     cues: list[CueItem] = Field(default_factory=list)
-    subtitles_path: Path | None = None
+    subtitles_path: str | None = None
 

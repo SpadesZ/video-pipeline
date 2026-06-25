@@ -9,8 +9,9 @@ logger = logging.getLogger(__name__)
 from fastapi import APIRouter, Depends, Form, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.concurrency import run_in_threadpool
+from sqlmodel import Session
 
-from app.deps import settings_dep
+from app.deps import settings_dep, get_session
 from pipeline.adapters.llm.lava_settings import get_llm_brain_status
 from pipeline.models.asset_manifest import RightsStatus
 from pipeline.models.production_artifact import ProductionArtifact
@@ -1113,6 +1114,7 @@ async def create_project_from_trend(
     primary_keyword: str = Form(...),
     angle: str = Form(...),
     settings: Settings = Depends(settings_dep),
+    session: Session = Depends(get_session),
 ) -> RedirectResponse:
     title_stripped = title.strip() if title else ""
     if not title_stripped:
@@ -1134,6 +1136,7 @@ async def create_project_from_trend(
 
     try:
         artifact = await run_mvp_pipeline(
+            session=session,
             settings=settings,
             title=title_stripped,
             script_markdown=script_markdown,
