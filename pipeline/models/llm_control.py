@@ -37,12 +37,15 @@ class LLMTask(BaseModel):
     label: str
     capability: LLMCapability = LLMCapability.CHAT
     required: bool = False
+    category: str = "general"
+    fallback_behavior: str = "Use deterministic offline fallback when no configured provider succeeds."
     description: str
 
 
 class LLMTaskBinding(BaseModel):
     task_id: str
     connection_id: str
+    model_id: str | None = None
 
 
 class LLMBrainStatus(BaseModel):
@@ -50,4 +53,9 @@ class LLMBrainStatus(BaseModel):
     tasks: list[LLMTask] = Field(default_factory=list)
     bindings: list[LLMTaskBinding] = Field(default_factory=list)
     configured_env_keys: list[str] = Field(default_factory=list)
+    binding_source: str = "default"
+    config_path: str | None = None
 
+
+class LLMSettingsStore(BaseModel):
+    bindings: list[LLMTaskBinding] = Field(default_factory=list)

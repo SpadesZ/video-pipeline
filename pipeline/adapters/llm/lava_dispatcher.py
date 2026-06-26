@@ -3,7 +3,7 @@ import asyncio
 import httpx
 import logging
 
-from pipeline.adapters.llm.lava_settings import binding_for_task, connection_by_id, default_connections
+from pipeline.adapters.llm.lava_settings import binding_for_task, default_connections
 from pipeline.adapters.llm.task_registry import TASK_IDS
 from pipeline.secrets import load_runtime_secrets
 
@@ -21,9 +21,9 @@ async def dispatch_llm_task(
     if task_id not in TASK_IDS:
         return {"ok": False, "error": f"Unknown video LLM task: {task_id}"}
     
-    # Get the primary connection bound to this task
     binding = binding_for_task(task_id)
     primary_conn_id = binding.connection_id if binding else None
+    model_override = binding.model_id if binding else None
     
     connections = default_connections()
     
@@ -39,19 +39,25 @@ async def dispatch_llm_task(
             trial_conns.append(c)
             
     last_error = None
+    attempted_connections = []
     for connection in trial_conns:
+        if not connection.is_active:
+            attempted_connections.append({"connection_id": connection.connection_id, "status": "inactive"})
+            continue
         api_key = os.getenv(connection.api_key_env)
         if not api_key:
-            # Skip if API key is not configured in secrets
+            attempted_connections.append({"connection_id": connection.connection_id, "status": "missing_key"})
             continue
             
         res = {"ok": False}
+        model_id = model_override or connection.model_id
+        attempted_connections.append({"connection_id": connection.connection_id, "status": "attempted", "model": model_id})
         try:
             if connection.provider == "openrouter":
                 res = await openai_compatible_chat_with_retry(
                     connection.base_url or "", 
                     api_key, 
-                    connection.model_id, 
+                    model_id,
                     messages, 
                     temperature, 
                     max_tokens
@@ -59,7 +65,7 @@ async def dispatch_llm_task(
             elif connection.provider == "google":
                 res = await google_chat_with_retry(
                     api_key, 
-                    connection.model_id, 
+                    model_id,
                     messages, 
                     temperature, 
                     max_tokens
@@ -70,12 +76,18 @@ async def dispatch_llm_task(
         if res.get("ok"):
             if connection.connection_id != primary_conn_id:
                 logger.info(f"Fallback active: Task '{task_id}' fell back from {primary_conn_id} to {connection.connection_id}")
+            res["connection_id"] = connection.connection_id
+            res["fallback_order"] = attempted_connections
             return res
         else:
             last_error = res.get("error", "Unknown error")
             logger.warning(f"Connection {connection.connection_id} failed for task '{task_id}': {last_error}")
             
-    return {"ok": False, "error": f"All LLM connections failed for task '{task_id}'. Last error: {last_error}"}
+    return {
+        "ok": False,
+        "error": f"All LLM connections failed for task '{task_id}'. Last error: {last_error}",
+        "fallback_order": attempted_connections,
+    }
 
 
 def is_retryable_error(err_msg: str) -> bool:
