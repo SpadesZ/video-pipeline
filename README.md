@@ -75,8 +75,6 @@ Outputs land under:
 data/projects/<project_id>/
 ```
 
-## Next Build Steps
-
 ## Review Flow
 
 Projects move through:
@@ -134,10 +132,38 @@ CPU-only Windows hosts and does not depend on model downloads. Real local ASR is
 exercised by running the ASR worker on a project that already has a voiceover or
 uploaded audio file.
 
+## LAVA Settings
+
+Open LAVA provider and task binding settings:
+
+```text
+http://localhost:8010/settings/lava
+```
+
+The settings page shows configured provider env keys, registered video LLM
+tasks, required/optional status, current task bindings, and deterministic
+fallback behavior. Binding updates are stored in `DATA_DIR/lava_settings.json`
+and do not store API keys.
+
+Private provider keys stay in `secrets/.env.local`:
+
+```text
+OPENROUTER_API_KEY=...
+GOOGLE_API_KEY=...
+OPENROUTER_MODEL_ID=openai/gpt-4o-mini
+GOOGLE_MODEL_ID=gemini-2.0-flash
+```
+
+Run the no-key LAVA settings smoke:
+
+```powershell
+docker compose run --rm worker python scripts/smoke_lava_settings.py
+```
+
 ## Next Build Steps
 
-1. Expand LAVA settings/config UI and task registry coverage.
-2. Improve navigation, project state visibility, and user-facing status flow.
+1. Improve navigation, project state visibility, and user-facing status flow.
+2. Add external import stability checks and restart-stable Docker operations.
 3. Add quality scoring gates for transcript, script, visual, audio, and video.
 4. Add image/asset generation with safe fallbacks.
 5. Add optional GPU/WhisperX profile only after the CPU workflow is stable.

@@ -13,6 +13,7 @@ data/projects/*
 data/assets/*
 data/temp/*
 data/exports/*
+data/lava_settings.json
 !data/projects/.gitkeep
 !data/assets/.gitkeep
 !data/temp/.gitkeep

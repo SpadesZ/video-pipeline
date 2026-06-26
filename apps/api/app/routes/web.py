@@ -18,12 +18,13 @@ logger = logging.getLogger(__name__)
 
 
 from fastapi import APIRouter, Depends, Form, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.concurrency import run_in_threadpool
 from sqlmodel import Session
 
 from app.deps import settings_dep, get_session
-from pipeline.adapters.llm.lava_settings import get_llm_brain_status
+from pipeline.adapters.llm.lava_settings import get_llm_brain_status, update_task_binding
+from pipeline.adapters.llm.lava_verifier import verify_connection
 from pipeline.models.asset_manifest import RightsStatus
 from pipeline.models.production_artifact import ProductionArtifact
 from pipeline.models.review import DecisionLogEntry, ReviewStatus
@@ -190,7 +191,10 @@ def home(settings: Settings = Depends(settings_dep)) -> str:
               <p class="eyebrow">Local production desk</p>
               <h1>Video Pipeline</h1>
             </div>
-            <a class="ghost-button" href="/docs">API Docs</a>
+            <div class="actions">
+              <a class="ghost-button" href="/settings/lava">LAVA Settings</a>
+              <a class="ghost-button" href="/docs">API Docs</a>
+            </div>
           </header>
  
           <section class="overview-grid">
@@ -261,6 +265,40 @@ def home(settings: Settings = Depends(settings_dep)) -> str:
         </section>
         """,
     )
+
+
+@router.get("/settings/lava/status")
+def lava_status_json(settings: Settings = Depends(settings_dep)) -> JSONResponse:
+    return JSONResponse(get_llm_brain_status(settings).model_dump(mode="json"))
+
+
+@router.get("/settings/lava", response_class=HTMLResponse)
+def lava_settings_page(settings: Settings = Depends(settings_dep)) -> str:
+    return lava_settings_view(settings)
+
+
+@router.post("/settings/lava/binding")
+def update_lava_task_binding(
+    task_id: str = Form(...),
+    connection_id: str = Form(...),
+    model_id: str = Form(""),
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    try:
+        update_task_binding(task_id, connection_id, settings=settings, model_id=model_id)
+    except ValueError as exc:
+        raise WebException(detail=str(exc), status_code=400, back_link="/settings/lava")
+    return RedirectResponse(url="/settings/lava", status_code=303)
+
+
+@router.post("/settings/lava/verify", response_class=HTMLResponse)
+async def verify_lava_task_connection(
+    connection_id: str = Form(...),
+    capability: str = Form("chat"),
+    settings: Settings = Depends(settings_dep),
+) -> str:
+    result = await verify_connection(connection_id, capability=capability)
+    return lava_settings_view(settings, verification_result=result)
 
 
 @router.post("/")
@@ -360,7 +398,7 @@ def project_detail(project_id: str, settings: Settings = Depends(settings_dep)) 
               </section>
             </main>
             <aside class="side-col">
-              {llm_brain_panel(project_id)}
+              {llm_brain_panel(project_id, settings)}
               {review_panel(artifact)}
               {packaging_panel(artifact)}
               {shorts_panel(artifact)}
@@ -631,6 +669,134 @@ def page(title: str, body: str) -> str:
     """
 
 
+def lava_settings_view(settings: Settings, verification_result: dict | None = None) -> str:
+    status = get_llm_brain_status(settings)
+    binding_map = {binding.task_id: binding for binding in status.bindings}
+    connection_map = {connection.connection_id: connection for connection in status.connections}
+    configured_envs = set(status.configured_env_keys)
+
+    verification_html = ""
+    if verification_result is not None:
+        ok = bool(verification_result.get("ok"))
+        cls = "ok" if ok else "warn"
+        summary = verification_result.get("reply") if ok else verification_result.get("error", "Verification failed")
+        verification_html = f"""
+        <section class="panel" style="border-color: {'var(--accent)' if ok else 'var(--amber)'};">
+          <div class="section-head">
+            <h2>Verification Result</h2>
+            <span class="status {cls}">{'ok' if ok else 'needs attention'}</span>
+          </div>
+          <p class="muted">{escape(str(summary))}</p>
+        </section>
+        """
+
+    connection_rows = []
+    connection_options = []
+    for connection in status.connections:
+        configured = connection.api_key_env in configured_envs
+        key_badge = '<span class="status ok">configured</span>' if configured else '<span class="status warn">missing key</span>'
+        active_badge = '<span class="status ok">active</span>' if connection.is_active else '<span class="status warn">inactive</span>'
+        connection_options.append(
+            f'<option value="{escape(connection.connection_id)}">{escape(connection.label)}</option>'
+        )
+        connection_rows.append(
+            f"""
+            <tr>
+              <td><strong>{escape(connection.label)}</strong><br><span class="muted mono">{escape(connection.connection_id)}</span></td>
+              <td>{escape(connection.provider)}</td>
+              <td class="mono">{escape(connection.model_id)}</td>
+              <td>{key_badge}</td>
+              <td>{active_badge}</td>
+              <td>
+                <form method="post" action="/settings/lava/verify">
+                  <input type="hidden" name="connection_id" value="{escape(connection.connection_id)}" />
+                  <input type="hidden" name="capability" value="chat" />
+                  <button class="ghost-button" type="submit">Verify</button>
+                </form>
+              </td>
+            </tr>
+            """
+        )
+
+    option_html = "".join(connection_options)
+    task_rows = []
+    for task in status.tasks:
+        binding = binding_map.get(task.task_id)
+        selected_connection_id = binding.connection_id if binding else ""
+        bound_connection = connection_map.get(selected_connection_id)
+        model_value = binding.model_id if binding and binding.model_id else ""
+        selected_options = []
+        for connection in status.connections:
+            selected = " selected" if connection.connection_id == selected_connection_id else ""
+            selected_options.append(
+                f'<option value="{escape(connection.connection_id)}"{selected}>{escape(connection.label)}</option>'
+            )
+        required = '<span class="status warn">required</span>' if task.required else '<span class="status ok">optional</span>'
+        key_status = "unbound"
+        if bound_connection:
+            key_status = "configured" if bound_connection.api_key_env in configured_envs else "missing key"
+        task_rows.append(
+            f"""
+            <tr>
+              <td>
+                <strong>{escape(task.label)}</strong><br>
+                <span class="muted mono">{escape(task.task_id)}</span><br>
+                <span class="muted">{escape(task.description)}</span>
+              </td>
+              <td>{required}<br><span class="pill">{escape(task.category)}</span></td>
+              <td>
+                <form method="post" action="/settings/lava/binding" class="lava-binding-form">
+                  <input type="hidden" name="task_id" value="{escape(task.task_id)}" />
+                  <select name="connection_id">{''.join(selected_options) or option_html}</select>
+                  <input name="model_id" value="{escape(model_value)}" placeholder="{escape(bound_connection.model_id if bound_connection else 'optional model override')}" />
+                  <button class="ghost-button" type="submit">Save</button>
+                </form>
+                <span class="muted">key: {escape(key_status)}</span>
+              </td>
+              <td class="muted">{escape(task.fallback_behavior)}</td>
+            </tr>
+            """
+        )
+
+    return page(
+        title="LAVA Settings",
+        body=f"""
+        <section class="app-shell">
+          <header class="topbar">
+            <div>
+              <a class="text-link" href="/">Back to Projects</a>
+              <p class="eyebrow">LLM control plane</p>
+              <h1>LAVA Settings</h1>
+              <p class="muted mono">binding source: {escape(status.binding_source)} | config: {escape(status.config_path or '-')}</p>
+            </div>
+            <a class="ghost-button" href="/settings/lava/status">Status JSON</a>
+          </header>
+          {verification_html}
+          <section class="panel">
+            <div class="section-head">
+              <h2>Provider Connections</h2>
+              <span class="muted">{len(status.configured_env_keys)} configured env keys</span>
+            </div>
+            <table>
+              <thead><tr><th>Connection</th><th>Provider</th><th>Model</th><th>Key</th><th>State</th><th></th></tr></thead>
+              <tbody>{''.join(connection_rows)}</tbody>
+            </table>
+          </section>
+          <section class="panel">
+            <div class="section-head">
+              <h2>Task Bindings</h2>
+              <span class="muted">{len(status.tasks)} registered tasks</span>
+            </div>
+            <table>
+              <thead><tr><th>Task</th><th>Stage</th><th>Binding</th><th>Fallback</th></tr></thead>
+              <tbody>{''.join(task_rows)}</tbody>
+            </table>
+          </section>
+        </section>
+        """,
+    )
+
+
 def project_row(artifact: ProductionArtifact) -> str:
     cues = len(artifact.cue_ledger.cues) if artifact.cue_ledger else 0
     ready = bool(artifact.compliance_report and artifact.compliance_report.upload_ready)
@@ -812,15 +978,16 @@ def visual_shot_card(shot) -> str:
     """
 
 
-def llm_brain_panel(project_id: str) -> str:
-    status = get_llm_brain_status()
-    binding_map = {binding.task_id: binding.connection_id for binding in status.bindings}
+def llm_brain_panel(project_id: str, settings: Settings) -> str:
+    status = get_llm_brain_status(settings)
+    binding_map = {binding.task_id: binding for binding in status.bindings}
     connection_map = {connection.connection_id: connection for connection in status.connections}
     rows = []
     for task in status.tasks:
-        connection = connection_map.get(binding_map.get(task.task_id, ""))
+        binding = binding_map.get(task.task_id)
+        connection = connection_map.get(binding.connection_id if binding else "")
         provider = connection.provider if connection else "unbound"
-        model = connection.model_id if connection else "-"
+        model = binding.model_id or connection.model_id if binding and connection else "-"
         configured = bool(connection and connection.api_key_env in status.configured_env_keys)
         key_badge = '<span class="status ok">key ready</span>' if configured else '<span class="status warn">key missing</span>'
         rows.append(
@@ -840,7 +1007,7 @@ def llm_brain_panel(project_id: str) -> str:
     <section class="panel">
       <div class="section-head">
         <h2>LLM Brain</h2>
-        <span class="pill">LAVA-style bindings</span>
+        <a class="button-link" href="/settings/lava">Settings</a>
       </div>
       <table>
         <thead><tr><th>Task</th><th>Provider</th><th>Model</th><th>Key</th></tr></thead>
@@ -1606,6 +1773,13 @@ def styles() -> str:
       margin-bottom: 14px;
     }
     .project-form { display: grid; gap: 12px; }
+    .lava-binding-form {
+      display: grid;
+      grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 6px;
+    }
     .field { display: grid; gap: 6px; }
     label { color: var(--muted); font-size: 12px; }
     input, textarea, select {
@@ -1890,6 +2064,7 @@ def styles() -> str:
     }
     @media (max-width: 720px) {
       .split, .asset-card, .asset-form, .gate-form { grid-template-columns: 1fr; }
+      .lava-binding-form { grid-template-columns: 1fr; }
       h1 { font-size: 23px; }
     }
     """
