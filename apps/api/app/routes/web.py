@@ -184,16 +184,13 @@ def home(settings: Settings = Depends(settings_dep)) -> str:
 
     return page(
         title="Video Pipeline",
+        active_nav="projects",
         body=f"""
         <section class="app-shell">
           <header class="topbar">
             <div>
               <p class="eyebrow">Local production desk</p>
-              <h1>Video Pipeline</h1>
-            </div>
-            <div class="actions">
-              <a class="ghost-button" href="/settings/lava">LAVA Settings</a>
-              <a class="ghost-button" href="/docs">API Docs</a>
+              <h1>Video Pipeline Dashboard</h1>
             </div>
           </header>
  
@@ -356,11 +353,11 @@ def project_detail(project_id: str, settings: Settings = Depends(settings_dep)) 
 
     return page(
         title=artifact.title,
+        active_nav="projects",
         body=f"""
         <section class="app-shell detail-page">
           <header class="project-hero">
             <div>
-              <a class="text-link" href="/">Back to Projects</a>
               <h1>{escape(artifact.title)}</h1>
               <p class="muted mono">{escape(project_id)} | {escape(artifact.language)} | {escape(artifact.persona or "no persona")}</p>
             </div>
@@ -379,6 +376,8 @@ def project_detail(project_id: str, settings: Settings = Depends(settings_dep)) 
             {stat_card("Review State", status_label(artifact.review_status), "current gate")}
             {stat_card("Upload Ready", "Yes" if upload_ready else "No", "hard stop/go")}
           </section>
+
+          {status_flow_panel(artifact)}
 
           <section class="review-layout">
             <main class="main-col">
@@ -654,7 +653,17 @@ def approved_assets_count(artifact: ProductionArtifact) -> int:
     return sum(1 for asset in artifact.asset_manifest.assets if asset.rights_status == RightsStatus.APPROVED)
 
 
-def page(title: str, body: str) -> str:
+def page(title: str, body: str, active_nav: str = "") -> str:
+    nav_html = f"""
+    <nav class="global-nav" aria-label="Primary navigation">
+      <a class="nav-brand" href="/">Video Pipeline MVP</a>
+      <div class="nav-links">
+        <a href="/" class="{'active' if active_nav == 'projects' else ''}">Projects</a>
+        <a href="/settings/lava" class="{'active' if active_nav == 'lava' else ''}">LAVA Settings</a>
+        <a href="/docs">API Docs</a>
+      </div>
+    </nav>
+    """
     return f"""
     <!doctype html>
     <html lang="en">
@@ -664,7 +673,10 @@ def page(title: str, body: str) -> str:
         <title>{escape(title)}</title>
         <style>{styles()}</style>
       </head>
-      <body>{body}</body>
+      <body>
+        {nav_html}
+        {body}
+      </body>
     </html>
     """
 
@@ -760,11 +772,11 @@ def lava_settings_view(settings: Settings, verification_result: dict | None = No
 
     return page(
         title="LAVA Settings",
+        active_nav="lava",
         body=f"""
         <section class="app-shell">
           <header class="topbar">
             <div>
-              <a class="text-link" href="/">Back to Projects</a>
               <p class="eyebrow">LLM control plane</p>
               <h1>LAVA Settings</h1>
               <p class="muted mono">binding source: {escape(status.binding_source)} | config: {escape(status.config_path or '-')}</p>
@@ -800,12 +812,20 @@ def lava_settings_view(settings: Settings, verification_result: dict | None = No
 def project_row(artifact: ProductionArtifact) -> str:
     cues = len(artifact.cue_ledger.cues) if artifact.cue_ledger else 0
     ready = bool(artifact.compliance_report and artifact.compliance_report.upload_ready)
+    snapshot = project_status_snapshot(artifact)
+    mini_status = status_mini_strip(snapshot["items"])
     return f"""
     <tr>
       <td class="mono">{escape(artifact.project_id)}</td>
       <td>{escape(artifact.title)}</td>
       <td>{cues}</td>
-      <td>{status_chip(artifact.review_status, ready)}</td>
+      <td>
+        <div class="project-status-stack">
+          {mini_status}
+          {status_chip(artifact.review_status, ready)}
+          <small class="muted">{escape(snapshot["next_action_text"])}</small>
+        </div>
+      </td>
       <td><a class="button-link" href="/projects/{escape(artifact.project_id)}/view">Open</a></td>
     </tr>
     """
@@ -1173,6 +1193,144 @@ def stepper(status: ReviewStatus) -> str:
     return f'<ol class="stepper">{"".join(items)}</ol>'
 
 
+def project_status_snapshot(artifact: ProductionArtifact) -> dict:
+    asset_count = len(artifact.asset_manifest.assets) if artifact.asset_manifest else 0
+    approved_asset_count = approved_assets_count(artifact)
+    has_transcript = bool(artifact.transcript_import)
+    has_cues = bool(artifact.cue_ledger and artifact.cue_ledger.cues)
+    lava_ready = bool(artifact.visual_contract or artifact.video_packaging)
+    assets_ready = asset_count > 0 and asset_count == approved_asset_count
+    preview_ready = bool(artifact.preview_mp4) or artifact.review_status in {
+        ReviewStatus.PREVIEW_READY,
+        ReviewStatus.APPROVED,
+    }
+    compliance_ready = bool(artifact.compliance_report)
+    upload_ready = bool(artifact.compliance_report and artifact.compliance_report.upload_ready)
+    transcript_detail = "imported" if has_transcript else ("script cues" if has_cues else "missing")
+
+    items = [
+        {
+            "key": "transcript",
+            "short": "ASR",
+            "label": "Transcript",
+            "detail": transcript_detail,
+            "state": "ok" if has_transcript else "warn",
+        },
+        {
+            "key": "lava",
+            "short": "LAVA",
+            "label": "LAVA",
+            "detail": "ready" if lava_ready else "not run",
+            "state": "ok" if lava_ready else "warn",
+        },
+        {
+            "key": "assets",
+            "short": "AST",
+            "label": "Assets",
+            "detail": f"{approved_asset_count}/{asset_count} approved" if asset_count else "none",
+            "state": "ok" if assets_ready else "warn",
+        },
+        {
+            "key": "preview",
+            "short": "PVW",
+            "label": "Preview",
+            "detail": "ready" if preview_ready else "pending",
+            "state": "ok" if preview_ready else "warn",
+        },
+        {
+            "key": "compliance",
+            "short": "CMP",
+            "label": "Compliance",
+            "detail": "checked" if compliance_ready else "not checked",
+            "state": "ok" if compliance_ready else "warn",
+        },
+        {
+            "key": "upload",
+            "short": "UP",
+            "label": "Upload",
+            "detail": "ready" if upload_ready else "blocked",
+            "state": "ok" if upload_ready else "block",
+        },
+    ]
+
+    next_action_html = '<a href="#transcript" class="text-link">Import Transcript</a> or Run CPU ASR'
+    next_action_text = "Import Transcript or Run CPU ASR"
+    missing = "Audio file or external ASR output"
+    if not has_cues:
+        if has_transcript:
+            next_action_html = "Approve transcript import to rebuild cues"
+            next_action_text = "Approve transcript import to rebuild cues"
+            missing = "Cue ledger"
+    elif not lava_ready:
+        next_action_html = "Run LAVA Brain Workflow"
+        next_action_text = "Run LAVA Brain Workflow"
+        missing = "LAVA visual/packaging outputs"
+    elif not assets_ready:
+        next_action_html = '<a href="#assets" class="text-link">Review and approve assets</a>'
+        next_action_text = "Review and approve assets"
+        missing = "Approved asset rights"
+    elif not preview_ready:
+        next_action_html = "Review final preview"
+        next_action_text = "Review final preview"
+        missing = "Preview approval"
+    elif not compliance_ready:
+        next_action_html = "Run compliance check through the review flow"
+        next_action_text = "Run compliance check through the review flow"
+        missing = "Compliance report"
+    elif not upload_ready:
+        next_action_html = "Resolve compliance findings or approve final gate"
+        next_action_text = "Resolve compliance findings or approve final gate"
+        missing = "Final approval and clear compliance"
+    else:
+        next_action_html = "Ready for manual upload/export handoff"
+        next_action_text = "Ready for manual upload/export handoff"
+        missing = "None"
+
+    return {
+        "items": items,
+        "next_action_html": next_action_html,
+        "next_action_text": next_action_text,
+        "missing": missing,
+        "upload_ready": upload_ready,
+        "review_status": status_label(artifact.review_status),
+    }
+
+
+def status_mini_strip(items: list[dict]) -> str:
+    badges = "".join(
+        f'<span class="status-mini {escape(str(item["state"]))}" title="{escape(str(item["label"]))}: {escape(str(item["detail"]))}">'
+        f'{escape(str(item["short"]))}</span>'
+        for item in items
+    )
+    return f'<div class="status-minis">{badges}</div>'
+
+
+def status_flow_panel(artifact: ProductionArtifact) -> str:
+    snapshot = project_status_snapshot(artifact)
+    nodes = "".join(
+        f"""
+        <div class="status-node {escape(str(item["state"]))}">
+          <span>{escape(str(item["label"]))}</span>
+          <strong>{escape(str(item["detail"]))}</strong>
+        </div>
+        """
+        for item in snapshot["items"]
+    )
+    return f"""
+    <section class="panel status-flow-panel">
+      <div class="section-head">
+        <h2>Project Status Flow</h2>
+        <span class="status {'ok' if snapshot["upload_ready"] else 'warn'}">{escape(str(snapshot["review_status"]))}</span>
+      </div>
+      <div class="status-pipeline">{nodes}</div>
+      <div class="action-box">
+        <p><strong>Next Recommended Action:</strong> {snapshot["next_action_html"]}</p>
+        <p class="muted"><strong>Missing Prerequisites:</strong> {escape(str(snapshot["missing"]))}</p>
+      </div>
+    </section>
+    """
+
+
 def step_index(status: ReviewStatus) -> int:
     if status in {ReviewStatus.DRAFT, ReviewStatus.CUES_READY, ReviewStatus.CHANGES_REQUESTED}:
         return 0
@@ -1385,11 +1543,11 @@ async def trend_research_list(
 
     return page(
         title="AI Trend Research Results",
+        active_nav="projects",
         body=f"""
         <section class="app-shell">
           <header class="project-hero">
             <div>
-              <a class="text-link" href="/">Back to Dashboard</a>
               <h1 style="margin-top:8px;">AI Niche Research: {escape(topic_prompt)}</h1>
               <p class="muted">Primary Keyword: {escape(report.get('primary_keyword'))} | Search Intent: {escape(report.get('search_intent'))}</p>
             </div>
@@ -1720,10 +1878,53 @@ def styles() -> str:
     h1, h2, p { margin: 0; }
     h1 { font-size: 28px; line-height: 1.2; }
     h2 { font-size: 16px; line-height: 1.3; }
+    .global-nav {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      min-height: 48px;
+      padding: 0 16px;
+      background: #151713;
+      border-bottom: 1px solid var(--line);
+    }
+    .nav-brand {
+      color: var(--accent-strong);
+      font-weight: 700;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    .nav-links a {
+      min-height: 32px;
+      display: inline-flex;
+      align-items: center;
+      padding: 0 10px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .nav-links a:hover, .nav-links a.active {
+      border-color: var(--line);
+      background: var(--panel-2);
+      color: var(--text);
+    }
     .app-shell {
       display: grid;
       gap: 16px;
-      min-height: 100vh;
+      min-height: calc(100vh - 48px);
       padding: 16px;
     }
     .topbar, .project-hero, .panel, .stat-card, .create-pane, .list-pane {
@@ -1914,6 +2115,75 @@ def styles() -> str:
     .stepper .blocked span { background: var(--danger); color: #160706; }
     .stepper .current, .stepper .blocked { border-color: var(--accent); }
     .stepper .todo { opacity: 0.7; }
+    .project-status-stack {
+      display: grid;
+      gap: 7px;
+      align-items: start;
+    }
+    .status-minis {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    .status-mini {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 34px;
+      min-height: 22px;
+      padding: 0 6px;
+      border-radius: 5px;
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--muted);
+      font-family: Consolas, monospace;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .status-mini.ok { color: #84e8ad; border-color: #2c7a55; }
+    .status-mini.warn { color: #f0c86b; border-color: #7b6429; }
+    .status-mini.block { color: #ff9b95; border-color: #884141; }
+    .status-flow-panel {
+      background: var(--panel-2);
+      border-color: #315f48;
+    }
+    .status-pipeline {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(118px, 1fr));
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .status-node {
+      min-height: 74px;
+      display: grid;
+      gap: 6px;
+      align-content: center;
+      padding: 10px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .status-node span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .status-node strong {
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
+    .status-node.ok { border-color: #2c7a55; }
+    .status-node.warn { border-color: #7b6429; }
+    .status-node.block { border-color: #884141; }
+    .action-box {
+      display: grid;
+      gap: 6px;
+      padding: 12px 14px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: var(--bg);
+      line-height: 1.5;
+    }
     .review-layout {
       display: grid;
       grid-template-columns: minmax(0, 1.4fr) minmax(340px, 0.8fr);
@@ -2058,13 +2328,15 @@ def styles() -> str:
       line-height: 1.45;
     }
     @media (max-width: 1100px) {
-      .workspace, .review-layout, .overview-grid, .stepper { grid-template-columns: 1fr; }
+      .workspace, .review-layout, .overview-grid, .stepper, .status-pipeline { grid-template-columns: 1fr; }
       .project-hero, .topbar { display: grid; }
       .actions { justify-content: flex-start; }
     }
     @media (max-width: 720px) {
       .split, .asset-card, .asset-form, .gate-form { grid-template-columns: 1fr; }
       .lava-binding-form { grid-template-columns: 1fr; }
+      .global-nav { align-items: flex-start; flex-direction: column; padding: 10px 12px; }
+      .nav-links { flex-wrap: wrap; justify-content: flex-start; }
       h1 { font-size: 23px; }
     }
     """

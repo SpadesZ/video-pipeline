@@ -132,6 +132,19 @@ CPU-only Windows hosts and does not depend on model downloads. Real local ASR is
 exercised by running the ASR worker on a project that already has a voiceover or
 uploaded audio file.
 
+## Navigation and Status Flow
+
+The web console has a persistent top navigation bar for Projects, LAVA Settings,
+and API Docs. The project detail page includes a Project Status Flow panel that
+summarizes transcript/ASR, LAVA output, asset rights, preview, compliance, and
+upload readiness, plus the next recommended action and missing prerequisite.
+
+Run the deterministic navigation/UI smoke:
+
+```powershell
+docker compose run --rm api python scripts/smoke_navigation_ui.py
+```
+
 ## LAVA Settings
 
 Open LAVA provider and task binding settings:
