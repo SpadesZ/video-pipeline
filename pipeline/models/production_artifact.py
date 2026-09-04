@@ -23,6 +23,7 @@ from pipeline.models.production_profile import ProductionProfile
 from pipeline.models.review import DecisionLogEntry, ReviewStatus
 from pipeline.models.shorts_manifest import ShortsManifest
 from pipeline.models.shot import CharacterIdentityPack, ShotPlan
+from pipeline.models.timeline import EditDecision
 from pipeline.models.transcript import TranscriptImport
 from pipeline.models.visual_contract import VisualQualityContract, VisualQualityReport
 
@@ -96,6 +97,11 @@ class ProductionArtifact(SQLModel, table=True):
     shot_plans: list[ShotPlan] = Field(
         default_factory=list,
         sa_column=Column(PydanticJSON(ShotPlan, is_list=True))
+    )
+    # 剪輯決策是人工調整的成果，必須持久化而非每次由選定候選重新推導
+    edit_decisions: list[EditDecision] = Field(
+        default_factory=list,
+        sa_column=Column(PydanticJSON(EditDecision, is_list=True))
     )
 
     review_status: ReviewStatus = ReviewStatus.CUES_READY

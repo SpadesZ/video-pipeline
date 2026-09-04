@@ -35,6 +35,10 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      # 組裝與規格探測需要 ffmpeg/ffprobe。不依賴 runner 預裝。
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -60,6 +64,10 @@ jobs:
 
       - name: Variant import and QC smoke
         run: python scripts/smoke_variant_qc.py
+
+      # 無 ffmpeg 時組裝會輸出清單檔，測試仍須通過
+      - name: Shot assembly smoke
+        run: python scripts/smoke_shot_assembly.py
 
       # 此腳本自行覆寫 DATA_DIR 與清空金鑰，不需外部環境變數
       - name: LAVA settings smoke (no API keys)

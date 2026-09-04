@@ -84,6 +84,7 @@ container.
 | `smoke_capability_router.py` | `api` |
 | `smoke_manual_provider.py` | `api` |
 | `smoke_variant_qc.py` | `api` |
+| `smoke_shot_assembly.py` | `api` |
 | `smoke_project_store.py` | `worker` |
 | `smoke_lava_settings.py` | `worker` |
 | `smoke_asr.py` | `asr-worker` (needs `--profile asr`) |

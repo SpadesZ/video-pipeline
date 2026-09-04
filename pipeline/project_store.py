@@ -16,6 +16,7 @@ from pipeline.models.production_profile import ProductionProfile
 from pipeline.models.review import DecisionLogEntry, ReviewStatus
 from pipeline.models.shorts_manifest import ShortsManifest
 from pipeline.models.shot import CharacterIdentityPack, ShotPlan
+from pipeline.models.timeline import EditDecision
 from pipeline.settings import Settings
 from pipeline.stages.compliance_checker import check_compliance
 from pipeline.models.transcript import TranscriptImport
@@ -37,6 +38,7 @@ JSON_FIELDS = (
     "narrative_ir",
     "character_packs",
     "shot_plans",
+    "edit_decisions",
     "video_packaging",
     "decision_log",
 )
@@ -58,6 +60,7 @@ MODEL_FIELDS = {
 LIST_MODEL_FIELDS = {
     "character_packs": CharacterIdentityPack,
     "shot_plans": ShotPlan,
+    "edit_decisions": EditDecision,
     "decision_log": DecisionLogEntry,
 }
 
@@ -126,6 +129,11 @@ def write_project_files(settings: Settings, artifact: ProductionArtifact) -> Pat
         write_json(
             project_dir / "shot_plans.json",
             [plan.model_dump(mode="json") for plan in artifact.shot_plans],
+        )
+    if artifact.edit_decisions:
+        write_json(
+            project_dir / "edit_decisions.json",
+            [item.model_dump(mode="json") for item in artifact.edit_decisions],
         )
     write_json(project_dir / ARTIFACT_FILENAME, artifact)
     return project_dir
