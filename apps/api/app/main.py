@@ -14,11 +14,12 @@ from fastapi.responses import HTMLResponse
 
 from app.routes import health, projects, render, web
 from app.routes.web import WebException, error_page
-from pipeline.db import init_db
+from pipeline.db import init_db, log_schema_status
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    log_schema_status()
     yield
 
 app = FastAPI(title="Video Pipeline API", version="0.1.0", lifespan=lifespan)

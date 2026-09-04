@@ -1,0 +1,61 @@
+# 檔案路徑: video-pipeline/.github/workflows/pr.yml
+# 產生時間: 2026-09-04 +08:00
+# 版本: v1.0
+# 模組定位:
+#   PR 快速回饋 CI。
+# 主要責任:
+#   1. 以 native Python 執行單元測試、schema 檢查與輕量確定性冒煙。
+#   2. 刻意不啟動 Docker，避免每次小改動都重建 ASR / FFmpeg / Postgres 映像。
+# 說明:
+#   需要 Docker 的完整整合測試由 integration.yml 負責。
+# --------------------------------------------------------------------------
+
+name: PR
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    name: Unit + schema + fast smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Compile check
+        run: python -m compileall -q apps pipeline scripts
+
+      - name: Unit tests
+        run: python -m pytest tests/ -q
+
+      - name: Migration smoke
+        run: python scripts/smoke_migrations.py
+
+      # 此腳本自行覆寫 DATA_DIR 與清空金鑰，不需外部環境變數
+      - name: LAVA settings smoke (no API keys)
+        run: python scripts/smoke_lava_settings.py
+
+      - name: Schema upgrade and check
+        env:
+          DATABASE_URL: sqlite:///${{ runner.temp }}/ci_schema.db
+        run: |
+          python scripts/migrate.py upgrade
+          python scripts/migrate.py check

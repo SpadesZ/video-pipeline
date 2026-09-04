@@ -69,6 +69,42 @@ Run a smoke job:
 docker compose run --rm api python scripts/smoke_test.py
 ```
 
+### Smoke Suite
+
+Each smoke is deterministic and needs no API key. Note the container column:
+`smoke_project_store.py` imports the worker module and fails in the `api`
+container.
+
+| Smoke | Container |
+|---|---|
+| `smoke_test.py` | `api` |
+| `smoke_navigation_ui.py` | `api` |
+| `smoke_migrations.py` | `api` |
+| `smoke_project_store.py` | `worker` |
+| `smoke_lava_settings.py` | `worker` |
+| `smoke_asr.py` | `asr-worker` (needs `--profile asr`) |
+
+## Database Migrations
+
+Schema changes use explicit versioned migrations. `SQLModel.metadata.create_all()`
+creates missing tables but never alters existing ones, so any new column must
+ship with a migration.
+
+```powershell
+docker compose run --rm api python scripts/migrate.py status
+docker compose run --rm api python scripts/migrate.py upgrade
+docker compose run --rm api python scripts/migrate.py check
+docker compose run --rm api python scripts/migrate.py downgrade --target 1
+```
+
+`check` exits non-zero when the schema is behind, which is what CI uses.
+Migrations live in `pipeline/migrations/versions/` as `vNNNN_<name>.py`, each
+defining `VERSION`, `NAME`, `upgrade(conn, dialect)`, and `downgrade(conn, dialect)`.
+They are dialect-aware and verified against both SQLite and PostgreSQL.
+
+The application never modifies schema on startup. It only logs a warning when
+the schema is behind.
+
 Outputs land under:
 
 ```text
