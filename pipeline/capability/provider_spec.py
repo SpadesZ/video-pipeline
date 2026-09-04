@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 
@@ -24,6 +25,23 @@ from pipeline.models.capability import Capability
 from pipeline.models.variant import TransportKind
 
 CATALOG_DIR = Path(__file__).resolve().parent / "catalog" / "providers"
+
+
+class DurationUnit(StrEnum):
+    """平台介面接受的片長單位。
+
+    內部一律以毫秒表達，輸出至 job package 時依平台換算。多數平台的
+    操作介面以秒為單位，若直接輸出毫秒，人工照著填會得到錯誤的片長。
+    """
+
+    MILLISECONDS = "ms"
+    SECONDS = "seconds"
+
+    def from_ms(self, duration_ms: int) -> int | float:
+        if self is DurationUnit.MILLISECONDS:
+            return duration_ms
+        seconds = duration_ms / 1000
+        return int(seconds) if seconds.is_integer() else round(seconds, 2)
 
 
 class DurationLimits(BaseModel):
@@ -47,6 +65,8 @@ class ProviderSpec(BaseModel):
 
     supported_capabilities: list[Capability] = Field(default_factory=list)
     duration_limits: DurationLimits = Field(default_factory=DurationLimits)
+    # 平台介面填寫片長時使用的單位，內部恆為毫秒
+    duration_unit: DurationUnit = DurationUnit.SECONDS
     max_reference_assets: int | None = None
     supported_aspect_ratios: list[str] = Field(default_factory=list)
 

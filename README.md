@@ -82,6 +82,7 @@ container.
 | `smoke_migrations.py` | `api` |
 | `smoke_narrative_models.py` | `api` |
 | `smoke_capability_router.py` | `api` |
+| `smoke_manual_provider.py` | `api` |
 | `smoke_project_store.py` | `worker` |
 | `smoke_lava_settings.py` | `worker` |
 | `smoke_asr.py` | `asr-worker` (needs `--profile asr`) |

@@ -49,14 +49,18 @@ def clear_adapters() -> None:
     _ADAPTERS.clear()
 
 
-def _install_default_adapters() -> None:
+def install_default_adapters() -> None:
+    """安裝內建轉接器。測試清空登錄表後可呼叫此函式復原。"""
     from pipeline.capability.adapters.chat import (
         GoogleChatAdapter,
         OpenRouterChatAdapter,
     )
+    from pipeline.capability.transports.manual import install_manual_adapters
 
     register_adapter(OpenRouterChatAdapter())
     register_adapter(GoogleChatAdapter())
+    # 人工 transport 依 ProviderSpec 的 transport 欄位資料驅動註冊
+    install_manual_adapters()
 
 
 async def dispatch_capability(
@@ -154,4 +158,4 @@ async def dispatch_capability(
     )
 
 
-_install_default_adapters()
+install_default_adapters()

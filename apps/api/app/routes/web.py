@@ -11,22 +11,33 @@
 
 from html import escape
 from pathlib import Path
+import io
 import re
 import logging
+import zipfile
 
 logger = logging.getLogger(__name__)
 
 
 from fastapi import APIRouter, Depends, Form, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
 from fastapi.concurrency import run_in_threadpool
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from app.deps import settings_dep, get_session
 from pipeline.adapters.llm.lava_settings import get_llm_brain_status, update_task_binding
 from pipeline.adapters.llm.lava_verifier import verify_connection
+from pipeline.capability.provider_spec import provider_specs
+from pipeline.db import engine
 from pipeline.models.asset_manifest import RightsStatus
 from pipeline.models.production_artifact import ProductionArtifact
+from pipeline.models.variant import CapabilityJob, TransportKind
 from pipeline.models.review import DecisionLogEntry, ReviewStatus
 from pipeline.models.transcript import TranscriptFormat
 from pipeline.project_store import (
@@ -38,6 +49,7 @@ from pipeline.project_store import (
 from pipeline.settings import Settings
 from pipeline.stages.compliance_checker import check_compliance
 from pipeline.stages.run_mvp import run_mvp_pipeline
+from pipeline.stages.shot_dispatcher import dispatch_project_shots, job_package_root
 from pipeline.stages.transcript_importer import import_transcript
 from pipeline.utils.files import ensure_project_dir
 from pipeline.stages.llm_executors import run_topic_research, run_script_outline, run_packaging
@@ -383,6 +395,7 @@ def project_detail(project_id: str, settings: Settings = Depends(settings_dep)) 
             <main class="main-col">
               {preview}
               {transcript_panel(artifact)}
+              {shot_dispatch_panel(artifact)}
               {cue_strip}
               {visual_quality_panel(artifact)}
               <section class="panel">
@@ -485,6 +498,83 @@ def trigger_local_asr(
     artifact.touch()
     save_project(settings, artifact)
     return RedirectResponse(url=f"/projects/{project_id}/view#transcript", status_code=303)
+
+
+@router.post("/projects/{project_id}/shots/dispatch")
+async def dispatch_shots(
+    project_id: str,
+    preferred_provider: str = Form(""),
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    """為專案的 ShotPlan 產生 job package。
+
+    第一階段走人工 transport，結果為 pending_manual，代表已交付人工生成。
+    """
+    artifact = await run_in_threadpool(load_project, settings, project_id)
+    if not artifact.shot_plans:
+        raise WebException(
+            detail="This project has no shot plans to dispatch.",
+            back_link=f"/projects/{project_id}/view",
+        )
+
+    try:
+        report = await dispatch_project_shots(
+            artifact, preferred_provider=preferred_provider or None
+        )
+        note = report.summary()
+        failures = [item for item in report.results if not item.dispatched]
+        if failures:
+            note += f" | first failure: {failures[0].shot_id} {failures[0].message}"
+            logger.warning("Shot dispatch had %d failures", len(failures))
+    except Exception as error:  # noqa: BLE001 - 派工失敗需留下稽核軌跡
+        artifact.decision_log.append(
+            DecisionLogEntry(
+                action="shots_dispatch_failed",
+                actor="local",
+                note=str(error)[:300],
+            )
+        )
+        artifact.touch()
+        await run_in_threadpool(save_project, settings, artifact)
+        raise WebException(
+            detail=f"Shot dispatch failed: {error}",
+            back_link=f"/projects/{project_id}/view",
+        ) from error
+
+    await run_in_threadpool(save_project, settings, artifact)
+    return RedirectResponse(url=f"/projects/{project_id}/view#shots", status_code=303)
+
+
+@router.get("/projects/{project_id}/job-packages.zip")
+def download_job_packages(
+    project_id: str,
+    settings: Settings = Depends(settings_dep),
+) -> Response:
+    """將專案的 job packages 打包下載，供人工於各平台操作。"""
+    root = job_package_root(settings.data_dir, project_id)
+    if not root.is_dir():
+        raise WebException(
+            detail="No job packages generated yet.",
+            back_link=f"/projects/{project_id}/view#shots",
+            status_code=404,
+        )
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(root))
+    buffer.seek(0)
+
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{project_id}_job_packages.zip"'
+            )
+        },
+    )
 
 
 @router.post("/projects/{project_id}/lava/run")
@@ -955,6 +1045,100 @@ def transcript_panel(artifact: ProductionArtifact) -> str:
           <button class="ghost-button" type="submit">Run CPU ASR</button>
         </form>
       </div>
+    </section>
+    """
+
+
+def shot_dispatch_panel(artifact: ProductionArtifact) -> str:
+    """鏡頭派工面板。
+
+    第一階段所有影片能力都走人工 transport，因此正常狀態是 pending_manual：
+    job package 已產出，等待人工至平台生成後匯回。
+    """
+    project_id = artifact.project_id
+    shots = sorted(artifact.shot_plans, key=lambda item: item.order)
+
+    manual_providers = [
+        spec for spec in provider_specs().values()
+        if spec.transport is TransportKind.MANUAL
+    ]
+    provider_options = "\n".join(
+        f'<option value="{escape(spec.provider_id)}">{escape(spec.label)}</option>'
+        for spec in sorted(manual_providers, key=lambda s: s.provider_id)
+    )
+
+    if not shots:
+        return f"""
+    <section id="shots" class="panel">
+      <div class="section-head">
+        <h2>Shot Dispatch</h2>
+        <span class="muted">No shot plans yet</span>
+      </div>
+      <p class="muted empty">建立 ShotPlan 後即可產生 job package 交付人工生成。</p>
+    </section>
+    """
+
+    jobs: dict[str, list[CapabilityJob]] = {}
+    try:
+        with Session(engine) as session:
+            for job in session.exec(
+                select(CapabilityJob).where(CapabilityJob.project_id == project_id)
+            ).all():
+                jobs.setdefault(job.shot_id or "", []).append(job)
+    except Exception as error:  # noqa: BLE001 - 派工狀態不可用時仍應顯示鏡頭清單
+        logger.warning("Failed to load capability jobs: %s", error)
+
+    rows = []
+    for shot in shots:
+        shot_jobs = jobs.get(shot.shot_id, [])
+        if shot_jobs:
+            state = ", ".join(
+                sorted({f"{job.provider}: {job.status}" for job in shot_jobs})
+            )
+        else:
+            state = "not dispatched"
+        rows.append(
+            f"""
+        <tr>
+          <td class="mono">{escape(shot.shot_id)}</td>
+          <td>{escape(shot.capability.value)}</td>
+          <td>{escape(shot.camera.describe())}</td>
+          <td class="mono">{shot.target_duration_ms / 1000:g}s</td>
+          <td>{escape(shot.prompt[:80])}</td>
+          <td class="muted">{escape(state)}</td>
+        </tr>
+        """
+        )
+
+    dispatched = sum(1 for shot in shots if jobs.get(shot.shot_id))
+    summary = f"{dispatched}/{len(shots)} shots dispatched"
+
+    return f"""
+    <section id="shots" class="panel">
+      <div class="section-head">
+        <h2>Shot Dispatch</h2>
+        <span class="muted">{escape(summary)}</span>
+      </div>
+      <form method="post" action="/projects/{escape(project_id)}/shots/dispatch" class="split">
+        <div class="field">
+          <label for="dispatch-provider">Provider</label>
+          <select id="dispatch-provider" name="preferred_provider">
+            <option value="">Auto (routing policy)</option>
+            {provider_options}
+          </select>
+        </div>
+        <button class="primary" type="submit">Generate Job Packages</button>
+      </form>
+      <table class="data-table">
+        <thead>
+          <tr><th>Shot</th><th>Capability</th><th>Camera</th><th>Target</th><th>Prompt</th><th>Dispatch</th></tr>
+        </thead>
+        <tbody>{"".join(rows)}</tbody>
+      </table>
+      <p class="muted">
+        產出後下載 job packages，依各平台 README 的步驟人工生成，再將影片匯回。
+        <a href="/projects/{escape(project_id)}/job-packages.zip">Download job packages</a>
+      </p>
     </section>
     """
 

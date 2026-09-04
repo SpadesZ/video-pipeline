@@ -43,8 +43,10 @@ from pipeline.capability import (
     RoutingPolicy,
     VisualPayload,
     check_compatibility,
+    clear_adapters,
     dispatch_capability,
     get_provider,
+    install_default_adapters,
     load_routing_rules,
     model_registry,
     provider_specs,
@@ -227,7 +229,9 @@ def verify_dispatch_behaviour() -> None:
                 error_message=f"{self.provider} 失敗",
             )
 
-    # 無任何轉接器時，派送應回報 no_adapter 而非拋出例外
+    # 清空登錄表以驗證「找不到轉接器」的行為。內建轉接器於本函式結尾復原。
+    clear_adapters()
+
     request = visual_request()
     profile = load_preset("comic_drama_high")
     result = asyncio.run(dispatch_capability(request, profile=profile))
@@ -263,6 +267,19 @@ def verify_dispatch_behaviour() -> None:
     check(result.awaiting_human, "pending_manual 應被視為等待人工")
     check(not result.is_terminal, "pending_manual 不是終態")
     check(later.calls == 0, "等待人工時不應繼續嘗試其他平台")
+
+    # 復原內建轉接器，避免影響後續驗證
+    clear_adapters()
+    install_default_adapters()
+    installed = registered_adapters()
+    check(
+        any(cap is Capability.TEXT_REASONING for cap, _p in installed),
+        "復原後應含文字推理轉接器",
+    )
+    check(
+        any(cap is Capability.VIDEO_I2V for cap, _p in installed),
+        "復原後應含人工影片轉接器",
+    )
 
 
 def verify_legacy_contract() -> None:
