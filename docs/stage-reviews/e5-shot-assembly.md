@@ -79,5 +79,7 @@ Scope: 以選定候選建立剪輯決策、由決策衍生時間線與 CueLedger
 3. 轉場僅在模型中定義，組裝階段一律以硬切處理。淡入淡出只作用於整支片。
 4. 音訊仍以單一 voiceover 併入，尚未支援逐鏡頭對白軌。
    對白戲的音訊先決節奏待短劇 profile 驗證時處理。
-5. `retime_mode=SPEED` 已於模型與時間線計算中支援，但組裝階段尚未
-   套用變速濾鏡，目前僅影響時間線長度。
+5. ~~`retime_mode=SPEED` 尚未於組裝階段套用變速濾鏡。~~
+   已於 E5a 修正：`TimelineClip` 帶出 `retime_mode`、`retime_factor` 與
+   `hold_ms`，組裝時分別轉為 `setpts` 與 `tpad` 濾鏡實際 render。
+   詳見 [e5a-correctness-hardening.md](e5a-correctness-hardening.md)。

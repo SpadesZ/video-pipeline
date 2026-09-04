@@ -52,11 +52,13 @@ from pipeline.models.variant import (
 from pipeline.settings import get_settings
 from pipeline.stages.shot_qc import (
     QCValidationError,
+    ShotOutcome,
     record_continuity_qc,
     record_variant_qc,
     summarize_project_qc,
 )
 from pipeline.stages.variant_importer import (
+    JobLinkError,
     import_variants,
     list_variants,
     select_variant,
@@ -125,20 +127,34 @@ def build_artifact() -> ProductionArtifact:
     )
 
 
-def seed_job(shot_id: str, request_hash: str) -> str:
-    job_id = f"job_kling_{shot_id}"
+def seed_job(
+    shot_id: str,
+    request_hash: str,
+    project_id: str = PROJECT_ID,
+    provider: str = "kling",
+    requested_duration_ms: int | None = 6000,
+) -> str:
+    """建立派工記錄。
+
+    requested_duration_ms 刻意設為 6000 而非 ShotPlan 的 5000，
+    模擬 ProductionProfile 夾住後的實際送出值，以驗證落差比對用的是
+    真正 dispatch 的規格而非原始意圖。
+    """
+    job_id = f"job_{provider}_{shot_id}_{request_hash[:6]}"
     with Session(engine) as session:
         session.add(
             CapabilityJob(
                 job_id=job_id,
-                project_id=PROJECT_ID,
+                project_id=project_id,
                 shot_id=shot_id,
                 capability=Capability.VIDEO_I2V.value,
-                provider="kling",
+                provider=provider,
                 model_id="kling-video",
                 transport=TransportKind.MANUAL.value,
                 status=JobStatus.PENDING_MANUAL.value,
                 request_hash=request_hash,
+                requested_duration_ms=requested_duration_ms,
+                requested_aspect_ratio="9:16",
             )
         )
         session.commit()
@@ -149,7 +165,8 @@ def verify_import(artifact: ProductionArtifact) -> None:
     settings = get_settings()
     job_id = seed_job(SHOT_A, "hash_shot_a")
 
-    good = make_video(_TMP_DIR / "good.mp4", 5.0)
+    # good 命中請求的 6 秒；long 明顯超出，用於驗證落差警告
+    good = make_video(_TMP_DIR / "good.mp4", 6.0)
     long_clip = make_video(_TMP_DIR / "long.mp4", 9.0)
 
     report = import_variants(
@@ -180,25 +197,36 @@ def verify_import(artifact: ProductionArtifact) -> None:
         check(Path(variant.local_path).exists(), "候選檔案未落盤")
         check(variant.status == VariantStatus.IMPORTED, "匯入後狀態應為 imported")
         check(variant.job_id == job_id, "候選未關聯工作")
+        # 基準必須是派工當下送出的 6000，而非 ShotPlan 的 5000
         check(
-            variant.requested_duration_ms == 5000,
-            "未記錄 ShotPlan 的目標長度",
+            variant.requested_duration_ms == 6000,
+            f"基準應取自派工記錄而非 ShotPlan，實際 {variant.requested_duration_ms}",
         )
         check(variant.prompt_snapshot == "雨夜天橋遠景", "未保存提示詞快照")
 
     if ffprobe_available():
-        # 實際規格必須以檔案為準，不可沿用目標值
+        # 實際規格必須以檔案為準，落差則以派工規格為基準
         long_variant = next(
             item for item in report.imported if item.local_path.endswith(".mp4")
             and item.actual_duration_ms and item.actual_duration_ms > 7000
         )
         check(
             long_variant.warnings,
-            "片長明顯偏離目標時應產生警告",
+            "片長明顯偏離請求時應產生警告",
         )
         check(
-            any("片長" in w for w in long_variant.warnings),
-            f"警告內容應說明片長落差: {long_variant.warnings}",
+            any("請求 6000ms" in w for w in long_variant.warnings),
+            f"落差應以派工規格 6000ms 為基準: {long_variant.warnings}",
+        )
+
+        # 命中請求長度者不應產生片長警告
+        good_variant = next(
+            item for item in report.imported
+            if item.actual_duration_ms and 5500 <= item.actual_duration_ms <= 6500
+        )
+        check(
+            not any("片長" in w for w in good_variant.warnings),
+            f"容差內不應警告: {good_variant.warnings}",
         )
 
     # 相同內容重複匯入不應建立第二筆
@@ -373,30 +401,172 @@ def verify_selection(artifact: ProductionArtifact) -> None:
     check("variant_selected" in actions, "未記錄選片事件")
 
 
+def verify_strict_hash_matching(artifact: ProductionArtifact) -> None:
+    """提供 request_hash 時必須完全相符，不得退回猜測其他工作。"""
+    settings = get_settings()
+    video = make_video(_TMP_DIR / "strict.mp4", 5.0)
+
+    # 屬於別的專案的工作
+    seed_job(SHOT_A, "hash_other_project", project_id="other_project")
+    # 屬於別的鏡頭的工作
+    seed_job(SHOT_B, "hash_other_shot")
+    # 屬於別的平台的工作
+    seed_job(SHOT_A, "hash_other_provider", provider="runway")
+
+    cases = [
+        ("hash_does_not_exist", "找不到"),
+        ("hash_other_project", "project"),
+        ("hash_other_shot", "shot"),
+        ("hash_other_provider", "provider"),
+    ]
+    for bad_hash, expected in cases:
+        try:
+            import_variants(
+                settings=settings, artifact=artifact, shot_id=SHOT_A,
+                provider="kling", files=[("x.mp4", video)], request_hash=bad_hash,
+            )
+        except JobLinkError as error:
+            check(
+                expected in str(error),
+                f"錯誤訊息應說明不符原因 ({expected}): {error}",
+            )
+        else:
+            raise AssertionError(f"不符的 request_hash 應被拒絕: {bad_hash}")
+
+    # 完全未提供 hash 時允許匯入，但必須明確標示為未關聯
+    unlinked = import_variants(
+        settings=settings, artifact=artifact, shot_id=SHOT_A,
+        provider="veo", files=[("unlinked.mp4", video)],
+    )
+    check(unlinked.new_count == 1, "未提供 hash 時應可匯入")
+    check(not unlinked.linked, "未提供 hash 應標示為 unlinked")
+    check("unlinked" in unlinked.summary(), "摘要應標示未關聯")
+    imported = unlinked.imported[0]
+    check(
+        any("未關聯" in w for w in imported.warnings),
+        f"未關聯時應警告無可信基準: {imported.warnings}",
+    )
+
+    with Session(engine) as session:
+        variant = session.get(AssetVariant, imported.variant_id)
+    check(
+        variant.requested_duration_ms is None,
+        "未關聯派工時不得回頭以 ShotPlan 目標值充當基準",
+    )
+
+    # 不屬於本專案的鏡頭必須被拒絕
+    try:
+        import_variants(
+            settings=settings, artifact=artifact, shot_id="shot_not_here",
+            provider="kling", files=[("x.mp4", video)],
+        )
+    except ValueError as error:
+        check("不屬於專案" in str(error), f"應說明鏡頭不屬於本專案: {error}")
+    else:
+        raise AssertionError("外部鏡頭應被拒絕")
+
+
+def verify_cross_project_guard(artifact: ProductionArtifact) -> None:
+    """帶著別的專案的 variant_id 不得改動資料。"""
+    from pipeline.stages.variant_importer import load_owned_variant
+
+    with Session(engine) as session:
+        session.add(
+            AssetVariant(
+                variant_id="var_foreign",
+                project_id="other_project",
+                shot_id="shot_x",
+                provider="kling",
+                prompt_snapshot="foreign",
+            )
+        )
+        session.commit()
+
+    with Session(engine) as session:
+        try:
+            load_owned_variant(session, PROJECT_ID, "var_foreign")
+        except ValueError as error:
+            check("屬於專案" in str(error), f"應說明歸屬不符: {error}")
+        else:
+            raise AssertionError("跨專案讀取應被拒絕")
+
+    for operation in (
+        lambda: select_variant(artifact, "var_foreign", reason="x"),
+        lambda: record_variant_qc(
+            artifact, "var_foreign", scores={"prompt_adherence": 50}
+        ),
+    ):
+        try:
+            operation()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("跨專案操作應被拒絕")
+
+    # 連戲評分引用外部候選同樣不可
+    try:
+        record_continuity_qc(
+            artifact, shot_id=SHOT_A, ref_shot_id=SHOT_B,
+            scores={"cross_shot_identity": 50}, variant_id="var_foreign",
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("連戲評分引用外部候選應被拒絕")
+
+
 def verify_summary(artifact: ProductionArtifact) -> None:
-    summary = summarize_project_qc(PROJECT_ID, artifact.production_profile)
-    check(summary.total_variants == 2, f"候選總數錯誤: {summary.total_variants}")
-    check(summary.total_usable == 1, f"可用候選數錯誤: {summary.total_usable}")
+    summary = summarize_project_qc(artifact)
 
-    shot_summary = summary.shots[0]
-    check(shot_summary.shot_id == SHOT_A, "彙整未依鏡頭分組")
-    check(shot_summary.scored_count == 2, "已評分數量錯誤")
-    check(shot_summary.best_variant_id is not None, "未選出最佳候選")
+    # 分母來自分鏡表，兩顆鏡頭都要算進去，即使 SHOT_B 從未產出候選
     check(
-        shot_summary.usable_rate == 0.5,
-        f"可用率計算錯誤: {shot_summary.usable_rate}",
+        summary.planned_count == 2,
+        f"分母應涵蓋全部分鏡，實際 {summary.planned_count}",
+    )
+    check(summary.usable_count == 1, f"可用鏡頭數錯誤: {summary.usable_count}")
+    check(
+        summary.usable_shot_rate_of_planned == 0.5,
+        f"以分鏡為分母的可用率應為 0.5，實際 {summary.usable_shot_rate_of_planned}",
     )
 
-    # 人工修正時間是判斷系統是否具商業價值的關鍵
+    outcomes = summary.outcome_counts()
     check(
-        summary.total_correction_minutes > 0,
-        "應累計人工修正時間",
+        outcomes[ShotOutcome.USABLE.value] == 1,
+        f"應有 1 顆 usable: {outcomes}",
     )
     check(
-        summary.usable_shot_rate == 1.0,
-        f"至少一個可用候選的鏡頭比例錯誤: {summary.usable_shot_rate}",
+        outcomes[ShotOutcome.PLANNED.value] + outcomes[ShotOutcome.DISPATCHED.value]
+        + outcomes[ShotOutcome.FAILED.value] == 1,
+        f"SHOT_B 應被歸入未完成類別: {outcomes}",
     )
-    check(summary.continuity_count == 1, "連戲評分數量錯誤")
+    check(
+        sum(outcomes.values()) == summary.planned_count,
+        "各狀態計數總和應等於分鏡數，狀態必須互斥",
+    )
+
+    by_shot = {item.shot_id: item for item in summary.shots}
+    shot_a = by_shot[SHOT_A]
+    check(shot_a.outcome is ShotOutcome.USABLE, "SHOT_A 應為 usable")
+    check(shot_a.scored_count == 2, f"已評分數量錯誤: {shot_a.scored_count}")
+    check(shot_a.usable_count == 1, f"可用候選數錯誤: {shot_a.usable_count}")
+    check(shot_a.best_variant_id is not None, "未選出最佳候選")
+    check(
+        shot_a.usable_variant_rate
+        == round(shot_a.usable_count / shot_a.variant_count, 3),
+        "候選可用率應等於可用數除以候選數",
+    )
+    # 候選可用率與 usable-shot rate 是不同指標，不得混用
+    check(
+        shot_a.usable_variant_rate != summary.usable_shot_rate_of_planned,
+        "候選可用率與鏡頭可用率在此情境下應不同",
+    )
+
+    check(summary.total_correction_minutes > 0, "應累計人工修正時間")
+    check(
+        summary.correction_minutes_per_usable_shot is not None,
+        "應能計算每可用鏡頭的人工時間",
+    )
+    check(summary.continuity_count >= 1, "連戲評分數量錯誤")
 
 
 def main() -> int:
@@ -404,9 +574,11 @@ def main() -> int:
     artifact = build_artifact()
 
     verify_import(artifact)
+    verify_strict_hash_matching(artifact)
     verify_qc_scoring(artifact)
     verify_continuity_qc(artifact)
     verify_selection(artifact)
+    verify_cross_project_guard(artifact)
     verify_summary(artifact)
 
     probe_note = "ffprobe" if ffprobe_available() else "no-ffprobe"

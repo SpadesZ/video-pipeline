@@ -49,14 +49,24 @@ from pipeline.project_store import (
 from pipeline.settings import Settings
 from pipeline.stages.compliance_checker import check_compliance
 from pipeline.stages.run_mvp import run_mvp_pipeline
-from pipeline.stages.shot_dispatcher import dispatch_project_shots, job_package_root
+from pipeline.stages.shot_dispatcher import (
+    ShotReadinessState,
+    assess_project_readiness,
+    dispatch_project_shots,
+    job_package_root,
+)
 from pipeline.stages.shot_qc import (
     QCValidationError,
     record_variant_qc,
     summarize_project_qc,
 )
 from pipeline.stages.transcript_importer import import_transcript
-from pipeline.stages.variant_importer import import_variants, list_variants, select_variant
+from pipeline.stages.variant_importer import (
+    JobLinkError,
+    import_variants,
+    list_variants,
+    select_variant,
+)
 from pipeline.utils.files import ensure_project_dir
 from pipeline.stages.llm_executors import run_topic_research, run_script_outline, run_packaging
 from pipeline.stages.script_splitter import split_script_into_shorts
@@ -638,6 +648,21 @@ async def import_project_variants(
         )
         if report.skipped:
             logger.warning("Variant import skipped %d files", len(report.skipped))
+    except JobLinkError as error:
+        # request_hash 不符時直接拒絕，不猜測要接到哪一筆工作
+        artifact.decision_log.append(
+            DecisionLogEntry(
+                action="variants_import_rejected",
+                actor=actor or "local",
+                note=str(error)[:300],
+            )
+        )
+        artifact.touch()
+        await run_in_threadpool(save_project, settings, artifact)
+        raise WebException(
+            detail=f"request_hash 不符，已拒絕匯入: {error}",
+            back_link=f"/projects/{project_id}/view#variants",
+        ) from error
     except Exception as error:  # noqa: BLE001 - 匯入失敗需留下稽核軌跡
         artifact.decision_log.append(
             DecisionLogEntry(
@@ -1238,6 +1263,18 @@ def shot_dispatch_panel(artifact: ProductionArtifact) -> str:
     except Exception as error:  # noqa: BLE001 - 派工狀態不可用時仍應顯示鏡頭清單
         logger.warning("Failed to load capability jobs: %s", error)
 
+    try:
+        readiness = assess_project_readiness(artifact)
+    except Exception as error:  # noqa: BLE001 - 完備度不可用時仍顯示鏡頭清單
+        logger.warning("Failed to assess readiness: %s", error)
+        readiness = {}
+
+    readiness_labels = {
+        ShotReadinessState.READY: "Ready",
+        ShotReadinessState.INCOMPLETE: "Incomplete",
+        ShotReadinessState.BLOCKED: "Blocked",
+    }
+
     rows = []
     for shot in shots:
         shot_jobs = jobs.get(shot.shot_id, [])
@@ -1247,6 +1284,16 @@ def shot_dispatch_panel(artifact: ProductionArtifact) -> str:
             )
         else:
             state = "not dispatched"
+
+        check = readiness.get(shot.shot_id)
+        if check is None:
+            ready_cell = '<span class="muted">unknown</span>'
+        else:
+            label = readiness_labels[check.state]
+            title = escape("; ".join(check.issues)) if check.issues else ""
+            css = f"readiness-{check.state.value}"
+            ready_cell = f'<span class="{css}" title="{title}">{label}</span>'
+
         rows.append(
             f"""
         <tr>
@@ -1254,14 +1301,22 @@ def shot_dispatch_panel(artifact: ProductionArtifact) -> str:
           <td>{escape(shot.capability.value)}</td>
           <td>{escape(shot.camera.describe())}</td>
           <td class="mono">{shot.target_duration_ms / 1000:g}s</td>
-          <td>{escape(shot.prompt[:80])}</td>
+          <td>{escape(shot.prompt[:70])}</td>
+          <td>{ready_cell}</td>
           <td class="muted">{escape(state)}</td>
         </tr>
         """
         )
 
     dispatched = sum(1 for shot in shots if jobs.get(shot.shot_id))
-    summary = f"{dispatched}/{len(shots)} shots dispatched"
+    not_ready = sum(
+        1
+        for check in readiness.values()
+        if check.state is not ShotReadinessState.READY
+    )
+    summary = f"{dispatched}/{len(shots)} dispatched"
+    if not_ready:
+        summary += f" | {not_ready} not ready"
 
     return f"""
     <section id="shots" class="panel">
@@ -1281,10 +1336,14 @@ def shot_dispatch_panel(artifact: ProductionArtifact) -> str:
       </form>
       <table class="data-table">
         <thead>
-          <tr><th>Shot</th><th>Capability</th><th>Camera</th><th>Target</th><th>Prompt</th><th>Dispatch</th></tr>
+          <tr><th>Shot</th><th>Capability</th><th>Camera</th><th>Target</th><th>Prompt</th><th>Ready</th><th>Dispatch</th></tr>
         </thead>
         <tbody>{"".join(rows)}</tbody>
       </table>
+      <p class="muted">
+        僅 Ready 的鏡頭會被派工。Incomplete 代表參考素材檔案缺失，
+        Blocked 代表缺少必要資訊，兩者都不會送出殘缺的 job package。
+      </p>
       <p class="muted">
         產出後下載 job packages，依各平台 README 的步驟人工生成，再將影片匯回。
         <a href="/projects/{escape(project_id)}/job-packages.zip">Download job packages</a>
@@ -1302,7 +1361,7 @@ def variant_panel(artifact: ProductionArtifact) -> str:
 
     try:
         variants = list_variants(project_id)
-        summary = summarize_project_qc(project_id, artifact.production_profile)
+        summary = summarize_project_qc(artifact)
     except Exception as error:  # noqa: BLE001 - 候選不可用時仍應顯示匯入表單
         logger.warning("Failed to load variants: %s", error)
         variants, summary = [], None
@@ -1380,16 +1439,20 @@ def variant_panel(artifact: ProductionArtifact) -> str:
         """
         )
 
-    if summary and summary.total_variants:
-        usable_rate = summary.usable_shot_rate
+    if summary and summary.planned_count:
+        planned_rate = summary.usable_shot_rate_of_planned
+        dispatched_rate = summary.usable_shot_rate_of_dispatched
+        per_usable = summary.correction_minutes_per_usable_shot
         head = (
-            f"{summary.total_usable}/{summary.total_variants} usable | "
-            f"shots with a usable take: "
-            f"{'n/a' if usable_rate is None else f'{usable_rate:.0%}'} | "
+            f"usable shots {summary.usable_count}/{summary.planned_count} planned "
+            f"({'n/a' if planned_rate is None else f'{planned_rate:.0%}'}) | "
+            f"{summary.usable_count}/{summary.dispatched_count} dispatched "
+            f"({'n/a' if dispatched_rate is None else f'{dispatched_rate:.0%}'}) | "
             f"correction {summary.total_correction_minutes:g} min"
+            + (f" ({per_usable:g} min/usable)" if per_usable is not None else "")
         )
     else:
-        head = "No variants imported yet"
+        head = "No shot plans yet"
 
     return f"""
     <section id="variants" class="panel">

@@ -87,6 +87,9 @@ def seed_reference_assets() -> Path:
     face = assets_dir / "face_lin.png"
     face.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
 
+    coat = assets_dir / "coat_lin.png"
+    coat.write_bytes(b"\x89PNG\r\n\x1a\n" + b"1" * 64)
+
     with Session(engine) as session:
         session.add(
             ReferenceAsset(
@@ -97,7 +100,16 @@ def seed_reference_assets() -> Path:
                 file_hash="deadbeef",
             )
         )
-        # 刻意登錄一筆沒有實體檔案的素材，用於驗證缺漏警告
+        session.add(
+            ReferenceAsset(
+                asset_id="ref_coat_lin",
+                project_id="smoke_manual",
+                asset_type=ReferenceAssetType.WARDROBE.value,
+                local_path=str(coat),
+                file_hash="cafebabe",
+            )
+        )
+        # 刻意登錄一筆沒有實體檔案的素材，用於驗證缺漏警告與 fail-closed
         session.add(
             ReferenceAsset(
                 asset_id="ref_missing",
@@ -460,6 +472,110 @@ def verify_shot_plan_dispatch() -> None:
         f"角色臉部參考未複製進 refs/: {[i.name for i in refs]}",
     )
 
+    # 派工當下的規格必須記錄於工作上，供匯入時比對落差
+    with Session(engine) as session:
+        job = session.get(CapabilityJob, result.job_id)
+    check(job is not None, "應建立工作記錄")
+    check(
+        job.requested_duration_ms == 6000,
+        f"工作應記錄實際送出的片長，實際 {job.requested_duration_ms}",
+    )
+    check(job.requested_aspect_ratio == "9:16", "工作應記錄實際送出的比例")
+
+
+def verify_readiness_fail_closed() -> None:
+    """完備度不足的鏡頭不得以「已派工」的外觀通過。"""
+    from pipeline.models.production_artifact import ProductionArtifact
+    from pipeline.models.shot import CharacterIdentityPack, ShotPlan
+    from pipeline.stages.shot_dispatcher import (
+        NOT_DISPATCHED,
+        ShotReadinessState,
+        assess_project_readiness,
+        check_shot_readiness,
+        dispatch_project_shots,
+    )
+
+    pack = CharacterIdentityPack(
+        character_id="char_lin",
+        canonical_face_ref="ref_face_lin",
+        wardrobe_refs=["ref_missing"],  # 已登錄但沒有實體檔案
+    )
+    base = dict(
+        beat_id="beat_0001", scene_id="scene_0001", order=0,
+        capability=Capability.VIDEO_I2V, target_duration_ms=6000,
+        aspect_ratio="9:16",
+    )
+
+    incomplete_shot = ShotPlan(
+        shot_id="shot_incomplete", prompt="有效提示詞",
+        character_refs=["char_lin"], **base
+    )
+    unknown_character = ShotPlan(
+        shot_id="shot_unknown", prompt="有效提示詞",
+        character_refs=["char_ghost"], **base
+    )
+    empty_prompt = ShotPlan(shot_id="shot_empty", prompt="   ", **base)
+
+    packs = {"char_lin": pack}
+    check(
+        check_shot_readiness(incomplete_shot, packs).state
+        is ShotReadinessState.INCOMPLETE,
+        "參考素材檔案缺失應判定為 incomplete",
+    )
+    blocked = check_shot_readiness(unknown_character, packs)
+    check(
+        blocked.state is ShotReadinessState.BLOCKED,
+        "找不到角色身份定義應判定為 blocked",
+    )
+    check(
+        any("角色身份定義" in issue for issue in blocked.issues),
+        f"blocked 原因應說明缺少角色定義: {blocked.issues}",
+    )
+    check(
+        check_shot_readiness(empty_prompt, packs).state is ShotReadinessState.BLOCKED,
+        "缺少 prompt 應判定為 blocked",
+    )
+
+    artifact = ProductionArtifact(
+        project_id="smoke_manual",
+        title="readiness",
+        production_profile=load_preset("comic_drama_high"),
+        character_packs=[pack],
+        shot_plans=[incomplete_shot, unknown_character, empty_prompt],
+    )
+
+    states = assess_project_readiness(artifact)
+    check(len(states) == 3, "應評估全部鏡頭的完備度")
+
+    # 預設 fail-closed：三顆都不應被派工
+    report = asyncio.run(dispatch_project_shots(artifact))
+    check(len(report.results) == 3, "報告應涵蓋全部鏡頭")
+    check(report.dispatched_count == 0, "完備度不足時不應派工")
+    check(report.blocked_count == 3, f"三顆都應被擋下: {report.summary()}")
+    for item in report.results:
+        check(
+            item.status == NOT_DISPATCHED,
+            f"{item.shot_id} 不應顯示為已派工狀態: {item.status}",
+        )
+        check(item.message, f"{item.shot_id} 應說明未派工原因")
+
+    # 明確允許時，incomplete 可派但 blocked 仍不可
+    forced = asyncio.run(dispatch_project_shots(artifact, allow_incomplete=True))
+    by_shot = {item.shot_id: item for item in forced.results}
+    check(
+        by_shot["shot_incomplete"].dispatched,
+        "明確允許後 incomplete 應可派工",
+    )
+    check(
+        by_shot["shot_incomplete"].readiness is ShotReadinessState.INCOMPLETE,
+        "派工後仍應保留 incomplete 標記",
+    )
+    check(
+        not by_shot["shot_unknown"].dispatched,
+        "blocked 即使明確允許也不得派工",
+    )
+    check(not by_shot["shot_empty"].dispatched, "缺 prompt 者不得派工")
+
 
 def main() -> int:
     init_db()
@@ -473,6 +589,7 @@ def main() -> int:
     verify_routing_selects_manual_provider()
     verify_dispatch_and_job_record()
     verify_shot_plan_dispatch()
+    verify_readiness_fail_closed()
 
     packages = list(PACKAGE_ROOT.glob("*/*/job.json"))
     print(

@@ -120,6 +120,12 @@ class CapabilityJob(SQLModel, table=True):
     request_hash: str | None = Field(default=None, index=True)
     provider_job_id: str | None = None
 
+    # 派工當下實際送出的規格。ShotPlan.target_duration_ms 會經
+    # ProductionProfile 的鏡頭長度政策夾住，兩者可能不同，
+    # 匯入時的落差比對必須以此為基準。
+    requested_duration_ms: int | None = Field(default=None, sa_column=Column(Integer))
+    requested_aspect_ratio: str | None = None
+
     submitted_at: datetime | None = None
     completed_at: datetime | None = None
     error_code: str | None = None

@@ -15,22 +15,51 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
 from pathlib import Path
 
 from pydantic import BaseModel, Field
+from sqlmodel import Session, select
 
 from pipeline.capability.base import CapabilityRequest, VisualPayload
 from pipeline.capability.router import dispatch_capability
 from pipeline.models.production_artifact import ProductionArtifact
 from pipeline.models.production_profile import ProductionProfile, default_profile
+from pipeline.models.reference_asset import ReferenceAsset
 from pipeline.models.review import DecisionLogEntry
 from pipeline.models.shot import CharacterIdentityPack, ShotPlan
 from pipeline.models.variant import JobStatus
+
+NOT_DISPATCHED = "not_dispatched"
+
+
+class ShotReadinessState(StrEnum):
+    """派工前的完備度。
+
+    ready      所有必要資訊與參考素材皆齊備。
+    incomplete 資訊齊備但部分參考素材檔案缺失，送出去 refs/ 會不完整。
+    blocked    缺少必要資訊，不具備派工條件。
+    """
+
+    READY = "ready"
+    INCOMPLETE = "incomplete"
+    BLOCKED = "blocked"
+
+
+class ShotReadiness(BaseModel):
+    shot_id: str
+    state: ShotReadinessState = ShotReadinessState.READY
+    issues: list[str] = Field(default_factory=list)
+
+    @property
+    def can_dispatch(self) -> bool:
+        return self.state is ShotReadinessState.READY
 
 
 class ShotDispatchResult(BaseModel):
     shot_id: str
     status: str
+    readiness: ShotReadinessState = ShotReadinessState.READY
     provider: str | None = None
     model_id: str | None = None
     job_id: str | None = None
@@ -57,14 +86,96 @@ class ShotDispatchReport(BaseModel):
         return sum(1 for item in self.results if item.dispatched)
 
     @property
+    def blocked_count(self) -> int:
+        return sum(
+            1
+            for item in self.results
+            if item.readiness is not ShotReadinessState.READY and not item.dispatched
+        )
+
+    @property
     def failed_count(self) -> int:
         return len(self.results) - self.dispatched_count
 
     def summary(self) -> str:
         return (
-            f"{self.dispatched_count} dispatched, {self.failed_count} failed "
+            f"{self.dispatched_count} dispatched, {self.blocked_count} blocked, "
+            f"{self.failed_count - self.blocked_count} failed "
             f"of {len(self.results)} shots"
         )
+
+
+def resolve_reference_availability(asset_ids: list[str]) -> dict[str, bool]:
+    """檢查參考素材是否已登錄且具備實體檔案。"""
+    if not asset_ids:
+        return {}
+    from pipeline.db import engine
+
+    available: dict[str, bool] = {asset_id: False for asset_id in asset_ids}
+    with Session(engine) as session:
+        rows = session.exec(
+            select(ReferenceAsset).where(ReferenceAsset.asset_id.in_(asset_ids))
+        ).all()
+        for row in rows:
+            available[row.asset_id] = bool(
+                row.local_path and Path(row.local_path).exists()
+            )
+    return available
+
+
+def check_shot_readiness(
+    shot: ShotPlan, packs: dict[str, CharacterIdentityPack]
+) -> ShotReadiness:
+    """派工前的完備度檢查。
+
+    刻意 fail-closed：宣告了角色卻找不到身份定義、或參考素材檔案不存在時，
+    不可讓鏡頭以「已派工」的外觀通過。那會讓平台收到殘缺的 job package，
+    產出的結果無法歸因，也會污染後續的模型比較。
+    """
+    readiness = ShotReadiness(shot_id=shot.shot_id)
+
+    if not shot.prompt.strip():
+        readiness.issues.append("缺少 prompt")
+
+    missing_packs = [
+        character_id
+        for character_id in shot.character_refs
+        if character_id not in packs
+    ]
+    if missing_packs:
+        readiness.issues.append(
+            f"找不到角色身份定義: {', '.join(missing_packs)}"
+        )
+
+    if readiness.issues:
+        readiness.state = ShotReadinessState.BLOCKED
+        return readiness
+
+    required_refs = collect_reference_ids(shot, packs)
+    if shot.first_frame_ref:
+        required_refs = [shot.first_frame_ref, *required_refs]
+
+    availability = resolve_reference_availability(required_refs)
+    missing_files = [
+        asset_id for asset_id, present in availability.items() if not present
+    ]
+    if missing_files:
+        readiness.state = ShotReadinessState.INCOMPLETE
+        readiness.issues.append(
+            f"參考素材檔案不存在: {', '.join(sorted(missing_files))}"
+        )
+
+    return readiness
+
+
+def assess_project_readiness(
+    artifact: ProductionArtifact,
+) -> dict[str, ShotReadiness]:
+    packs = {pack.character_id: pack for pack in artifact.character_packs}
+    return {
+        shot.shot_id: check_shot_readiness(shot, packs)
+        for shot in artifact.shot_plans
+    }
 
 
 def collect_reference_ids(
@@ -127,10 +238,15 @@ async def dispatch_project_shots(
     preferred_provider: str | None = None,
     scenario_type: str | None = None,
     shot_ids: list[str] | None = None,
+    allow_incomplete: bool = False,
 ) -> ShotDispatchReport:
     """為專案的每個 ShotPlan 派工。
 
     第一階段會得到 pending_manual，代表 job package 已產出、等待人工至平台生成。
+
+    完備度預設 fail-closed：blocked 一律不派，incomplete 也不派，除非
+    呼叫端明確傳入 allow_incomplete。未通過檢查的鏡頭會出現在報告中並
+    標示原因，不會以「已派工」的外觀混入。
     """
     profile = artifact.production_profile or default_profile()
     packs = {pack.character_id: pack for pack in artifact.character_packs}
@@ -143,6 +259,22 @@ async def dispatch_project_shots(
     report = ShotDispatchReport(project_id=artifact.project_id)
 
     for shot in selected:
+        readiness = check_shot_readiness(shot, packs)
+        blocked = readiness.state is ShotReadinessState.BLOCKED
+        incomplete_blocked = (
+            readiness.state is ShotReadinessState.INCOMPLETE and not allow_incomplete
+        )
+        if blocked or incomplete_blocked:
+            report.results.append(
+                ShotDispatchResult(
+                    shot_id=shot.shot_id,
+                    status=NOT_DISPATCHED,
+                    readiness=readiness.state,
+                    message="; ".join(readiness.issues),
+                )
+            )
+            continue
+
         request = build_shot_request(artifact, shot, packs, profile)
         result = await dispatch_capability(
             request,
@@ -151,15 +283,19 @@ async def dispatch_project_shots(
             preferred_provider=preferred_provider,
         )
         package_dir = result.outputs[0] if result.outputs else None
+        message = result.error_message
+        if readiness.issues:
+            message = "; ".join([*readiness.issues, message or ""]).strip("; ")
         report.results.append(
             ShotDispatchResult(
                 shot_id=shot.shot_id,
                 status=result.status.value,
+                readiness=readiness.state,
                 provider=result.provider,
                 model_id=result.model_id,
                 job_id=result.job_id,
                 package_dir=package_dir,
-                message=result.error_message,
+                message=message,
             )
         )
 

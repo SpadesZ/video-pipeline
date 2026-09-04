@@ -78,7 +78,11 @@ class EditDecision(BaseModel):
 
 
 class TimelineClip(BaseModel):
-    """時間線上的一段。由 EditDecision 展開而得，帶絕對起點。"""
+    """時間線上的一段。由 EditDecision 展開而得，帶絕對起點。
+
+    retime 與 hold 一併帶下來，組裝階段才能真正 render 出對應的長度。
+    若只保留 used_duration_ms，組裝端無從得知該用變速還是停格達成。
+    """
 
     clip_id: str
     edit_id: str
@@ -91,11 +95,19 @@ class TimelineClip(BaseModel):
     source_in_ms: int = Field(ge=0)
     source_out_ms: int = Field(gt=0)
 
+    retime_mode: RetimeMode = RetimeMode.NONE
+    retime_factor: float = Field(default=1.0, gt=0)
+    hold_ms: int = Field(default=0, ge=0)
+
     local_path: str | None = None
 
     @property
     def timeline_end_ms(self) -> int:
         return self.timeline_start_ms + self.used_duration_ms
+
+    @property
+    def needs_retime(self) -> bool:
+        return self.retime_mode is RetimeMode.SPEED and self.retime_factor != 1.0
 
 
 class Timeline(BaseModel):
@@ -135,6 +147,9 @@ def build_timeline(project_id: str, decisions: list[EditDecision]) -> Timeline:
                 used_duration_ms=duration,
                 source_in_ms=decision.in_point_ms,
                 source_out_ms=decision.out_point_ms,
+                retime_mode=decision.retime_mode,
+                retime_factor=decision.retime_factor,
+                hold_ms=decision.hold_ms,
             )
         )
         cursor_ms += duration

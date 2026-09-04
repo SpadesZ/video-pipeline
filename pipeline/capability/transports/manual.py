@@ -100,6 +100,9 @@ def upsert_manual_job(
         if existing is not None:
             return existing.job_id, False
 
+        # 記錄真正送出去的規格，而非 ShotPlan 的原始意圖。
+        # 匯入時的落差比對必須以此為基準。
+        visual = request.visual
         session.add(
             CapabilityJob(
                 job_id=job_id,
@@ -112,6 +115,8 @@ def upsert_manual_job(
                 transport=TransportKind.MANUAL.value,
                 status=JobStatus.PENDING_MANUAL.value,
                 request_hash=request_hash,
+                requested_duration_ms=visual.duration_ms if visual else None,
+                requested_aspect_ratio=visual.aspect_ratio if visual else None,
                 submitted_at=datetime.now(timezone.utc),
             )
         )

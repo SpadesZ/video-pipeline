@@ -87,6 +87,27 @@ def _write_manifest(
     return manifest
 
 
+def build_clip_filter(clip: TimelineClip, width: int, height: int) -> str:
+    """組出單一片段的濾鏡鏈。
+
+    retime 與 hold 必須在此實際套用，否則時間線計算出的長度與成片會分歧。
+    變速以 setpts 調整時間戳，停格以 tpad 複製最後一幀延長。
+    """
+    stages = [
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
+        f"fps={DEFAULT_FPS}",
+    ]
+    if clip.needs_retime:
+        stages.append(f"setpts=PTS/{clip.retime_factor:g}")
+    if clip.hold_ms > 0:
+        stages.append(
+            f"tpad=stop_mode=clone:stop_duration={clip.hold_ms / 1000:.3f}"
+        )
+    stages.append("format=yuv420p")
+    return ",".join(stages)
+
+
 def _trim_clip(
     clip: TimelineClip,
     source: Path,
@@ -96,18 +117,16 @@ def _trim_clip(
 ) -> tuple[bool, str]:
     start_seconds = clip.source_in_ms / 1000
     duration_seconds = (clip.source_out_ms - clip.source_in_ms) / 1000
-    scale_filter = (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-        f"fps={DEFAULT_FPS},format=yuv420p"
-    )
+    # -ss 與 -t 都置於 -i 之前，屬於輸入端限制：只讀取指定區間。
+    # 若 -t 放在輸出端，tpad 停格與 setpts 變速產生的額外長度會被截掉，
+    # 成片就會與時間線對不上。
     return _run(
         [
             "ffmpeg", "-y", "-v", "error",
             "-ss", f"{start_seconds:.3f}",
-            "-i", str(source),
             "-t", f"{duration_seconds:.3f}",
-            "-vf", scale_filter,
+            "-i", str(source),
+            "-vf", build_clip_filter(clip, width, height),
             "-an",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             str(destination),
@@ -147,20 +166,6 @@ def assemble_timeline(
 
     if not ffmpeg_available():
         return _write_manifest(output_path, timeline, variant_paths, "ffmpeg not found")
-
-    # 變速尚未於組裝階段實作，但已計入時間線長度。若靜默略過，成片長度
-    # 會與時間線不符，因此明確警告而非讓兩者悄悄分歧。
-    retimed = [
-        clip.shot_id
-        for clip in timeline.clips
-        if clip.used_duration_ms != clip.source_out_ms - clip.source_in_ms
-    ]
-    if retimed:
-        logger.warning(
-            "Timeline applies retime or hold to %s but assembly renders at "
-            "source speed; output length will differ from the timeline",
-            ", ".join(retimed),
-        )
 
     width, height = target_resolution(aspect_ratio)
     work_dir = project_dir / "temp_clips"

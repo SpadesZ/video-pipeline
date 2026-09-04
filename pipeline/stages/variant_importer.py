@@ -64,15 +64,18 @@ class VariantImportReport(BaseModel):
     imported: list[ImportedVariant] = Field(default_factory=list)
     skipped: list[str] = Field(default_factory=list)
     job_id: str | None = None
+    # 未提供 request_hash 時為 False，代表這批候選沒有可信的派工來源
+    linked: bool = False
 
     @property
     def new_count(self) -> int:
         return sum(1 for item in self.imported if not item.duplicate)
 
     def summary(self) -> str:
+        link = "linked" if self.linked else "unlinked"
         return (
             f"{self.new_count} new, {len(self.imported) - self.new_count} duplicate, "
-            f"{len(self.skipped)} skipped for {self.shot_id}@{self.provider}"
+            f"{len(self.skipped)} skipped for {self.shot_id}@{self.provider} ({link})"
         )
 
 
@@ -96,26 +99,44 @@ def find_shot(artifact: ProductionArtifact, shot_id: str) -> ShotPlan | None:
     )
 
 
-def check_against_plan(shot: ShotPlan | None, media: MediaInfo) -> list[str]:
-    """比對實際規格與鏡頭計畫，回傳落差描述。不阻擋匯入。"""
+class JobLinkError(ValueError):
+    """提供的 request_hash 無法安全對應到一筆工作。"""
+
+
+def check_against_request(
+    job: CapabilityJob | None, media: MediaInfo
+) -> list[str]:
+    """比對實際規格與派工當下送出的規格，回傳落差描述。不阻擋匯入。
+
+    基準一律取自 CapabilityJob 記錄的 requested_* 欄位，不回頭使用
+    ShotPlan.target_duration_ms。後者是導演意圖，派工前會經
+    ProductionProfile 的鏡頭長度政策夾住，以它計算落差會得到錯誤數值。
+    未關聯工作時無可信基準，明確標示而非改用其他來源。
+    """
     warnings: list[str] = []
     if media.error:
         warnings.append(media.error)
-    if shot is None:
+
+    if job is None:
+        warnings.append("未關聯派工記錄，無法比對規格落差")
         return warnings
 
-    if media.duration_ms is not None:
-        tolerance = max(200, int(shot.target_duration_ms * 0.1))
-        delta = media.duration_ms - shot.target_duration_ms
+    requested_ms = job.requested_duration_ms
+    if requested_ms is None:
+        warnings.append("派工記錄未含請求片長，無法比對落差")
+    elif media.duration_ms is not None:
+        tolerance = max(200, int(requested_ms * 0.1))
+        delta = media.duration_ms - requested_ms
         if abs(delta) > tolerance:
             warnings.append(
-                f"片長 {media.duration_ms}ms 與目標 {shot.target_duration_ms}ms "
+                f"片長 {media.duration_ms}ms 與請求 {requested_ms}ms "
                 f"相差 {delta:+d}ms"
             )
 
     actual_ratio = media.aspect_ratio
-    if actual_ratio and shot.aspect_ratio and actual_ratio != shot.aspect_ratio:
-        warnings.append(f"比例 {actual_ratio} 與目標 {shot.aspect_ratio} 不符")
+    requested_ratio = job.requested_aspect_ratio
+    if actual_ratio and requested_ratio and actual_ratio != requested_ratio:
+        warnings.append(f"比例 {actual_ratio} 與請求 {requested_ratio} 不符")
 
     return warnings
 
@@ -127,24 +148,39 @@ def _resolve_job(
     provider: str,
     request_hash: str | None,
 ) -> CapabilityJob | None:
-    if request_hash:
-        job = session.exec(
-            select(CapabilityJob).where(
-                CapabilityJob.request_hash == request_hash,
-                CapabilityJob.provider == provider,
-            )
-        ).first()
-        if job is not None:
-            return job
-    return session.exec(
-        select(CapabilityJob)
-        .where(
-            CapabilityJob.project_id == project_id,
-            CapabilityJob.shot_id == shot_id,
-            CapabilityJob.provider == provider,
-        )
-        .order_by(CapabilityJob.created_at.desc())
+    """依 request_hash 嚴格對應工作。
+
+    提供 hash 時必須同時符合 project_id、shot_id 與 provider，任一不符即
+    拒絕匯入。刻意不提供「找不到就退回最近一筆」的行為：那會把使用者
+    貼錯的 hash 悄悄接到別的工作上，讓後續統計全部失真。
+    完全未提供 hash 時回傳 None，由呼叫端標示為 unlinked import。
+    """
+    if not request_hash:
+        return None
+
+    job = session.exec(
+        select(CapabilityJob).where(CapabilityJob.request_hash == request_hash)
     ).first()
+    if job is None:
+        raise JobLinkError(
+            f"找不到 request_hash 為 {request_hash[:16]}... 的派工記錄"
+        )
+
+    mismatches: list[str] = []
+    if job.project_id != project_id:
+        mismatches.append(f"project {job.project_id} != {project_id}")
+    if (job.shot_id or "") != shot_id:
+        mismatches.append(f"shot {job.shot_id} != {shot_id}")
+    if job.provider != provider:
+        mismatches.append(f"provider {job.provider} != {provider}")
+
+    if mismatches:
+        raise JobLinkError(
+            f"request_hash {request_hash[:16]}... 對應的工作不符: "
+            + "; ".join(mismatches)
+        )
+
+    return job
 
 
 def import_variants(
@@ -169,6 +205,11 @@ def import_variants(
         raise ValueError("未提供任何檔案")
 
     shot = find_shot(artifact, shot_id)
+    if shot is None:
+        raise ValueError(
+            f"鏡頭 {shot_id} 不屬於專案 {artifact.project_id}，拒絕匯入"
+        )
+
     target_dir = variants_dir(settings, artifact.project_id, shot_id)
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -177,6 +218,7 @@ def import_variants(
             session, artifact.project_id, shot_id, provider, request_hash
         )
         report.job_id = job.job_id if job else None
+        report.linked = job is not None
 
         for filename, payload in files:
             suffix = Path(filename).suffix.lower()
@@ -218,7 +260,7 @@ def import_variants(
             destination.write_bytes(payload)
 
             media = probe_media(destination)
-            warnings = check_against_plan(shot, media)
+            warnings = check_against_request(job, media)
 
             session.add(
                 AssetVariant(
@@ -230,10 +272,11 @@ def import_variants(
                     model_id=model_id or (job.model_id if job else None),
                     model_version=job.model_version if job else None,
                     generation_mode=generation_mode or GenerationMode.IMAGE_TO_VIDEO.value,
-                    prompt_snapshot=shot.prompt if shot else "",
-                    negative_prompt=shot.negative_prompt if shot else "",
-                    reference_asset_ids=list(shot.reference_asset_ids) if shot else [],
-                    requested_duration_ms=shot.target_duration_ms if shot else None,
+                    prompt_snapshot=shot.prompt,
+                    negative_prompt=shot.negative_prompt,
+                    reference_asset_ids=list(shot.reference_asset_ids),
+                    # 基準取自派工記錄，未關聯時留空而非退回 ShotPlan 意圖值
+                    requested_duration_ms=job.requested_duration_ms if job else None,
                     actual_duration_ms=media.duration_ms,
                     resolution=media.resolution,
                     fps=media.fps,
@@ -286,6 +329,25 @@ def list_variants(project_id: str, shot_id: str | None = None) -> list[AssetVari
         return list(session.exec(statement.order_by(AssetVariant.created_at)).all())
 
 
+def load_owned_variant(
+    session: Session, project_id: str, variant_id: str
+) -> AssetVariant:
+    """取得候選並驗證其歸屬。
+
+    所有以 variant_id 為入口的操作都必須經過此處，否則帶著別的專案的
+    variant_id 呼叫就能跨專案改動資料。
+    """
+    variant = session.get(AssetVariant, variant_id)
+    if variant is None:
+        raise ValueError(f"找不到候選 {variant_id}")
+    if variant.project_id != project_id:
+        raise ValueError(
+            f"候選 {variant_id} 屬於專案 {variant.project_id}，"
+            f"不可由專案 {project_id} 操作"
+        )
+    return variant
+
+
 def select_variant(
     artifact: ProductionArtifact,
     variant_id: str,
@@ -296,13 +358,11 @@ def select_variant(
     from pipeline.db import engine
 
     with Session(engine) as session:
-        variant = session.get(AssetVariant, variant_id)
-        if variant is None:
-            raise ValueError(f"找不到候選 {variant_id}")
+        variant = load_owned_variant(session, artifact.project_id, variant_id)
 
         siblings = session.exec(
             select(AssetVariant).where(
-                AssetVariant.project_id == variant.project_id,
+                AssetVariant.project_id == artifact.project_id,
                 AssetVariant.shot_id == variant.shot_id,
                 AssetVariant.variant_id != variant_id,
                 AssetVariant.status == VariantStatus.SELECTED.value,

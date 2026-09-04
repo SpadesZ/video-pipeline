@@ -15,6 +15,9 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+
+from pydantic import BaseModel, Field
 
 from pipeline.models.cue_ledger import AssetType, CueItem, CueLedger
 from pipeline.models.production_artifact import ProductionArtifact
@@ -163,6 +166,71 @@ def rebuild_timeline(
     return timeline
 
 
+class AssemblyBlocked(RuntimeError):
+    """成片組裝的前置條件未滿足。"""
+
+    def __init__(self, missing_shots: list[str], reasons: list[str]) -> None:
+        self.missing_shots = missing_shots
+        self.reasons = reasons
+        super().__init__("; ".join(reasons))
+
+
+class AssemblyPreflight(BaseModel):
+    project_id: str
+    planned_shots: int = 0
+    ready_shots: int = 0
+    missing_shots: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.missing_shots and not self.reasons
+
+
+def preflight_assembly(artifact: ProductionArtifact) -> AssemblyPreflight:
+    """檢查成片組裝的前置條件。
+
+    分鏡表上的每一顆鏡頭都必須有已選定的候選。若缺任何一顆仍照常輸出，
+    成片會少掉幾個鏡頭卻看不出來，而長度與時間線也對不上。
+    寧可明確擋下並列出缺哪些鏡頭。
+    """
+    report = AssemblyPreflight(
+        project_id=artifact.project_id, planned_shots=len(artifact.shot_plans)
+    )
+    if not artifact.shot_plans:
+        report.reasons.append("專案沒有任何 ShotPlan")
+        return report
+
+    chosen = selected_variants(artifact.project_id)
+    paths = variant_path_map(artifact.project_id)
+
+    for shot in sorted(artifact.shot_plans, key=lambda item: item.order):
+        variant = chosen.get(shot.shot_id)
+        if variant is None:
+            report.missing_shots.append(shot.shot_id)
+            continue
+        local_path = paths.get(variant.variant_id)
+        if not local_path or not Path(local_path).exists():
+            report.missing_shots.append(shot.shot_id)
+            report.reasons.append(
+                f"{shot.shot_id}: 選定候選 {variant.variant_id} 的檔案不存在"
+            )
+            continue
+        report.ready_shots += 1
+
+    without_selection = [
+        shot_id
+        for shot_id in report.missing_shots
+        if not any(shot_id in reason for reason in report.reasons)
+    ]
+    if without_selection:
+        report.reasons.insert(
+            0, f"以下鏡頭尚未選定候選: {', '.join(without_selection)}"
+        )
+
+    return report
+
+
 def variant_path_map(project_id: str) -> dict[str, str]:
     from pipeline.db import engine
     from sqlmodel import Session, select
@@ -181,9 +249,10 @@ def render_by_profile(
 
     這是雙軌設計的分流點：既有投影片路徑保留為一組 preset，
     新的鏡頭組裝走 shot_assembly。分流依政策欄位，不依 preset 名稱。
-    """
-    from pathlib import Path
 
+    鏡頭組裝前會執行完備度檢查，缺少已選定候選時拋出 AssemblyBlocked，
+    不會靜默略過該鏡頭後照樣輸出。
+    """
     from pipeline.models.production_profile import default_profile
 
     profile = artifact.production_profile or default_profile()
@@ -196,6 +265,10 @@ def render_by_profile(
         if artifact.cue_ledger is None:
             return None
         return render_preview(project_dir, artifact.cue_ledger, artifact.title)
+
+    preflight = preflight_assembly(artifact)
+    if not preflight.ok:
+        raise AssemblyBlocked(preflight.missing_shots, preflight.reasons)
 
     from pipeline.adapters.video.shot_assembler import assemble_timeline
 

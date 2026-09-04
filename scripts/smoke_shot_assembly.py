@@ -46,13 +46,16 @@ from pipeline.models.narrative import Beat, BeatIntent, NarrativeIR, Scene
 from pipeline.models.production_artifact import ProductionArtifact
 from pipeline.models.production_profile import load_preset
 from pipeline.models.shot import CameraSpec, ShotPlan
-from pipeline.models.timeline import build_timeline
+from pipeline.adapters.video.shot_assembler import build_clip_filter
+from pipeline.models.timeline import RetimeMode, build_timeline
 from pipeline.models.variant import AssetVariant, VariantStatus
 from pipeline.settings import get_settings
 from pipeline.stages.timeline_builder import (
+    AssemblyBlocked,
     build_edit_decisions,
-    render_by_profile,
+    preflight_assembly,
     rebuild_timeline,
+    render_by_profile,
     update_edit_decision,
 )
 
@@ -309,6 +312,99 @@ def verify_assembly(artifact: ProductionArtifact) -> str:
     return "manifest"
 
 
+def verify_assembly_preflight(artifact: ProductionArtifact) -> None:
+    """缺少已選定候選時必須擋下組裝，不得靜默少拍幾顆鏡頭。"""
+    settings = get_settings()
+
+    incomplete = artifact.model_copy(
+        update={
+            "shot_plans": [
+                *artifact.shot_plans,
+                ShotPlan(
+                    shot_id="shot_0003", beat_id="beat_0003", scene_id="scene_0001",
+                    order=2, capability=Capability.VIDEO_I2V, camera=CameraSpec(),
+                    prompt="尚未生成的鏡頭", target_duration_ms=5000,
+                    aspect_ratio="9:16",
+                ),
+            ]
+        }
+    )
+
+    report = preflight_assembly(incomplete)
+    check(not report.ok, "缺少候選時 preflight 不應通過")
+    check(
+        "shot_0003" in report.missing_shots,
+        f"應列出缺少候選的鏡頭: {report.missing_shots}",
+    )
+    check(report.planned_shots == 3, "應以分鏡數為基準")
+    check(report.ready_shots == 2, f"就緒鏡頭數錯誤: {report.ready_shots}")
+    check(
+        any("shot_0003" in reason for reason in report.reasons),
+        f"原因應指名缺少的鏡頭: {report.reasons}",
+    )
+
+    rebuild_timeline(incomplete, preserve_existing=False)
+    try:
+        render_by_profile(settings, incomplete)
+    except AssemblyBlocked as error:
+        check("shot_0003" in error.missing_shots, "例外應帶出缺少的鏡頭")
+    else:
+        raise AssertionError("缺少候選時組裝必須被擋下，不得輸出成片")
+
+    # 完整的專案則應通過
+    complete = preflight_assembly(artifact)
+    check(complete.ok, f"完整專案不應被擋: {complete.reasons}")
+    check(complete.ready_shots == complete.planned_shots, "全部鏡頭應就緒")
+
+
+def verify_retime_is_rendered(artifact: ProductionArtifact) -> None:
+    """hold 與變速必須實際 render，不能只存在於時間線。"""
+    settings = get_settings()
+    rebuild_timeline(artifact, preserve_existing=False)
+
+    baseline = build_timeline(artifact.project_id, artifact.edit_decisions)
+    baseline_ms = baseline.total_duration_ms
+
+    update_edit_decision(artifact, SHOT_A, hold_ms=2000)
+    held = build_timeline(artifact.project_id, artifact.edit_decisions)
+    check(
+        held.total_duration_ms == baseline_ms + 2000,
+        f"時間線應反映停格: {held.total_duration_ms}",
+    )
+
+    clip = next(item for item in held.clips if item.shot_id == SHOT_A)
+    check(clip.hold_ms == 2000, "TimelineClip 應帶出停格資訊供組裝使用")
+
+    filter_chain = build_clip_filter(clip, 1080, 1920)
+    check("tpad" in filter_chain, f"停格應轉為 tpad 濾鏡: {filter_chain}")
+
+    speed_clip = clip.model_copy(
+        update={"retime_mode": RetimeMode.SPEED, "retime_factor": 2.0, "hold_ms": 0}
+    )
+    check(speed_clip.needs_retime, "變速應被識別")
+    check(
+        "setpts=PTS/2" in build_clip_filter(speed_clip, 1080, 1920),
+        "變速應轉為 setpts 濾鏡",
+    )
+
+    if not ffmpeg_available() or not ffprobe_available():
+        return
+
+    output = render_by_profile(settings, artifact, held)
+    info = probe_media(Path(output))
+    check(info.probed, f"成片無法探測: {info.error}")
+    tolerance = max(500, int(held.total_duration_ms * 0.15))
+    check(
+        abs(info.duration_ms - held.total_duration_ms) <= tolerance,
+        f"停格必須實際 render：成片 {info.duration_ms}ms 與時間線 "
+        f"{held.total_duration_ms}ms 不符",
+    )
+    check(
+        info.duration_ms > baseline_ms,
+        "加入停格後成片應變長，否則濾鏡未生效",
+    )
+
+
 def verify_slideshow_track_intact(artifact: ProductionArtifact) -> None:
     """既有投影片路徑必須仍可運作，不能被鏡頭組裝取代。"""
     settings = get_settings()
@@ -340,6 +436,8 @@ def main() -> int:
     verify_timeline_is_not_file_length(artifact, actual)
     verify_cue_ledger_is_derived(artifact)
     mode = verify_assembly(artifact)
+    verify_assembly_preflight(artifact)
+    verify_retime_is_rendered(artifact)
     verify_slideshow_track_intact(artifact)
 
     timeline = build_timeline(artifact.project_id, artifact.edit_decisions)
