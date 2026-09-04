@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Iterable
 
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, inspect, text
 from sqlalchemy.engine import Engine
 
 SCHEMA_VERSION_TABLE = "schema_version"
@@ -49,24 +49,16 @@ def dialect_of(conn: Connection) -> str:
 
 
 def table_exists(conn: Connection, table: str) -> bool:
-    return conn.dialect.has_table(conn, table)
+    # 使用公開的 inspect API。dialect.has_table 是內部介面，缺少 info_cache
+    # 參數時在部分方言下會回報錯誤結果。
+    return inspect(conn).has_table(table)
 
 
 def column_exists(conn: Connection, table: str, column: str) -> bool:
     if not table_exists(conn, table):
         return False
-    dialect = dialect_of(conn)
-    if dialect == "sqlite":
-        rows = conn.execute(text(f'PRAGMA table_info("{table}")')).fetchall()
-        return any(row[1] == column for row in rows)
-    rows = conn.execute(
-        text(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_name = :table AND column_name = :column"
-        ),
-        {"table": table, "column": column},
-    ).fetchall()
-    return len(rows) > 0
+    columns = {col["name"] for col in inspect(conn).get_columns(table)}
+    return column in columns
 
 
 def json_type(conn: Connection) -> str:

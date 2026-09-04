@@ -26,7 +26,12 @@ engine = create_engine(
 )
 
 def init_db() -> None:
+    # 明確 import 所有資料表模組，確保其註冊至 SQLModel.metadata。
     from pipeline.models.production_artifact import ProductionArtifact
+    from pipeline.models.qc import ContinuityQC, VariantQC
+    from pipeline.models.reference_asset import ReferenceAsset
+    from pipeline.models.variant import AssetVariant, CapabilityJob
+
     SQLModel.metadata.create_all(engine)
 
 def check_schema():
