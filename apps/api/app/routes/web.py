@@ -19,7 +19,7 @@ import zipfile
 logger = logging.getLogger(__name__)
 
 
-from fastapi import APIRouter, Depends, Form, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -50,7 +50,13 @@ from pipeline.settings import Settings
 from pipeline.stages.compliance_checker import check_compliance
 from pipeline.stages.run_mvp import run_mvp_pipeline
 from pipeline.stages.shot_dispatcher import dispatch_project_shots, job_package_root
+from pipeline.stages.shot_qc import (
+    QCValidationError,
+    record_variant_qc,
+    summarize_project_qc,
+)
 from pipeline.stages.transcript_importer import import_transcript
+from pipeline.stages.variant_importer import import_variants, list_variants, select_variant
 from pipeline.utils.files import ensure_project_dir
 from pipeline.stages.llm_executors import run_topic_research, run_script_outline, run_packaging
 from pipeline.stages.script_splitter import split_script_into_shorts
@@ -396,6 +402,7 @@ def project_detail(project_id: str, settings: Settings = Depends(settings_dep)) 
               {preview}
               {transcript_panel(artifact)}
               {shot_dispatch_panel(artifact)}
+              {variant_panel(artifact)}
               {cue_strip}
               {visual_quality_panel(artifact)}
               <section class="panel">
@@ -575,6 +582,149 @@ def download_job_packages(
             )
         },
     )
+
+
+def _optional_int(raw: str) -> int | None:
+    """空字串代表 N/A，不可轉為 0，否則會與「極差」混淆。"""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError as error:
+        raise QCValidationError(f"評分必須為整數或留空: {raw}") from error
+
+
+def _optional_float(raw: str) -> float | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+@router.post("/projects/{project_id}/variants/import")
+async def import_project_variants(
+    project_id: str,
+    shot_id: str = Form(...),
+    provider: str = Form(...),
+    files: list[UploadFile] = File(...),
+    request_hash: str = Form(""),
+    actor: str = Form("local"),
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    """匯入人工於平台生成的候選影片。"""
+    artifact = await run_in_threadpool(load_project, settings, project_id)
+
+    payloads: list[tuple[str, bytes]] = []
+    for upload in files:
+        payloads.append((upload.filename or "unnamed", await upload.read()))
+
+    try:
+        report = await run_in_threadpool(
+            import_variants,
+            settings,
+            artifact,
+            shot_id,
+            provider,
+            payloads,
+            request_hash.strip() or None,
+            None,
+            None,
+            actor or "local",
+            None,
+        )
+        if report.skipped:
+            logger.warning("Variant import skipped %d files", len(report.skipped))
+    except Exception as error:  # noqa: BLE001 - 匯入失敗需留下稽核軌跡
+        artifact.decision_log.append(
+            DecisionLogEntry(
+                action="variants_import_failed",
+                actor=actor or "local",
+                note=str(error)[:300],
+            )
+        )
+        artifact.touch()
+        await run_in_threadpool(save_project, settings, artifact)
+        raise WebException(
+            detail=f"Variant import failed: {error}",
+            back_link=f"/projects/{project_id}/view#variants",
+        ) from error
+
+    await run_in_threadpool(save_project, settings, artifact)
+    return RedirectResponse(url=f"/projects/{project_id}/view#variants", status_code=303)
+
+
+@router.post("/projects/{project_id}/variants/{variant_id}/select")
+async def select_project_variant(
+    project_id: str,
+    variant_id: str,
+    reason: str = Form(""),
+    actor: str = Form("local"),
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    artifact = await run_in_threadpool(load_project, settings, project_id)
+    try:
+        await run_in_threadpool(
+            select_variant, artifact, variant_id, reason, actor or "local"
+        )
+    except ValueError as error:
+        raise WebException(
+            detail=str(error),
+            back_link=f"/projects/{project_id}/view#variants",
+            status_code=404,
+        ) from error
+
+    await run_in_threadpool(save_project, settings, artifact)
+    return RedirectResponse(url=f"/projects/{project_id}/view#variants", status_code=303)
+
+
+@router.post("/projects/{project_id}/variants/{variant_id}/qc")
+async def score_project_variant(
+    project_id: str,
+    variant_id: str,
+    prompt_adherence: str = Form(""),
+    temporal_stability: str = Form(""),
+    motion_quality: str = Form(""),
+    camera_control: str = Form(""),
+    artifact_severity: str = Form(""),
+    usable: str = Form(""),
+    correction_minutes: str = Form(""),
+    notes: str = Form(""),
+    actor: str = Form("local"),
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    """記錄單鏡頭品質評分。留空的欄位視為 N/A。"""
+    artifact = await run_in_threadpool(load_project, settings, project_id)
+    try:
+        scores = {
+            "prompt_adherence": _optional_int(prompt_adherence),
+            "temporal_stability": _optional_int(temporal_stability),
+            "motion_quality": _optional_int(motion_quality),
+            "camera_control": _optional_int(camera_control),
+            "artifact_severity": _optional_int(artifact_severity),
+        }
+        await run_in_threadpool(
+            record_variant_qc,
+            artifact,
+            variant_id,
+            scores,
+            bool(usable),
+            _optional_float(correction_minutes),
+            None,
+            actor or "local",
+            notes or None,
+        )
+    except (QCValidationError, ValueError) as error:
+        raise WebException(
+            detail=f"QC scoring failed: {error}",
+            back_link=f"/projects/{project_id}/view#variants",
+        ) from error
+
+    await run_in_threadpool(save_project, settings, artifact)
+    return RedirectResponse(url=f"/projects/{project_id}/view#variants", status_code=303)
 
 
 @router.post("/projects/{project_id}/lava/run")
@@ -1139,6 +1289,136 @@ def shot_dispatch_panel(artifact: ProductionArtifact) -> str:
         產出後下載 job packages，依各平台 README 的步驟人工生成，再將影片匯回。
         <a href="/projects/{escape(project_id)}/job-packages.zip">Download job packages</a>
       </p>
+    </section>
+    """
+
+
+def variant_panel(artifact: ProductionArtifact) -> str:
+    """候選管理面板：匯入人工生成的影片、評分、選片。"""
+    project_id = artifact.project_id
+    shots = sorted(artifact.shot_plans, key=lambda item: item.order)
+    if not shots:
+        return ""
+
+    try:
+        variants = list_variants(project_id)
+        summary = summarize_project_qc(project_id, artifact.production_profile)
+    except Exception as error:  # noqa: BLE001 - 候選不可用時仍應顯示匯入表單
+        logger.warning("Failed to load variants: %s", error)
+        variants, summary = [], None
+
+    by_shot: dict[str, list] = {}
+    for variant in variants:
+        by_shot.setdefault(variant.shot_id, []).append(variant)
+
+    shot_options = "\n".join(
+        f'<option value="{escape(shot.shot_id)}">{escape(shot.shot_id)}</option>'
+        for shot in shots
+    )
+    provider_options = "\n".join(
+        f'<option value="{escape(spec.provider_id)}">{escape(spec.label)}</option>'
+        for spec in sorted(provider_specs().values(), key=lambda s: s.provider_id)
+        if spec.transport is TransportKind.MANUAL
+    )
+
+    cards = []
+    for shot in shots:
+        items = by_shot.get(shot.shot_id, [])
+        if not items:
+            cards.append(
+                f'<div class="variant-group"><strong class="mono">{escape(shot.shot_id)}</strong>'
+                f'<span class="muted"> no variants imported</span></div>'
+            )
+            continue
+
+        rows = []
+        for variant in items:
+            duration = (
+                f"{variant.actual_duration_ms / 1000:g}s"
+                if variant.actual_duration_ms
+                else "?"
+            )
+            selected = " selected" if variant.is_selected else ""
+            rows.append(
+                f"""
+            <tr class="variant-row{selected}">
+              <td class="mono">{escape(variant.variant_id[-16:])}</td>
+              <td>{escape(variant.provider)}</td>
+              <td class="mono">{escape(duration)}</td>
+              <td class="mono">{escape(variant.resolution or "?")}</td>
+              <td>{escape(variant.status)}</td>
+              <td>
+                <form method="post" action="/projects/{escape(project_id)}/variants/{escape(variant.variant_id)}/select" class="inline-form">
+                  <input name="reason" placeholder="reason" />
+                  <button class="ghost-button" type="submit">Select</button>
+                </form>
+              </td>
+              <td>
+                <form method="post" action="/projects/{escape(project_id)}/variants/{escape(variant.variant_id)}/qc" class="inline-form">
+                  <input name="prompt_adherence" placeholder="prompt" size="4" />
+                  <input name="temporal_stability" placeholder="stable" size="4" />
+                  <input name="motion_quality" placeholder="motion" size="4" />
+                  <input name="camera_control" placeholder="camera" size="4" />
+                  <input name="artifact_severity" placeholder="artifact" size="4" />
+                  <label><input type="checkbox" name="usable" value="1" /> usable</label>
+                  <input name="correction_minutes" placeholder="min" size="4" />
+                  <button class="ghost-button" type="submit">Score</button>
+                </form>
+              </td>
+            </tr>
+            """
+            )
+        cards.append(
+            f"""
+        <div class="variant-group">
+          <strong class="mono">{escape(shot.shot_id)}</strong>
+          <table class="data-table">
+            <thead><tr><th>Variant</th><th>Provider</th><th>Actual</th><th>Res</th><th>Status</th><th>Select</th><th>QC (0-100, blank = N/A)</th></tr></thead>
+            <tbody>{"".join(rows)}</tbody>
+          </table>
+        </div>
+        """
+        )
+
+    if summary and summary.total_variants:
+        usable_rate = summary.usable_shot_rate
+        head = (
+            f"{summary.total_usable}/{summary.total_variants} usable | "
+            f"shots with a usable take: "
+            f"{'n/a' if usable_rate is None else f'{usable_rate:.0%}'} | "
+            f"correction {summary.total_correction_minutes:g} min"
+        )
+    else:
+        head = "No variants imported yet"
+
+    return f"""
+    <section id="variants" class="panel">
+      <div class="section-head">
+        <h2>Variants</h2>
+        <span class="muted">{escape(head)}</span>
+      </div>
+      <form method="post" action="/projects/{escape(project_id)}/variants/import"
+            enctype="multipart/form-data" class="variant-import">
+        <div class="split">
+          <div class="field">
+            <label for="variant-shot">Shot</label>
+            <select id="variant-shot" name="shot_id">{shot_options}</select>
+          </div>
+          <div class="field">
+            <label for="variant-provider">Provider</label>
+            <select id="variant-provider" name="provider">{provider_options}</select>
+          </div>
+        </div>
+        <div class="field">
+          <label for="variant-files">Generated videos</label>
+          <input id="variant-files" type="file" name="files" multiple accept="video/*" required />
+        </div>
+        <div class="split">
+          <input name="request_hash" placeholder="request_hash from job.json (optional)" />
+          <button class="primary" type="submit">Import Variants</button>
+        </div>
+      </form>
+      {"".join(cards)}
     </section>
     """
 
