@@ -1,0 +1,46 @@
+# 平台規格：Kling
+# 第一階段以人工操作驗證，不購買 API。
+#
+# 注意：以下數值為保守預設，尚未經實測確認。
+# 必須於 V1 真實測試時校正，校正前不得視為事實。
+provider_id: kling
+label: Kling
+transport: manual
+
+supported_capabilities:
+  - video_t2v
+  - video_i2v
+  - image_generation
+
+duration_limits:
+  min_ms: 5000
+  max_ms: 10000
+
+max_reference_assets: 4
+
+supported_aspect_ratios:
+  - "9:16"
+  - "16:9"
+  - "1:1"
+
+required_fields:
+  - prompt
+  - aspect_ratio
+  - duration_ms
+
+parameter_mapping:
+  negative_prompt: negative_prompt
+  first_frame_ref: start_frame
+  duration_ms: duration
+  aspect_ratio: aspect_ratio
+
+human_instructions: |
+  1. 開啟 Kling 網頁介面，選擇對應的生成模式（文生視頻或圖生視頻）。
+  2. 貼上 prompt.txt 的內容。
+  3. 圖生視頻時，上傳 refs/ 目錄中的首幀圖片。
+  4. 依 job.json 設定畫面比例與片長。
+  5. 產出後下載影片，連同平台回報的實際片長一併匯回。
+  6. 若同一鏡頭生成多次，每次都需匯入，重試次數是評估指標之一。
+
+notes: |
+  片長與參考素材上限待 V1 實測校正。

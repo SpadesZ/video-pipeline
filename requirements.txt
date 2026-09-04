@@ -11,6 +11,8 @@ httpx>=0.27,<1.0
 python-dotenv>=1.0,<2.0
 Pillow>=10.0,<11.0
 sqlmodel>=0.0.22,<1.0
+# Capability Router 的 provider / model / routing catalog
+PyYAML>=6.0,<7.0
 
 # Optional: YouTube Analytics API
 google-api-python-client>=2.100,<3.0

@@ -81,6 +81,7 @@ container.
 | `smoke_navigation_ui.py` | `api` |
 | `smoke_migrations.py` | `api` |
 | `smoke_narrative_models.py` | `api` |
+| `smoke_capability_router.py` | `api` |
 | `smoke_project_store.py` | `worker` |
 | `smoke_lava_settings.py` | `worker` |
 | `smoke_asr.py` | `asr-worker` (needs `--profile asr`) |
@@ -181,6 +182,46 @@ Run the deterministic navigation/UI smoke:
 ```powershell
 docker compose run --rm api python scripts/smoke_navigation_ui.py
 ```
+
+## Capability Router
+
+LAVA dispatch runs through a general capability router rather than an
+LLM-only path. Layers:
+
+```text
+CapabilityRequest -> ModelRegistry -> RoutingPolicy -> ProviderAdapter
+```
+
+Models and providers are decoupled: a provider hosts many models, and a model
+may be hosted by several providers. Adapters are looked up by
+`(capability, provider)` instead of a hardcoded if/else chain.
+
+Catalog lives in `pipeline/capability/catalog/`:
+
+```text
+providers/*.yaml   per-platform spec: capabilities, limits, required fields,
+                   parameter mapping, human instructions
+models.yaml        model capabilities, duration and aspect limits, hosted_by
+routing.yaml       preference rules matched on ProductionProfile policy fields
+```
+
+Routing rules match on policy fields (`quality_tier`, `motion_policy`,
+`aspect_ratio`). They must never match on `preset_id` — a preset is only a
+bundle of policy defaults, and branching on its name would grow a separate
+pipeline per content type.
+
+`CapabilityResult.status` covers the full job lifecycle, not a boolean:
+
+```text
+pending_manual -> submitted -> queued -> running -> completed
+                                      -> failed / cancelled / expired
+```
+
+`pending_manual` ends the fallback loop. A manual job is already dispatched to
+a human, so retrying other providers would duplicate the work.
+
+Video platform limits in the catalog are conservative placeholders and are
+marked as pending real measurement. Treat them as unverified until calibrated.
 
 ## LAVA Settings
 

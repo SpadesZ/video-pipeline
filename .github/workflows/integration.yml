@@ -52,6 +52,9 @@ jobs:
       - name: smoke_narrative_models (api)
         run: docker compose run --rm api python scripts/smoke_narrative_models.py
 
+      - name: smoke_capability_router (api)
+        run: docker compose run --rm api python scripts/smoke_capability_router.py
+
       - name: smoke_project_store (worker)
         run: docker compose run --rm worker python scripts/smoke_project_store.py
 

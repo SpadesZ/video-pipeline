@@ -1,0 +1,41 @@
+# 平台規格：Runway
+# 第一階段以人工操作驗證，不購買 API。
+#
+# 注意：以下數值為保守預設，尚未經實測確認。
+# 必須於 V1 真實測試時校正，校正前不得視為事實。
+provider_id: runway
+label: Runway
+transport: manual
+
+supported_capabilities:
+  - video_t2v
+  - video_i2v
+
+duration_limits:
+  min_ms: 5000
+  max_ms: 10000
+
+max_reference_assets: 1
+
+supported_aspect_ratios:
+  - "16:9"
+  - "9:16"
+
+required_fields:
+  - prompt
+  - duration_ms
+
+parameter_mapping:
+  first_frame_ref: input_image
+  duration_ms: duration
+  aspect_ratio: ratio
+
+human_instructions: |
+  1. 開啟 Runway 的 Generate Video 介面。
+  2. 貼上 prompt.txt 的內容。
+  3. 圖生視頻時上傳 refs/ 中的首幀。注意本平台單次僅接受一張參考圖。
+  4. 依 job.json 設定片長與比例。
+  5. 下載產出並記錄實際片長與嘗試次數。
+
+notes: |
+  參考素材上限與片長選項待 V1 實測校正。

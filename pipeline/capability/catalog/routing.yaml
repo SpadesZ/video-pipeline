@@ -1,0 +1,69 @@
+# 路由規則
+#
+# 規則只能比對 ProductionProfile 的政策欄位，不得比對 preset_id。
+# preset 只是政策的預設值組合，一旦用於分支，漫劇、短劇與電影就會
+# 各自長出一條路由路徑。
+#
+# prefer_models 為偏好順序；未列出的模型仍可作為後備，順序依 catalog。
+# 在 E6 累積 benchmark 資料前，這些偏好只是初始猜測，
+# 應於 V3 依 usable-shot rate 與人工修正時間重新排序。
+
+rules:
+  - rule_id: text_default
+    capability: text_reasoning
+    priority: 0
+    prefer_models:
+      - openai/gpt-4o-mini
+      - gemini-2.0-flash
+
+  - rule_id: vision_default
+    capability: vision_analysis
+    priority: 0
+    prefer_models:
+      - gemini-2.0-flash
+
+  # 直式高品質：漫劇與短劇的主要形態，角色一致性優先
+  - rule_id: i2v_vertical_high
+    capability: video_i2v
+    priority: 20
+    quality_tier: high
+    aspect_ratio: "9:16"
+    prefer_models:
+      - kling-video
+      - seedance-video
+      - runway-gen3
+
+  - rule_id: t2v_vertical_high
+    capability: video_t2v
+    priority: 20
+    quality_tier: high
+    aspect_ratio: "9:16"
+    prefer_models:
+      - kling-video
+      - seedance-video
+
+  # 橫式高品質：電影模式，運鏡控制優先
+  - rule_id: i2v_wide_high
+    capability: video_i2v
+    priority: 20
+    quality_tier: high
+    aspect_ratio: "16:9"
+    prefer_models:
+      - runway-gen3
+      - veo-video
+      - kling-video
+
+  # 草稿層級不分比例，以低成本快速產出為主
+  - rule_id: i2v_draft
+    capability: video_i2v
+    priority: 10
+    quality_tier: draft
+    prefer_models:
+      - veo-video
+      - kling-video
+
+  - rule_id: reference_video_default
+    capability: video_reference
+    priority: 0
+    prefer_models:
+      - seedance-video

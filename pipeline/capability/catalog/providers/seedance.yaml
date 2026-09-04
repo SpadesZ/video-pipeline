@@ -1,0 +1,42 @@
+# 平台規格：Seedance
+# 第一階段以人工操作驗證，不購買 API。
+#
+# 注意：以下數值為保守預設，尚未經實測確認。
+# 必須於 V1 真實測試時校正，校正前不得視為事實。
+provider_id: seedance
+label: Seedance
+transport: manual
+
+supported_capabilities:
+  - video_t2v
+  - video_i2v
+  - video_reference
+
+duration_limits:
+  min_ms: 5000
+  max_ms: 10000
+
+max_reference_assets: 4
+
+supported_aspect_ratios:
+  - "9:16"
+  - "16:9"
+  - "1:1"
+
+required_fields:
+  - prompt
+
+parameter_mapping:
+  negative_prompt: negative_prompt
+  first_frame_ref: first_frame
+  duration_ms: duration
+  aspect_ratio: ratio
+
+human_instructions: |
+  1. 於 Seedance 介面選擇生成模式。
+  2. 貼上 prompt.txt 的內容。
+  3. 使用參考影片或首幀時，上傳 refs/ 中對應的素材。
+  4. 下載產出並記錄實際片長與嘗試次數。
+
+notes: |
+  能力範圍與限制待 V1 實測校正。
