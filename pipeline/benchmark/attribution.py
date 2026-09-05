@@ -58,7 +58,10 @@ class AttributedVariant(BaseModel):
     model_id: str
     model_version: str | None = None
     local_path: str | None = None
+    # 平台下載時的原始檔名，也是人工在 ledger 記錄的 output_file。
     file_name: str | None = None
+    # 匯入後改名的 var_<uuid> 檔名，僅供除錯顯示，不參與對應。
+    stored_filename: str | None = None
     benchmark_selected: bool = False
 
     model_config = {"protected_namespaces": ()}
@@ -92,7 +95,11 @@ class AttributionIndex(BaseModel):
     def find_by_file(
         self, target_id: str, shot_id: str, file_name: str
     ) -> AttributedVariant:
-        """依檔名精確對應。多筆相符時拒絕，不挑第一個。"""
+        """依平台原始檔名精確對應。多筆相符時拒絕，不挑第一個。
+
+        比對的是 file_name（平台下載檔名），不是匯入後的 var_<uuid>。
+        使用者記在 ledger 的是平台給的檔名，系統內部改名對他不可見。
+        """
         matches = [
             item
             for item in self.for_shot(target_id, shot_id)
@@ -153,7 +160,14 @@ def build_index(project_id: str) -> AttributionIndex:
                 model_id=target.model_id,
                 model_version=target.model_version,
                 local_path=variant.local_path,
+                # 匯入時檔案會被改名為 var_<uuid>，但人工在 ledger 記的是
+                # 平台下載的原始檔名。拿內部檔名去對，永遠對不上。
+                # original_filename 為 None 的是舊資料，才退回本地檔名。
                 file_name=(
+                    variant.original_filename
+                    or (Path(variant.local_path).name if variant.local_path else None)
+                ),
+                stored_filename=(
                     Path(variant.local_path).name if variant.local_path else None
                 ),
                 benchmark_selected=bool(variant.benchmark_selected),

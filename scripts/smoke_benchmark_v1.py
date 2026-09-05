@@ -70,7 +70,7 @@ from pipeline.models.production_artifact import ProductionArtifact
 from pipeline.models.production_profile import load_preset
 from pipeline.models.qc import ContinuityQC, VariantQC
 from pipeline.models.reference_asset import ReferenceAsset
-from pipeline.models.variant import AssetVariant, VariantStatus
+from pipeline.models.variant import AssetVariant, CapabilityJob, VariantStatus
 from pipeline.project_store import load_project
 from pipeline.settings import get_settings
 from pipeline.stages.shot_dispatcher import (
@@ -675,6 +675,118 @@ def verify_attribution_requires_lineage() -> None:
         pass
     else:
         raise AssertionError("同名多筆時應拒絕，不得挑第一個")
+
+
+def verify_attempt_sync_uses_original_filename() -> None:
+    """匯入會把檔案改名為 var_<uuid>，對應必須認平台原始檔名。
+
+    人工在 ledger 記的是平台下載時的檔名，系統內部改名對他不可見。
+    若索引拿改名後的檔名去比對，每一列成功的嘗試都會 unresolved，
+    而且不會有任何徵兆——統計只會少掉資料，不會報錯。
+    """
+    from pipeline.stages.variant_importer import import_variants
+
+    settings = get_settings()
+    artifact = load_project(settings, v1_pack.BENCHMARK_PROJECT_ID)
+    registry = target.targets()
+    primary = registry.targets[0]
+    shot_id = "bm_b1_two_shot_dialogue"
+    platform_name = "provider_result_001.mp4"
+
+    # 取真實派工，走完整匯入路徑而非直接塞資料庫
+    with Session(engine) as session:
+        job = next(
+            (
+                item
+                for item in session.exec(
+                    select(CapabilityJob).where(
+                        CapabilityJob.project_id == v1_pack.BENCHMARK_PROJECT_ID,
+                        CapabilityJob.shot_id == shot_id,
+                    )
+                ).all()
+                if (item.request_snapshot or {}).get("parameters", {}).get(
+                    "_bm_target_id"
+                )
+                == primary.target_id
+            ),
+            None,
+        )
+    check(job is not None, f"{primary.target_id}/{shot_id} 應已有派工")
+
+    clip = _TMP_DIR / "downloads" / platform_name
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    clip.write_bytes(b"\x00\x00\x00\x18ftypmp42" + os.urandom(2048))
+
+    report = import_variants(
+        settings,
+        artifact,
+        shot_id=shot_id,
+        provider=primary.provider,
+        files=[(platform_name, clip.read_bytes())],
+        request_hash=job.request_hash,
+        model_id=primary.model_id,
+    )
+    check(report.new_count == 1, f"應匯入 1 支候選: {report.skipped}")
+    imported = report.imported[0]
+
+    stored = Path(imported.local_path).name
+    check(
+        stored != platform_name,
+        f"匯入後應改名為系統檔名，實際仍為 {stored}",
+    )
+    check(stored.startswith("var_"), f"系統檔名應為 var_ 前綴，實際 {stored}")
+
+    index = attribution.build_index(v1_pack.BENCHMARK_PROJECT_ID)
+    entry = index.by_variant_id(imported.variant_id)
+    check(entry is not None, "匯入的候選應可歸屬")
+    check(
+        entry.file_name == platform_name,
+        f"對應用的檔名應為平台原始檔名，實際 {entry.file_name}",
+    )
+    check(
+        entry.stored_filename == stored,
+        f"stored_filename 應保留系統檔名，實際 {entry.stored_filename}",
+    )
+
+    found = index.find_by_file(primary.target_id, shot_id, platform_name)
+    check(
+        found.variant_id == imported.variant_id,
+        "以平台原始檔名應能找回候選",
+    )
+
+    # 內部檔名不得成為對應依據，否則等於承認兩套檔名都算數
+    try:
+        index.find_by_file(primary.target_id, shot_id, stored)
+    except LookupError:
+        pass
+    else:
+        raise AssertionError("不得以系統內部檔名對應使用者記錄的 output_file")
+
+    # 完整走一次 ledger sync。用獨立 ledger，避免與共用評分表的列數互相牽動
+    path = _TMP_DIR / "original_filename_ledger" / attempts.ATTEMPTS_SHEET
+    attempts.append_attempt(
+        path,
+        shot_id=shot_id,
+        target_id=primary.target_id,
+        status="success",
+        output_file=platform_name,
+        generation_seconds="72",
+    )
+    sync = attempts.sync_variant_ids(path, v1_pack.BENCHMARK_PROJECT_ID)
+    check(
+        not sync.unresolved,
+        f"平台檔名應可對應到候選: {sync.unresolved}",
+    )
+
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    matched = [row for row in rows if row["output_file"] == platform_name]
+    check(len(matched) == 1, f"應有一列記錄 {platform_name}")
+    check(
+        matched[0]["variant_id"] == imported.variant_id,
+        f"variant_id 應補齊為 {imported.variant_id}，"
+        f"實際 {matched[0]['variant_id']!r}",
+    )
 
 
 def verify_benchmark_selection_independent() -> None:
@@ -1331,6 +1443,7 @@ def main() -> int:
     verify_sheets_and_applicability()
     verify_only_model_id_enforced()
     verify_attribution_requires_lineage()
+    verify_attempt_sync_uses_original_filename()
     verify_benchmark_selection_independent()
     verify_sync_preserves_user_input()
     verify_attempt_ledger_keeps_failures()
