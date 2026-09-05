@@ -65,6 +65,8 @@ class QCWeights(BaseModel):
     motion_quality: float = 1.0
     camera_control: float = 1.0
     artifact_severity: float = 1.0
+    identity_consistency: float = 1.0
+    facial_acting: float = 1.0
     # 跨鏡頭
     cross_shot_identity: float = 1.0
     wardrobe_continuity: float = 1.0
@@ -123,11 +125,13 @@ _PRESETS: dict[str, dict] = {
         "target_duration_seconds": 90,
         "qc_weights": {
             "cross_shot_identity": 3.0,
+            "identity_consistency": 3.0,
             "wardrobe_continuity": 2.0,
             "temporal_stability": 2.0,
             "prompt_adherence": 1.5,
             "location_continuity": 1.0,
             "motion_quality": 1.0,
+            "facial_acting": 1.0,
             "camera_control": 0.5,
             "artifact_severity": 1.5,
             "lip_sync_quality": 0.3,
@@ -145,6 +149,8 @@ _PRESETS: dict[str, dict] = {
         "target_duration_seconds": 180,
         "qc_weights": {
             "cross_shot_identity": 3.0,
+            "identity_consistency": 3.0,
+            "facial_acting": 2.5,
             "lip_sync_quality": 2.5,
             "wardrobe_continuity": 2.0,
             "temporal_stability": 2.0,
@@ -167,11 +173,13 @@ _PRESETS: dict[str, dict] = {
         "target_duration_seconds": 600,
         "qc_weights": {
             "cross_shot_identity": 3.0,
+            "identity_consistency": 3.0,
             "camera_control": 2.5,
             "location_continuity": 2.5,
             "temporal_stability": 2.0,
             "wardrobe_continuity": 2.0,
             "motion_quality": 2.0,
+            "facial_acting": 2.0,
             "lip_sync_quality": 1.5,
             "prompt_adherence": 1.5,
             "artifact_severity": 2.0,

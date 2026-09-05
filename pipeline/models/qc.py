@@ -59,11 +59,18 @@ class VariantQC(SQLModel, table=True):
     motion_quality: int | None = None
     camera_control: int | None = None
     artifact_severity: int | None = None  # 越高越糟
+    # 單一鏡頭內角色身份是否穩定。與 ContinuityQC.cross_shot_identity 不同：
+    # 一顆鏡頭內臉部漂移屬於此處，兩顆鏡頭像不像同一人屬於跨鏡頭連戲。
+    identity_consistency: int | None = None
+    # 表情演技。對話類鏡頭的主要判準之一，非對話鏡頭留空。
+    facial_acting: int | None = None
 
     # 商業指標，獨立於品質分數
     usable_without_repair: bool | None = Field(default=None, index=True)
     human_correction_minutes: float | None = None
     retries_to_usable: int | None = None
+    # 平台生成耗時，用於比較各平台效率
+    generation_seconds: float | None = None
 
     reviewer: str = "local"
     notes: str | None = None
@@ -80,6 +87,8 @@ class VariantQC(SQLModel, table=True):
                 (self.motion_quality, weights.motion_quality),
                 (self.camera_control, weights.camera_control),
                 (cleanliness, weights.artifact_severity),
+                (self.identity_consistency, weights.identity_consistency),
+                (self.facial_acting, weights.facial_acting),
             ]
         )
 

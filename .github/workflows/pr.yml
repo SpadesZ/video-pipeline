@@ -69,6 +69,9 @@ jobs:
       - name: Shot assembly smoke
         run: python scripts/smoke_shot_assembly.py
 
+      - name: Benchmark pack smoke
+        run: python scripts/smoke_benchmark_v1.py
+
       # 此腳本自行覆寫 DATA_DIR 與清空金鑰，不需外部環境變數
       - name: LAVA settings smoke (no API keys)
         run: python scripts/smoke_lava_settings.py

@@ -37,6 +37,8 @@ VARIANT_SCORE_FIELDS = (
     "motion_quality",
     "camera_control",
     "artifact_severity",
+    "identity_consistency",
+    "facial_acting",
 )
 
 CONTINUITY_SCORE_FIELDS = (
@@ -78,6 +80,7 @@ def record_variant_qc(
     usable_without_repair: bool | None = None,
     human_correction_minutes: float | None = None,
     retries_to_usable: int | None = None,
+    generation_seconds: float | None = None,
     reviewer: str = "local",
     notes: str | None = None,
 ) -> VariantQC:
@@ -106,6 +109,7 @@ def record_variant_qc(
         record.usable_without_repair = usable_without_repair
         record.human_correction_minutes = human_correction_minutes
         record.retries_to_usable = retries_to_usable
+        record.generation_seconds = generation_seconds
         record.reviewer = reviewer or "local"
         record.notes = notes
 

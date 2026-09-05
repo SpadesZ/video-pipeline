@@ -85,6 +85,7 @@ container.
 | `smoke_manual_provider.py` | `api` |
 | `smoke_variant_qc.py` | `api` |
 | `smoke_shot_assembly.py` | `api` |
+| `smoke_benchmark_v1.py` | `api` |
 | `smoke_project_store.py` | `worker` |
 | `smoke_lava_settings.py` | `worker` |
 | `smoke_asr.py` | `asr-worker` (needs `--profile asr`) |
@@ -185,6 +186,33 @@ Run the deterministic navigation/UI smoke:
 ```powershell
 docker compose run --rm api python scripts/smoke_navigation_ui.py
 ```
+
+## V1 Benchmark
+
+Fixed test cases for comparing video models by hand, without buying any API.
+Six shots across three scenarios, dispatched to Kling, Seedance, Veo and
+Runway with identical prompts and references.
+
+```powershell
+docker compose run --rm api python scripts/benchmark_v1.py check
+docker compose run --rm api python scripts/benchmark_v1.py build
+docker compose run --rm api python scripts/benchmark_v1.py sync
+docker compose run --rm api python scripts/benchmark_v1.py import-scores
+docker compose run --rm api python scripts/benchmark_v1.py status
+```
+
+Real video generation is manual: the system emits job packages, you generate
+on each platform, then import the results back. See
+[docs/benchmark/v1-sop.md](docs/benchmark/v1-sop.md) for the step-by-step
+procedure and [docs/benchmark/v1-spec.md](docs/benchmark/v1-spec.md) for
+scenarios, metrics and gate thresholds.
+
+The benchmark deliberately produces per-scenario winners rather than one
+overall ranking. A model that leads on dialogue may collapse on high-motion
+shots, and averaging the two throws that away.
+
+Platform limits in the catalog are provisional and unverified. Calibrating
+them is part of V1.
 
 ## Capability Router
 

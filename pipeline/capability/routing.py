@@ -116,7 +116,14 @@ class RoutingPolicy:
         profile: ProductionProfile | None = None,
         scenario_type: str | None = None,
         preferred_provider: str | None = None,
+        only_provider: str | None = None,
     ) -> RoutingDecision:
+        """解析可用的模型與平台候選。
+
+        preferred_provider 只調整順序，不相容時仍會退到其他平台。
+        only_provider 則完全排除其他平台：benchmark 需要確保某顆鏡頭
+        確實由指定平台生成，一旦退而求其次，比較資料就失去意義。
+        """
         decision = RoutingDecision()
         seen: set[tuple[str, str]] = set()
 
@@ -124,6 +131,8 @@ class RoutingPolicy:
             request.capability, profile, scenario_type
         ):
             for provider_id in model.hosted_by:
+                if only_provider and provider_id != only_provider:
+                    continue
                 provider = self._providers.get(provider_id)
                 if provider is None:
                     decision.rejected.append(
