@@ -56,6 +56,18 @@ VIDEO_LLM_TASKS = [
         fallback_behavior="Use deterministic quality checks and keep human review as final gate.",
         description="Review the preview package against visual, originality, and platform quality gates.",
     ),
+    LLMTask(
+        task_id="assistant_copilot",
+        label="AI Assistant",
+        capability=LLMCapability.CHAT,
+        required=False,
+        category="assistant",
+        fallback_behavior=(
+            "Show the assistant bubble as unavailable. It is read-only and never "
+            "on the production path, so the benchmark workflow is unaffected."
+        ),
+        description="Explain the current page, entity and workflow state. Read-only.",
+    ),
 ]
 
 TASK_IDS = {task.task_id for task in VIDEO_LLM_TASKS}

@@ -99,7 +99,14 @@ def _step_block(step: workflow.StepState) -> str:
     blockers = ""
     if step.blockers:
         items = "".join(f"<li>{escape(item)}</li>" for item in step.blockers)
-        blockers = f"<ul class='bm-list'>{items}</ul>"
+        # 卡住的步驟旁邊放 Ask AI：使用者看到原因後最常問的就是
+        # 「所以我要做什麼」，讓他不必自己把問題打出來。
+        ask = (
+            f'<a href="#" class="ask-ai" data-ask-ai="'
+            f'第 {step.number} 步「{escape(step.title)}」為什麼卡住？我該怎麼做？"'
+            f">Ask AI</a>"
+        )
+        blockers = f"<ul class='bm-list'>{items}</ul>{ask}"
 
     buttons = "".join(
         _control_button(
@@ -203,6 +210,7 @@ def benchmark_console(settings: Settings = Depends(settings_dep)) -> str:
           .bm-warn {{ color: #e8b; margin: 8px 0; }}
           .next-action {{ color: #7ec8e2; font-size: 14px; margin-top: 6px; }}
           .disabled-why {{ color: #8a94a6; font-size: 12px; }}
+          .ask-ai {{ color: #7ec8e2; font-size: 12px; text-decoration: underline; }}
           button[disabled] {{ opacity: 0.5; cursor: not-allowed; }}
           .bm-steps table {{ margin-top: 10px; }}
           @media (max-width: 720px) {{
@@ -639,6 +647,7 @@ async def benchmark_build(settings: Settings = Depends(settings_dep)):
         raise WebException(
             detail="尚未滿足正式派工條件：" + gate.summary(),
             back_link="/benchmark",
+            error_code=gate.codes()[0] if gate.codes() else "",
         )
 
     await run_in_threadpool(builder.register_assets, settings)

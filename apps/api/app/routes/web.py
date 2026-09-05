@@ -76,27 +76,50 @@ router = APIRouter(include_in_schema=False)
 
 
 class WebException(Exception):
-    def __init__(self, detail: str, status_code: int = 400, back_link: str = "/"):
+    def __init__(
+        self,
+        detail: str,
+        status_code: int = 400,
+        back_link: str = "/",
+        error_code: str = "",
+    ):
         self.detail = detail
         self.status_code = status_code
         self.back_link = back_link
+        # 對應 pipeline/assistant/knowledge/errors.yaml 的 code。
+        # 有 code 時助手能給出確定的成因與修法，而不是重述訊息。
+        self.error_code = error_code
 
 
-def error_page(title: str, message: str, back_link: str = "/", status_code: int = 400) -> HTMLResponse:
+def error_page(
+    title: str,
+    message: str,
+    back_link: str = "/",
+    status_code: int = 400,
+    error_code: str = "",
+) -> HTMLResponse:
+    """錯誤頁。附上 Ask AI，讓使用者不必自己判斷這串訊息是什麼意思。
+
+    data-error-code 供助手讀取，助手因此能直接說明成因與修法，
+    而不是把錯誤訊息換句話說一遍。
+    """
     return HTMLResponse(
         content=page(
             title=title,
             body=f"""
-            <section class="app-shell">
+            <section class="app-shell" data-route="{escape(back_link)}">
               <header class="topbar">
                 <div>
                   <p class="eyebrow" style="color: var(--danger);">System Error</p>
                   <h1>{escape(title)}</h1>
                 </div>
               </header>
-              <section class="panel" style="border-color: var(--danger); padding: 24px;">
+              <section class="panel" style="border-color: var(--danger); padding: 24px;"
+                       data-error-code="{escape(error_code)}">
                 <p style="font-size: 16px; margin-bottom: 20px; line-height: 1.6;">{escape(message)}</p>
                 <a class="button-link primary" href="{escape(back_link)}">Go Back</a>
+                <a class="button-link" href="#"
+                   data-ask-ai="這個錯誤是什麼意思？我該怎麼修？">Ask AI</a>
               </section>
             </section>
             """
@@ -942,8 +965,217 @@ def page(title: str, body: str, active_nav: str = "") -> str:
       <body>
         {nav_html}
         {body}
+        {assistant_widget()}
       </body>
     </html>
+    """
+
+
+def assistant_widget() -> str:
+    """右下角的 AI 助手。唯讀，且刻意不參與任何主流程的表單。
+
+    脈絡從 app-shell 的 data-* 屬性讀取，由後端渲染時寫入，
+    助手因此不需要從 DOM 反推語義。對話存在 sessionStorage，
+    換頁後仍在，關掉分頁才清空。
+    """
+    return """
+    <div id="ai-bubble" class="ai-bubble" role="button" tabindex="0"
+         aria-label="開啟 AI 製片助手">● AI</div>
+    <div id="ai-panel" class="ai-panel" hidden aria-label="AI 製片助手">
+      <div class="ai-head">
+        <strong>AI 製片助手</strong>
+        <span class="ai-head-actions">
+          <button type="button" id="ai-min" title="最小化">—</button>
+          <button type="button" id="ai-close" title="關閉">×</button>
+        </span>
+      </div>
+      <div class="ai-where" id="ai-where">目前：讀取中…</div>
+      <div class="ai-suggests">
+        <button type="button" class="ai-chip">我現在下一步要做什麼？</button>
+        <button type="button" class="ai-chip">為什麼這個按鈕不能按？</button>
+        <button type="button" class="ai-chip">這一頁是做什麼的？</button>
+      </div>
+      <div class="ai-log" id="ai-log"></div>
+      <form class="ai-form" id="ai-form">
+        <input id="ai-input" placeholder="問問題…" autocomplete="off" />
+        <button type="submit" title="送出">↑</button>
+      </form>
+      <p class="ai-note">助手只能讀取與說明，不會替你修改資料或執行操作。</p>
+    </div>
+    <style>
+      .ai-bubble {
+        position: fixed; right: 18px; bottom: 18px; z-index: 60;
+        background: #1f3a4d; color: #7ec8e2; border: 1px solid #2f5670;
+        border-radius: 999px; padding: 10px 16px; cursor: pointer;
+        font-size: 14px; user-select: none;
+      }
+      .ai-bubble:hover { background: #24455c; }
+      .ai-panel {
+        position: fixed; right: 18px; bottom: 18px; z-index: 61;
+        width: min(380px, calc(100vw - 36px));
+        max-height: min(560px, calc(100vh - 90px));
+        display: flex; flex-direction: column;
+        background: #131a26; border: 1px solid #2a3344; border-radius: 10px;
+      }
+      .ai-head {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 10px 12px; border-bottom: 1px solid #2a3344;
+      }
+      .ai-head-actions button {
+        background: none; border: none; color: #8a94a6; cursor: pointer;
+        font-size: 15px; padding: 0 4px;
+      }
+      .ai-where { padding: 8px 12px; font-size: 12px; color: #7ec8e2; }
+      .ai-suggests { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 8px; }
+      .ai-chip {
+        background: #1b2533; border: 1px solid #2a3344; color: #c7d0e0;
+        border-radius: 999px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+      }
+      .ai-chip:hover { background: #222e40; }
+      .ai-log {
+        flex: 1; overflow-y: auto; padding: 8px 12px; font-size: 13px;
+        line-height: 1.65; min-height: 90px;
+      }
+      .ai-msg { margin-bottom: 10px; white-space: pre-wrap; }
+      .ai-msg.user { color: #c7d0e0; }
+      .ai-msg.user::before { content: '你：'; color: #6b7688; }
+      .ai-msg.bot { color: #9fe6c0; }
+      .ai-msg.err { color: #e8b; }
+      .ai-form { display: flex; gap: 6px; padding: 8px 12px;
+                 border-top: 1px solid #2a3344; }
+      .ai-form input { flex: 1; }
+      .ai-form button {
+        background: #1f3a4d; border: 1px solid #2f5670; color: #7ec8e2;
+        border-radius: 6px; padding: 0 12px; cursor: pointer;
+      }
+      .ai-note { padding: 0 12px 10px; font-size: 11px; color: #6b7688; }
+      @media (max-width: 480px) {
+        .ai-panel { right: 8px; left: 8px; width: auto; }
+      }
+    </style>
+    <script>
+    (function () {
+      var bubble = document.getElementById('ai-bubble');
+      var panel = document.getElementById('ai-panel');
+      var log = document.getElementById('ai-log');
+      var form = document.getElementById('ai-form');
+      var input = document.getElementById('ai-input');
+      if (!bubble || !panel || !log || !form || !input) return;
+
+      var KEY = 'ai-assistant-log';
+      var OPEN = 'ai-assistant-open';
+
+      function pageContext() {
+        var shell = document.querySelector('[data-route]');
+        var banner = document.querySelector('[data-error-code]');
+        return {
+          route: (shell && shell.dataset.route) || window.location.pathname,
+          entity_type: (shell && shell.dataset.entityType) || '',
+          entity_id: (shell && shell.dataset.entityId) || '',
+          error_code: (banner && banner.dataset.errorCode) || '',
+          error_message: (banner && banner.textContent.trim().slice(0, 300)) || ''
+        };
+      }
+
+      function describeWhere() {
+        var shell = document.querySelector('[data-route]');
+        var where = document.getElementById('ai-where');
+        if (!where) return;
+        var title = document.title || '';
+        var step = shell && shell.dataset.step;
+        where.textContent = '目前：' + title + (step ? ' · Step ' + step : '');
+      }
+
+      function render() {
+        var items = JSON.parse(sessionStorage.getItem(KEY) || '[]');
+        log.innerHTML = '';
+        items.forEach(function (item) {
+          var node = document.createElement('div');
+          node.className = 'ai-msg ' + item.role;
+          node.textContent = item.text;
+          log.appendChild(node);
+        });
+        log.scrollTop = log.scrollHeight;
+      }
+
+      function push(role, text) {
+        var items = JSON.parse(sessionStorage.getItem(KEY) || '[]');
+        items.push({ role: role, text: text });
+        sessionStorage.setItem(KEY, JSON.stringify(items.slice(-40)));
+        render();
+      }
+
+      function open() {
+        panel.hidden = false; bubble.style.display = 'none';
+        sessionStorage.setItem(OPEN, '1');
+        describeWhere(); render(); input.focus();
+      }
+      function close() {
+        panel.hidden = true; bubble.style.display = '';
+        sessionStorage.setItem(OPEN, '0');
+      }
+
+      bubble.addEventListener('click', open);
+      bubble.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+      });
+      document.getElementById('ai-min').addEventListener('click', close);
+      document.getElementById('ai-close').addEventListener('click', function () {
+        sessionStorage.removeItem(KEY); close();
+      });
+
+      document.querySelectorAll('.ai-chip').forEach(function (chip) {
+        chip.addEventListener('click', function () {
+          input.value = chip.textContent.trim();
+          form.dispatchEvent(new Event('submit', { cancelable: true }));
+        });
+      });
+
+      // 錯誤橫幅上的 Ask AI，帶著該則錯誤的 code 進來
+      document.querySelectorAll('[data-ask-ai]').forEach(function (link) {
+        link.addEventListener('click', function (e) {
+          e.preventDefault();
+          open();
+          input.value = link.dataset.askAi || '這個錯誤是什麼意思？';
+          form.dispatchEvent(new Event('submit', { cancelable: true }));
+        });
+      });
+
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        var question = input.value.trim();
+        if (!question) return;
+        input.value = '';
+        push('user', question);
+        push('bot', '思考中…');
+
+        var payload = pageContext();
+        payload.question = question;
+
+        fetch('/assistant/ask', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+          .then(function (r) { return r.json(); })
+          .then(function (data) {
+            var items = JSON.parse(sessionStorage.getItem(KEY) || '[]');
+            items.pop();
+            sessionStorage.setItem(KEY, JSON.stringify(items));
+            if (data.ok) { push('bot', data.reply); }
+            else { push('err', data.reply || '助手暫時無法使用。'); }
+          })
+          .catch(function () {
+            var items = JSON.parse(sessionStorage.getItem(KEY) || '[]');
+            items.pop();
+            sessionStorage.setItem(KEY, JSON.stringify(items));
+            push('err', '助手暫時無法使用。這不影響你目前的操作。');
+          });
+      });
+
+      if (sessionStorage.getItem(OPEN) === '1') { open(); } else { close(); }
+    })();
+    </script>
     """
 
 

@@ -72,6 +72,11 @@ jobs:
       - name: Benchmark pack smoke
         run: python scripts/smoke_benchmark_v1.py
 
+      # 走完整 HTTP 路由，包含 AI 助手。助手以 mock adapter 驗證契約，
+      # 不需要金鑰，也不會呼叫真實 LLM。
+      - name: Benchmark web and assistant smoke (no API keys)
+        run: python scripts/smoke_benchmark_web_v1c.py
+
       # 此腳本自行覆寫 DATA_DIR 與清空金鑰，不需外部環境變數
       - name: LAVA settings smoke (no API keys)
         run: python scripts/smoke_lava_settings.py

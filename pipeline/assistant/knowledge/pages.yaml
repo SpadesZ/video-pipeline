@@ -1,0 +1,126 @@
+# AI 助手的系統知識庫：頁面與控制項。
+#
+# route 為前綴比對，最長的前綴優先。助手據此知道使用者在哪一頁、
+# 這頁能做什麼、按下去會發生什麼。
+#
+# controls 的 label 與行為在此描述語義，執行期的 enabled 與
+# disabled_reason 由 pipeline/benchmark/workflow.py 提供，不寫在這裡：
+# 那是狀態，不是知識。
+
+pages:
+  - route: /benchmark/assets
+    title: Step 1 · 參考素材
+    purpose: 上傳 benchmark 需要的 8 張參考圖，並即時驗證是否合規。
+    detail: >
+      兩張角色設定圖僅供你製作首幀時對照，不會上傳到平台，因此不限比例。
+      六張首幀會實際送到各平台，必須是 9:16 直式、短邊至少 512px 的
+      可解碼圖片。比例錯誤會讓四個平台各自裁切或補邊，結果就無法比較。
+      上傳失敗時原本那張會保留，不會變成空欄位。
+    controls:
+      - id: upload
+        label: 上傳 / 更換
+        effect: 驗證通過才會取代該欄位既有的圖片；未通過則完全不寫入。
+
+  - route: /benchmark/targets
+    title: Step 2 · 確認平台版本
+    purpose: 填入各平台介面上實際顯示的模型版本與選項名稱。
+    detail: >
+      勾選「我已在平台上確認」並填入版本字串後，provisional 才會變成 false。
+      沒有版本字串的「已確認」沒有意義，跨輪次比較時仍然無法得知用的是哪一版。
+      Catalog model 只能從該平台實際託管的模型中挑，避免打錯字要到派工才發現。
+      若這個對象已經建立過派工，修改後必須重新 Build；既有影片會保留它
+      當初生成時的版本，不會被改寫成新版本。
+    controls:
+      - id: save
+        label: 儲存
+        effect: 寫回 catalog 並更新 provisional 狀態。既有影片的版本紀錄不受影響。
+      - id: open_platform
+        label: 開啟平台
+        effect: 在新分頁開啟該平台的操作頁面，供你確認版本。不會呼叫任何 API。
+
+  - route: /benchmark/jobs
+    title: Job Workbench
+    purpose: 列出所有派工，每一份對應平台上的一次生成。
+    detail: >
+      這頁取代了「下載 zip、解壓、找 job.json、複製 request_hash」的流程。
+
+  - route: /benchmark/jobs/
+    title: Job Workbench · 單一派工
+    purpose: 在平台上生成這顆鏡頭時需要的一切，以及生成後的記錄與匯入。
+    detail: >
+      顯示的提示詞、參數與版本都是派工當下的快照，不是目前的 ShotPlan。
+      分鏡若在派工後被改過，這裡顯示的仍是實際送出去的內容。
+      匯入時系統已經知道專案、鏡頭、比較對象、平台、模型與 request_hash，
+      你只需要選檔案。
+    controls:
+      - id: copy_prompt
+        label: 複製提示詞
+        effect: 複製到剪貼簿，不改變任何資料。
+      - id: download_reference
+        label: 下載
+        effect: 下載該派工引用的參考圖，供你上傳到平台。
+      - id: record_attempt
+        label: 記錄這次嘗試
+        effect: >
+          在嘗試紀錄追加一列。失敗與取消也要記，重試次數本身就是評估指標。
+          成功時必須填平台的產出檔名，匯入後才能自動對應。
+      - id: import_result
+        label: 匯入結果
+        effect: >
+          建立 AssetVariant 並掛上這份派工的血緣。相同內容的檔案不會重複建立。
+          改成與派工不同的鏡頭會被拒絕。
+
+  - route: /benchmark/continuity
+    title: 連戲評分
+    purpose: 並排比較兩顆鏡頭的代表作，評身份、服裝與場景的一致性。
+    detail: >
+      配對只由 benchmark_selected 的代表作組成，而且兩支必須屬於同一個
+      比較對象。缺代表作的配對會顯示缺的是哪一邊，不會給你一個空播放器。
+      分數留白代表 N/A，不是 0 分。V1 沒有音訊，嘴型一律不評。
+    controls:
+      - id: save_next
+        label: 儲存並下一組
+        effect: 寫入或覆寫這組配對的評分，然後跳到下一組尚未評分的配對。
+
+  - route: /benchmark/results
+    title: Benchmark 結果
+    purpose: 依情境呈現各比較對象的可用率、重試次數與人工修補成本。
+    detail: >
+      刻意不產生跨情境總冠軍：擅長運鏡的模型未必擅長對話特寫。
+      低重試獎是唯一的跨情境指標。版本未確認的對象會被標示為版本不明。
+
+  - route: /benchmark
+    title: V1 Benchmark 控制台
+    purpose: 六個步驟的進度總覽，以及每一步的下一個操作。
+    detail: >
+      每個步驟會顯示目前狀態與卡住的原因。按鈕停用時，旁邊會寫出停用原因。
+    controls:
+      - id: benchmark.build
+        label: 建立正式 Job Packages
+        effect: >
+          對每個比較對象的每顆鏡頭各建立一份派工，並產生空白的評分表與
+          嘗試紀錄。三個條件必須同時成立才可執行：素材全部通過驗證、
+          所有比較對象都已確認版本、每個對象都通過 catalog 驗證。
+          重複執行會重新產生派工，既有的候選與評分不會被刪除。
+      - id: benchmark.sync
+        label: 同步評分表
+        effect: >
+          為尚未選定代表作的組合自動指定最早匯入的一支，並補齊 CSV 中
+          空白的 variant_id。只補空欄位，已填寫的分數不會被覆蓋。
+
+  - route: /projects/
+    title: 專案詳情
+    purpose: 單一專案的敘事、分鏡、候選、評分與審核狀態。
+    controls:
+      - id: variant_select
+        label: 選為代表
+        effect: 設定 production 的 SELECTED，與 benchmark_selected 是兩回事。
+
+  - route: /settings/lava
+    title: LAVA 設定
+    purpose: 設定各項文字推理任務要用哪一個模型連線。
+    detail: 這裡設定的是文字模型，與影片生成平台無關。
+
+  - route: /
+    title: 專案列表
+    purpose: 所有專案的入口，以及建立新專案。

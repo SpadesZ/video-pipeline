@@ -25,7 +25,32 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field
 
-CATALOG_PATH = Path(__file__).resolve().parent / "catalog" / "v1_targets.yaml"
+# 隨程式碼發佈的預設目錄。唯讀種子，不在執行期寫入。
+DEFAULT_CATALOG_PATH = Path(__file__).resolve().parent / "catalog" / "v1_targets.yaml"
+# 舊名保留，既有呼叫端仍以此指向預設目錄。
+CATALOG_PATH = DEFAULT_CATALOG_PATH
+
+ACTIVE_CATALOG_SUBPATH = Path("benchmark") / "v1" / "v1_targets.yaml"
+
+
+def active_catalog_path() -> Path:
+    """執行期實際使用的 catalog，位於 DATA_DIR 之下。
+
+    確認版本是使用者的輸入，必須存在會保留的地方。pipeline/ 在容器中
+    是映像的一部分：寫進去的話，重啟或重新部署就會退回全部 provisional，
+    而那時派工已經以確認後的版本建立了，兩邊會對不起來。
+
+    首次使用時從隨程式碼發佈的預設檔複製一份，之後只讀寫這一份。
+    """
+    from pipeline.settings import get_settings
+
+    path = Path(get_settings().data_dir) / ACTIVE_CATALOG_SUBPATH
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            DEFAULT_CATALOG_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    return path
 
 
 class BenchmarkTarget(BaseModel):
@@ -94,7 +119,7 @@ class TargetRegistry(BaseModel):
 
 
 def load_targets(catalog_path: Path | None = None) -> TargetRegistry:
-    path = catalog_path or CATALOG_PATH
+    path = catalog_path or active_catalog_path()
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     targets = [BenchmarkTarget.model_validate(item) for item in data.get("targets", [])]
 
@@ -190,7 +215,7 @@ def save_target(
     """
     from pipeline.models.capability import Capability
 
-    path = catalog_path or CATALOG_PATH
+    path = catalog_path or active_catalog_path()
     registry = load_targets(path)
     existing = registry.by_id(target_id)
     if existing is None:

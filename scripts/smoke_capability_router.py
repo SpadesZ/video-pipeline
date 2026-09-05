@@ -282,10 +282,23 @@ def verify_dispatch_behaviour() -> None:
     )
 
 
+# 重構前就存在的任務。契約是「這些都還在且行為不變」，
+# 不是「總數永遠是六」——後者會在每次新增任務時假性失敗。
+LEGACY_TASK_IDS = (
+    "topic_research",
+    "script_outline",
+    "visual_bible",
+    "storyboard",
+    "packaging",
+    "quality_review",
+)
+
+
 def verify_legacy_contract() -> None:
     """dispatch_llm_task 的行為契約在重構後必須維持。"""
     task_ids = [task.task_id for task in VIDEO_LLM_TASKS]
-    check(len(task_ids) == 6, f"既有任務數量應為 6，實際 {len(task_ids)}")
+    missing = [item for item in LEGACY_TASK_IDS if item not in task_ids]
+    check(not missing, f"既有任務不得消失: {missing}")
 
     messages = [{"role": "user", "content": "ping"}]
 

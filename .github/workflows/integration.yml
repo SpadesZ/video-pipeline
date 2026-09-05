@@ -67,6 +67,9 @@ jobs:
       - name: smoke_benchmark_v1 (api)
         run: docker compose run --rm api python scripts/smoke_benchmark_v1.py
 
+      - name: smoke_benchmark_web_v1c (api)
+        run: docker compose run --rm api python scripts/smoke_benchmark_web_v1c.py
+
       - name: smoke_project_store (worker)
         run: docker compose run --rm worker python scripts/smoke_project_store.py
 
