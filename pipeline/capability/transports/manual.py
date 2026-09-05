@@ -22,7 +22,11 @@ from pathlib import Path
 from sqlmodel import Session, select
 
 from pipeline.capability.base import CapabilityRequest, CapabilityResult
-from pipeline.capability.job_package import build_job_package
+from pipeline.capability.job_package import (
+    JobPackage,
+    build_job_package,
+    read_job_manifest,
+)
 from pipeline.capability.model_registry import ModelEntry, model_registry
 from pipeline.capability.provider_spec import ProviderSpec, get_provider, provider_specs
 from pipeline.models.capability import Capability
@@ -81,6 +85,7 @@ def upsert_manual_job(
     provider: str,
     model: ModelEntry,
     request_hash: str,
+    package: JobPackage | None = None,
 ) -> tuple[str, bool]:
     """建立或取回工作記錄。回傳 (job_id, 是否為新建)。
 
@@ -100,9 +105,10 @@ def upsert_manual_job(
         if existing is not None:
             return existing.job_id, False
 
-        # 記錄真正送出去的規格，而非 ShotPlan 的原始意圖。
-        # 匯入時的落差比對必須以此為基準。
+        # 凍結派工當下的完整請求。匯入候選時的血緣只讀這份快照，
+        # 分鏡日後被修改也不會污染已送出工作的來源記錄。
         visual = request.visual
+        manifest = read_job_manifest(Path(package.package_dir)) if package else {}
         session.add(
             CapabilityJob(
                 job_id=job_id,
@@ -117,6 +123,12 @@ def upsert_manual_job(
                 request_hash=request_hash,
                 requested_duration_ms=visual.duration_ms if visual else None,
                 requested_aspect_ratio=visual.aspect_ratio if visual else None,
+                request_snapshot=request.model_dump(mode="json"),
+                provider_parameters=manifest.get("provider_parameters", {}),
+                reference_asset_ids=(
+                    list(visual.reference_asset_ids) if visual else []
+                ),
+                manifest_path=package.job_path if package else None,
                 submitted_at=datetime.now(timezone.utc),
             )
         )
@@ -192,7 +204,7 @@ class ManualTransportAdapter:
         if self._record_job:
             try:
                 job_id, created = upsert_manual_job(
-                    request, self.provider, model, package.request_hash
+                    request, self.provider, model, package.request_hash, package
                 )
             except Exception as error:  # noqa: BLE001 - 需回報明確原因而非拋出
                 # job package 已產出，但沒有工作記錄就無法在匯回時對應，

@@ -21,6 +21,7 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
@@ -101,6 +102,32 @@ def find_shot(artifact: ProductionArtifact, shot_id: str) -> ShotPlan | None:
 
 class JobLinkError(ValueError):
     """提供的 request_hash 無法安全對應到一筆工作。"""
+
+
+def build_provenance(job: CapabilityJob | None) -> dict:
+    """由派工快照組出候選的生成血緣。
+
+    刻意不接受 ShotPlan 作為來源。分鏡在派工後可能已被修改，
+    若回推當前值，記錄下來的會是從未真正送出去的內容。
+    未關聯派工時全部留空，明確表示血緣不可考。
+    """
+    if job is None:
+        return {
+            "prompt": "",
+            "negative_prompt": "",
+            "reference_asset_ids": [],
+            "provider_parameters": {},
+        }
+
+    snapshot = job.request_snapshot or {}
+    visual = snapshot.get("visual") or {}
+    audio = snapshot.get("audio") or {}
+    return {
+        "prompt": visual.get("prompt") or audio.get("text") or "",
+        "negative_prompt": visual.get("negative_prompt") or "",
+        "reference_asset_ids": list(job.reference_asset_ids or []),
+        "provider_parameters": dict(job.provider_parameters or {}),
+    }
 
 
 def check_against_request(
@@ -231,11 +258,16 @@ def import_variants(
 
             digest = content_hash(payload)
 
+            # 去重必須連同來源一起比對。同樣的位元組若來自不同平台或不同
+            # 派工，是兩筆各自獨立的生成結果，合併會抹掉 attribution，
+            # 讓平台比較失去意義。
             existing = session.exec(
                 select(AssetVariant).where(
                     AssetVariant.project_id == artifact.project_id,
                     AssetVariant.shot_id == shot_id,
                     AssetVariant.file_hash == digest,
+                    AssetVariant.provider == provider,
+                    AssetVariant.job_id == (job.job_id if job else None),
                 )
             ).first()
             if existing is not None:
@@ -255,12 +287,17 @@ def import_variants(
                 )
                 continue
 
-            variant_id = f"var_{shot_id}_{provider}_{digest[:12]}"
+            # 全域唯一。原本以 shot_id + provider + file_hash 組成，
+            # 不同專案匯入同一支檔案會撞主鍵。
+            variant_id = f"var_{uuid4().hex[:20]}"
             destination = target_dir / f"{variant_id}{suffix}"
             destination.write_bytes(payload)
 
             media = probe_media(destination)
             warnings = check_against_request(job, media)
+            provenance = build_provenance(job)
+            if job is None:
+                warnings.append("未關聯派工，無生成血緣可記錄")
 
             session.add(
                 AssetVariant(
@@ -272,9 +309,11 @@ def import_variants(
                     model_id=model_id or (job.model_id if job else None),
                     model_version=job.model_version if job else None,
                     generation_mode=generation_mode or GenerationMode.IMAGE_TO_VIDEO.value,
-                    prompt_snapshot=shot.prompt,
-                    negative_prompt=shot.negative_prompt,
-                    reference_asset_ids=list(shot.reference_asset_ids),
+                    # 血緣一律取自派工快照，不回推當前 ShotPlan
+                    prompt_snapshot=provenance["prompt"],
+                    negative_prompt=provenance["negative_prompt"],
+                    reference_asset_ids=provenance["reference_asset_ids"],
+                    provider_parameters=provenance["provider_parameters"],
                     # 基準取自派工記錄，未關聯時留空而非退回 ShotPlan 意圖值
                     requested_duration_ms=job.requested_duration_ms if job else None,
                     actual_duration_ms=media.duration_ms,

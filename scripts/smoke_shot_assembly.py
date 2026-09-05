@@ -405,6 +405,160 @@ def verify_retime_is_rendered(artifact: ProductionArtifact) -> None:
     )
 
 
+def verify_stale_selection_blocks_render(artifact: ProductionArtifact) -> None:
+    """改選候選後，既有時間線不得繼續 render。"""
+    settings = get_settings()
+
+    # 為 SHOT_A 再匯入一個候選，模擬人工改選
+    alternative = _TMP_DIR / "clips" / "shot_0001_alt.mp4"
+    make_video(alternative, 7.0)
+    with Session(engine) as session:
+        session.add(
+            AssetVariant(
+                variant_id="var_shot_0001_alt",
+                project_id=PROJECT_ID,
+                shot_id=SHOT_A,
+                provider="runway",
+                prompt_snapshot="alt",
+                actual_duration_ms=7000,
+                local_path=str(alternative),
+                file_hash="hash_alt",
+                status=VariantStatus.IMPORTED.value,
+            )
+        )
+        session.commit()
+
+    timeline = rebuild_timeline(artifact, preserve_existing=False)
+    original_variant = next(
+        item.variant_id for item in artifact.edit_decisions if item.shot_id == SHOT_A
+    )
+    check(original_variant == f"var_{SHOT_A}", "初始應選定原候選")
+
+    # 改選為另一個候選，但不重建時間線
+    with Session(engine) as session:
+        old = session.get(AssetVariant, f"var_{SHOT_A}")
+        new = session.get(AssetVariant, "var_shot_0001_alt")
+        old.status = VariantStatus.IMPORTED.value
+        new.status = VariantStatus.SELECTED.value
+        session.add(old)
+        session.add(new)
+        session.commit()
+
+    report = preflight_assembly(artifact, timeline)
+    check(not report.ok, "改選後 preflight 不應通過")
+    check(
+        SHOT_A in report.stale_shots,
+        f"應標記過期的鏡頭: {report.stale_shots}",
+    )
+    check(
+        any("var_shot_0001_alt" in reason for reason in report.reasons),
+        f"原因應指出目前選定的候選: {report.reasons}",
+    )
+
+    try:
+        render_by_profile(settings, artifact, timeline)
+    except AssemblyBlocked as error:
+        check(SHOT_A in error.missing_shots, "例外應帶出過期的鏡頭")
+    else:
+        raise AssertionError("改選後以舊時間線 render 必須被擋下")
+
+    # 重建後即可通過，且指向新候選
+    rebuilt = rebuild_timeline(artifact, preserve_existing=False)
+    updated = next(
+        item.variant_id for item in artifact.edit_decisions if item.shot_id == SHOT_A
+    )
+    check(updated == "var_shot_0001_alt", "重建後應指向新選定的候選")
+    check(preflight_assembly(artifact, rebuilt).ok, "重建後 preflight 應通過")
+
+    # 傳入與剪輯決策不符的時間線同樣要擋
+    check(
+        not preflight_assembly(artifact, timeline).ok,
+        "舊時間線即使重建後仍不得使用",
+    )
+
+    # 還原為原候選，避免影響後續驗證
+    with Session(engine) as session:
+        old = session.get(AssetVariant, f"var_{SHOT_A}")
+        new = session.get(AssetVariant, "var_shot_0001_alt")
+        old.status = VariantStatus.SELECTED.value
+        new.status = VariantStatus.REJECTED.value
+        session.add(old)
+        session.add(new)
+        session.commit()
+    rebuild_timeline(artifact, preserve_existing=False)
+
+
+def verify_audio_does_not_truncate_video(artifact: ProductionArtifact) -> None:
+    """音訊短於時間線時，成片長度必須仍由時間線決定。"""
+    if not ffmpeg_available() or not ffprobe_available():
+        return
+
+    settings = get_settings()
+    timeline = rebuild_timeline(artifact, preserve_existing=False)
+    expected_ms = timeline.total_duration_ms
+    check(expected_ms > 6000, "測試需要足夠長的時間線")
+
+    project_dir = Path(settings.data_dir) / "projects" / PROJECT_ID
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    # 音訊刻意比時間線短。使用 -shortest 時成片會被截到音訊長度。
+    short_audio = project_dir / "voiceover.wav"
+    short_seconds = (expected_ms / 1000) - 6
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=mono:d={short_seconds:.2f}",
+            str(short_audio),
+        ],
+        capture_output=True,
+        check=False,
+    )
+    check(short_audio.exists(), "測試音訊未產生")
+
+    artifact.voiceover_path = str(short_audio)
+    output = render_by_profile(settings, artifact, timeline)
+    check(output is not None, "應產出成片")
+    check(
+        Path(output).suffix == ".mp4",
+        f"音訊較短不應導致組裝失敗: {Path(output).name}",
+    )
+
+    info = probe_media(Path(output))
+    check(info.probed, f"成片無法探測: {info.error}")
+    tolerance = max(500, int(expected_ms * 0.05))
+    check(
+        abs(info.duration_ms - expected_ms) <= tolerance,
+        f"成片 {info.duration_ms}ms 應等於時間線 {expected_ms}ms，"
+        f"而非被音訊截斷至 {short_seconds:.0f}s",
+    )
+    check(
+        info.duration_ms > short_seconds * 1000 + 1000,
+        "成片明顯被音訊截斷",
+    )
+
+    # 音訊長於時間線時，成片同樣由時間線決定
+    long_audio = project_dir / "voiceover_long.wav"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi",
+            "-i", f"anullsrc=r=44100:cl=mono:d={(expected_ms / 1000) + 10:.2f}",
+            str(long_audio),
+        ],
+        capture_output=True,
+        check=False,
+    )
+    artifact.voiceover_path = str(long_audio)
+    output_long = render_by_profile(settings, artifact, timeline)
+    info_long = probe_media(Path(output_long))
+    check(
+        abs(info_long.duration_ms - expected_ms) <= tolerance,
+        f"音訊較長時成片仍應為 {expected_ms}ms，實際 {info_long.duration_ms}ms",
+    )
+
+    artifact.voiceover_path = None
+
+
 def verify_slideshow_track_intact(artifact: ProductionArtifact) -> None:
     """既有投影片路徑必須仍可運作，不能被鏡頭組裝取代。"""
     settings = get_settings()
@@ -437,6 +591,8 @@ def main() -> int:
     verify_cue_ledger_is_derived(artifact)
     mode = verify_assembly(artifact)
     verify_assembly_preflight(artifact)
+    verify_stale_selection_blocks_render(artifact)
+    verify_audio_does_not_truncate_video(artifact)
     verify_retime_is_rendered(artifact)
     verify_slideshow_track_intact(artifact)
 

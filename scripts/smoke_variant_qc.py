@@ -67,6 +67,8 @@ from pipeline.stages.variant_importer import (
 PROJECT_ID = "smoke_qc"
 SHOT_A = "shot_0001"
 SHOT_B = "shot_0002"
+# 刻意與 ShotPlan.prompt 不同，用於驗證血緣取自派工快照而非當前分鏡
+DISPATCHED_PROMPT = "派工當下送出的提示詞"
 
 
 def check(condition: bool, message: str) -> None:
@@ -155,6 +157,16 @@ def seed_job(
                 request_hash=request_hash,
                 requested_duration_ms=requested_duration_ms,
                 requested_aspect_ratio="9:16",
+                # 派工當下的快照。匯入的血緣只會取自這裡，
+                # 提示詞刻意與 ShotPlan 不同以驗證未回推分鏡。
+                request_snapshot={
+                    "visual": {
+                        "prompt": DISPATCHED_PROMPT,
+                        "negative_prompt": "派工當下的負面詞",
+                    }
+                },
+                provider_parameters={"duration": 6, "aspect_ratio": "9:16"},
+                reference_asset_ids=["ref_dispatched"],
             )
         )
         session.commit()
@@ -202,7 +214,17 @@ def verify_import(artifact: ProductionArtifact) -> None:
             variant.requested_duration_ms == 6000,
             f"基準應取自派工記錄而非 ShotPlan，實際 {variant.requested_duration_ms}",
         )
-        check(variant.prompt_snapshot == "雨夜天橋遠景", "未保存提示詞快照")
+        # 血緣必須來自派工快照。ShotPlan 的 prompt 是「雨夜天橋遠景」，
+        # 若出現該值代表回推了當前分鏡。
+        check(
+            variant.prompt_snapshot == DISPATCHED_PROMPT,
+            f"血緣應取自派工快照，實際 {variant.prompt_snapshot!r}",
+        )
+        check(
+            variant.reference_asset_ids == ["ref_dispatched"],
+            f"參考素材應取自派工快照，實際 {variant.reference_asset_ids}",
+        )
+        check(variant.provider_parameters, "應保存派工當下的平台參數")
 
     if ffprobe_available():
         # 實際規格必須以檔案為準，落差則以派工規格為基準
@@ -466,6 +488,184 @@ def verify_strict_hash_matching(artifact: ProductionArtifact) -> None:
         raise AssertionError("外部鏡頭應被拒絕")
 
 
+def verify_lineage_survives_shot_edit(artifact: ProductionArtifact) -> None:
+    """分鏡在派工後被改寫，已匯入候選的血緣不得跟著變。"""
+    variants = list_variants(PROJECT_ID, SHOT_A)
+    before = {item.variant_id: item.prompt_snapshot for item in variants}
+
+    original = artifact.shot_plans
+    artifact.shot_plans = [
+        shot.model_copy(update={"prompt": "事後改寫的提示詞"})
+        if shot.shot_id == SHOT_A
+        else shot
+        for shot in original
+    ]
+
+    after = {item.variant_id: item.prompt_snapshot for item in list_variants(PROJECT_ID, SHOT_A)}
+    check(before == after, "分鏡改寫後，既有候選的血緣不得變動")
+    for prompt in after.values():
+        check(
+            "事後改寫" not in prompt,
+            f"血緣被當前分鏡污染: {prompt!r}",
+        )
+
+    artifact.shot_plans = original
+
+
+def verify_identity_and_attribution(artifact: ProductionArtifact) -> None:
+    """跨專案不得撞主鍵；相同位元組但來源不同須各自保留。"""
+    settings = get_settings()
+    payload = make_video(_TMP_DIR / "shared.mp4", 6.0)
+
+    other = ProductionArtifact(
+        project_id="smoke_qc_other",
+        title="other project",
+        production_profile=load_preset("comic_drama_high"),
+        shot_plans=[
+            ShotPlan(
+                shot_id=SHOT_A, beat_id="b", scene_id="s", order=0,
+                capability=Capability.VIDEO_I2V, camera=CameraSpec(),
+                prompt="另一個專案", target_duration_ms=5000, aspect_ratio="9:16",
+            )
+        ],
+    )
+
+    # 同樣的檔案、同樣的 shot_id、同樣的 provider，但屬於不同專案
+    mine = import_variants(
+        settings=settings, artifact=artifact, shot_id=SHOT_A,
+        provider="seedance", files=[("shared.mp4", payload)],
+    )
+    theirs = import_variants(
+        settings=settings, artifact=other, shot_id=SHOT_A,
+        provider="seedance", files=[("shared.mp4", payload)],
+    )
+    check(mine.new_count == 1 and theirs.new_count == 1, "兩個專案都應成功匯入")
+    check(
+        mine.imported[0].variant_id != theirs.imported[0].variant_id,
+        "不同專案的候選不得共用主鍵",
+    )
+
+    with Session(engine) as session:
+        rows = session.exec(
+            select(AssetVariant).where(
+                AssetVariant.file_hash == mine.imported[0].file_hash
+            )
+        ).all()
+    check(len(rows) >= 2, "相同內容於不同專案應各自留存")
+    check(
+        {row.project_id for row in rows} >= {PROJECT_ID, "smoke_qc_other"},
+        "兩個專案的候選都應存在",
+    )
+
+    # 相同位元組但來自不同平台，是兩次獨立生成，不得被去重吃掉
+    veo_import = import_variants(
+        settings=settings, artifact=artifact, shot_id=SHOT_A,
+        provider="veo", files=[("shared.mp4", payload)],
+    )
+    check(
+        veo_import.new_count == 1,
+        "不同平台的相同輸出不得被視為重複",
+    )
+    check(not veo_import.imported[0].duplicate, "不應標示為重複")
+
+    with Session(engine) as session:
+        same_bytes = session.exec(
+            select(AssetVariant).where(
+                AssetVariant.project_id == PROJECT_ID,
+                AssetVariant.shot_id == SHOT_A,
+                AssetVariant.file_hash == mine.imported[0].file_hash,
+            )
+        ).all()
+    providers = {row.provider for row in same_bytes}
+    check(
+        providers >= {"seedance", "veo"},
+        f"平台歸屬應各自保留: {providers}",
+    )
+
+    # 同專案同平台同檔案才算重複
+    repeat = import_variants(
+        settings=settings, artifact=artifact, shot_id=SHOT_A,
+        provider="veo", files=[("shared.mp4", payload)],
+    )
+    check(repeat.new_count == 0, "同專案同平台的相同檔案應判定為重複")
+
+
+def verify_orphan_protection(artifact: ProductionArtifact) -> None:
+    """分鏡表已移除的鏡頭留下的資料不得回填分母。"""
+    baseline = summarize_project_qc(artifact)
+
+    with Session(engine) as session:
+        session.add(
+            CapabilityJob(
+                job_id="job_orphan",
+                project_id=PROJECT_ID,
+                shot_id="shot_deleted",
+                capability=Capability.VIDEO_I2V.value,
+                provider="kling",
+                status=JobStatus.COMPLETED.value,
+            )
+        )
+        session.add(
+            AssetVariant(
+                variant_id="var_orphan",
+                project_id=PROJECT_ID,
+                shot_id="shot_deleted",
+                provider="kling",
+                prompt_snapshot="屬於已刪除鏡頭",
+            )
+        )
+        session.commit()
+
+    after = summarize_project_qc(artifact)
+    check(
+        after.planned_count == baseline.planned_count,
+        f"分母不得因 orphan 而改變: {after.planned_count} vs {baseline.planned_count}",
+    )
+    check(
+        after.usable_shot_rate_of_planned == baseline.usable_shot_rate_of_planned,
+        "可用率不得被 orphan 稀釋",
+    )
+    check(after.has_orphans, "應偵測到 orphan")
+    check(
+        "shot_deleted" in after.orphan_shot_ids,
+        f"應列出 orphan 鏡頭: {after.orphan_shot_ids}",
+    )
+    check(after.orphan_jobs == 1, f"orphan 工作數錯誤: {after.orphan_jobs}")
+    check(after.orphan_variants == 1, f"orphan 候選數錯誤: {after.orphan_variants}")
+    check(
+        all(item.shot_id != "shot_deleted" for item in after.shots),
+        "orphan 不得出現在統計列中",
+    )
+    check(
+        sum(after.outcome_counts().values()) == after.planned_count,
+        "狀態計數總和仍應等於分鏡數",
+    )
+
+
+def verify_foreign_continuity_rejected(artifact: ProductionArtifact) -> None:
+    """連戲評分不得引用不屬於本專案的鏡頭或場景。"""
+    cases = [
+        ({"shot_id": "shot_foreign", "ref_shot_id": SHOT_A}, "shot_id"),
+        ({"shot_id": SHOT_A, "ref_shot_id": "shot_foreign"}, "ref_shot_id"),
+        (
+            {"shot_id": SHOT_A, "ref_shot_id": SHOT_B, "scene_id": "scene_foreign"},
+            "scene_id",
+        ),
+    ]
+    for kwargs, expected in cases:
+        try:
+            record_continuity_qc(
+                artifact, scores={"cross_shot_identity": 80}, **kwargs
+            )
+        except QCValidationError as error:
+            check(
+                expected in str(error),
+                f"錯誤訊息應指出 {expected}: {error}",
+            )
+        else:
+            raise AssertionError(f"外部 {expected} 應被拒絕")
+
+
 def verify_cross_project_guard(artifact: ProductionArtifact) -> None:
     """帶著別的專案的 variant_id 不得改動資料。"""
     from pipeline.stages.variant_importer import load_owned_variant
@@ -574,11 +774,15 @@ def main() -> int:
     artifact = build_artifact()
 
     verify_import(artifact)
+    verify_lineage_survives_shot_edit(artifact)
     verify_strict_hash_matching(artifact)
+    verify_identity_and_attribution(artifact)
     verify_qc_scoring(artifact)
     verify_continuity_qc(artifact)
+    verify_foreign_continuity_rejected(artifact)
     verify_selection(artifact)
     verify_cross_project_guard(artifact)
+    verify_orphan_protection(artifact)
     verify_summary(artifact)
 
     probe_note = "ffprobe" if ffprobe_available() else "no-ffprobe"

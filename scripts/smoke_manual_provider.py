@@ -159,8 +159,13 @@ def verify_package_structure() -> None:
 
     package_dir = Path(package.package_dir)
     check(package_dir.is_dir(), "job package 目錄未建立")
-    check(package_dir.name == "kling", f"目錄應以平台命名，實際 {package_dir.name}")
-    check(package_dir.parent.name == "shot_0001", "目錄應以 shot_id 分組")
+    # 目錄結構為 <shot_id>/<provider>/<request_hash 前綴>
+    check(
+        package.request_hash.startswith(package_dir.name),
+        f"目錄應以 request_hash 前綴命名，實際 {package_dir.name}",
+    )
+    check(package_dir.parent.name == "kling", "上層目錄應以平台命名")
+    check(package_dir.parent.parent.name == "shot_0001", "最上層應以 shot_id 分組")
 
     for filename in ("job.json", "prompt.txt", "README.md"):
         check((package_dir / filename).exists(), f"缺少 {filename}")
@@ -483,6 +488,115 @@ def verify_shot_plan_dispatch() -> None:
     check(job.requested_aspect_ratio == "9:16", "工作應記錄實際送出的比例")
 
 
+def verify_manifest_not_overwritten() -> None:
+    """同一鏡頭同一平台的第二次派工不得覆寫前一份 manifest。"""
+    spec = get_provider("kling")
+    model = model_registry().get("kling-video")
+
+    first = make_request(shot_id="shot_rev", prompt="第一版提示詞")
+    second = make_request(shot_id="shot_rev", prompt="第二版提示詞")
+    check(
+        first.content_hash() != second.content_hash(),
+        "內容不同時 request_hash 必須不同",
+    )
+
+    package_a = build_job_package(first, spec, model, PACKAGE_ROOT)
+    package_b = build_job_package(second, spec, model, PACKAGE_ROOT)
+
+    check(
+        package_a.package_dir != package_b.package_dir,
+        "不同 request 應落在不同目錄，否則舊 manifest 會被覆寫",
+    )
+    check(Path(package_a.job_path).exists(), "第一份 manifest 應仍存在")
+    check(Path(package_b.job_path).exists(), "第二份 manifest 應存在")
+
+    manifest_a = read_job_manifest(Path(package_a.package_dir))
+    manifest_b = read_job_manifest(Path(package_b.package_dir))
+    check(
+        manifest_a["request"]["visual"]["prompt"] == "第一版提示詞",
+        "第一份 manifest 的內容被覆寫了",
+    )
+    check(
+        manifest_b["request"]["visual"]["prompt"] == "第二版提示詞",
+        "第二份 manifest 內容錯誤",
+    )
+    check(
+        manifest_a["request_hash"] != manifest_b["request_hash"],
+        "兩份 manifest 的 request_hash 應不同",
+    )
+
+    # 相同內容重複產生則應落在同一目錄，維持冪等
+    package_again = build_job_package(first, spec, model, PACKAGE_ROOT)
+    check(
+        package_again.package_dir == package_a.package_dir,
+        "相同內容應維持冪等，落在同一目錄",
+    )
+
+
+def verify_job_snapshot_is_frozen() -> None:
+    """派工後修改 ShotPlan，工作上的快照不得跟著變。"""
+    from pipeline.models.production_artifact import ProductionArtifact
+    from pipeline.models.shot import CameraSpec, CharacterIdentityPack, ShotPlan
+    from pipeline.stages.shot_dispatcher import dispatch_project_shots
+
+    pack = CharacterIdentityPack(
+        character_id="char_lin", canonical_face_ref="ref_face_lin"
+    )
+    original = ShotPlan(
+        shot_id="shot_frozen", beat_id="b", scene_id="s", order=0,
+        capability=Capability.VIDEO_I2V, camera=CameraSpec(),
+        prompt="派工當下的提示詞", negative_prompt="原始負面詞",
+        character_refs=["char_lin"], target_duration_ms=6000,
+        aspect_ratio="9:16",
+    )
+    artifact = ProductionArtifact(
+        project_id="smoke_manual", title="frozen",
+        production_profile=load_preset("comic_drama_high"),
+        character_packs=[pack], shot_plans=[original],
+    )
+
+    report = asyncio.run(dispatch_project_shots(artifact))
+    result = report.results[0]
+    check(result.dispatched, f"應成功派工: {result.message}")
+
+    with Session(engine) as session:
+        job = session.get(CapabilityJob, result.job_id)
+    check(job is not None, "應建立工作記錄")
+    check(job.request_snapshot, "工作應保存請求快照")
+    check(
+        job.request_snapshot["visual"]["prompt"] == "派工當下的提示詞",
+        "快照未保存派工當下的提示詞",
+    )
+    check(
+        job.reference_asset_ids == ["ref_face_lin"],
+        f"快照未保存參考素材: {job.reference_asset_ids}",
+    )
+    check(job.provider_parameters, "快照應保存平台參數")
+    check(job.manifest_path and Path(job.manifest_path).exists(), "應記錄 manifest 路徑")
+
+    # 分鏡在派工後被改寫
+    artifact.shot_plans = [
+        original.model_copy(
+            update={
+                "prompt": "改寫後的提示詞",
+                "negative_prompt": "改寫後的負面詞",
+                "character_refs": [],
+            }
+        )
+    ]
+
+    with Session(engine) as session:
+        job_after = session.get(CapabilityJob, result.job_id)
+    check(
+        job_after.request_snapshot["visual"]["prompt"] == "派工當下的提示詞",
+        "分鏡改寫後，工作快照不得跟著變動",
+    )
+    check(
+        job_after.reference_asset_ids == ["ref_face_lin"],
+        "分鏡改寫後，快照的參考素材不得變動",
+    )
+
+
 def verify_readiness_fail_closed() -> None:
     """完備度不足的鏡頭不得以「已派工」的外觀通過。"""
     from pipeline.models.production_artifact import ProductionArtifact
@@ -589,9 +703,12 @@ def main() -> int:
     verify_routing_selects_manual_provider()
     verify_dispatch_and_job_record()
     verify_shot_plan_dispatch()
+    verify_manifest_not_overwritten()
+    verify_job_snapshot_is_frozen()
     verify_readiness_fail_closed()
 
-    packages = list(PACKAGE_ROOT.glob("*/*/job.json"))
+    # 結構為 <shot_id>/<provider>/<request_hash>/job.json
+    packages = list(PACKAGE_ROOT.glob("*/*/*/job.json"))
     print(
         f"OK manual provider smoke packages={len(packages)} "
         f"adapters={len(registered_adapters())}"

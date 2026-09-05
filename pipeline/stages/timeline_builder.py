@@ -180,14 +180,69 @@ class AssemblyPreflight(BaseModel):
     planned_shots: int = 0
     ready_shots: int = 0
     missing_shots: list[str] = Field(default_factory=list)
+    stale_shots: list[str] = Field(default_factory=list)
     reasons: list[str] = Field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        return not self.missing_shots and not self.reasons
+        return not self.missing_shots and not self.stale_shots and not self.reasons
 
 
-def preflight_assembly(artifact: ProductionArtifact) -> AssemblyPreflight:
+def check_selection_consistency(
+    artifact: ProductionArtifact, timeline: Timeline | None = None
+) -> tuple[list[str], list[str]]:
+    """驗證 ShotPlan → selected variant → EditDecision → TimelineClip 一致。
+
+    改選候選後，既有的剪輯決策仍指向舊候選。若不檢查就直接 render，
+    成片用的會是已經被換掉的素材，而畫面上看不出任何異常。
+    回傳 (stale_shots, reasons)。
+    """
+    chosen = selected_variants(artifact.project_id)
+    decisions = {item.shot_id: item for item in artifact.edit_decisions}
+
+    stale: list[str] = []
+    reasons: list[str] = []
+
+    for shot in sorted(artifact.shot_plans, key=lambda item: item.order):
+        variant = chosen.get(shot.shot_id)
+        if variant is None:
+            continue
+        decision = decisions.get(shot.shot_id)
+        if decision is None:
+            stale.append(shot.shot_id)
+            reasons.append(f"{shot.shot_id}: 已選定候選但尚無剪輯決策")
+        elif decision.variant_id != variant.variant_id:
+            stale.append(shot.shot_id)
+            reasons.append(
+                f"{shot.shot_id}: 剪輯決策指向 {decision.variant_id}，"
+                f"但目前選定的是 {variant.variant_id}"
+            )
+
+    # 剪輯決策若引用了不屬於本專案分鏡的鏡頭，同樣視為過期
+    planned_ids = {shot.shot_id for shot in artifact.shot_plans}
+    for shot_id in decisions:
+        if shot_id not in planned_ids:
+            stale.append(shot_id)
+            reasons.append(f"{shot_id}: 剪輯決策引用了不存在的鏡頭")
+
+    if timeline is not None:
+        expected = build_timeline(artifact.project_id, artifact.edit_decisions)
+        actual_ids = [clip.variant_id for clip in timeline.clips]
+        expected_ids = [clip.variant_id for clip in expected.clips]
+        if actual_ids != expected_ids:
+            reasons.append("傳入的時間線與目前的剪輯決策不符，需重建")
+        elif timeline.total_duration_ms != expected.total_duration_ms:
+            reasons.append(
+                f"傳入的時間線長度 {timeline.total_duration_ms}ms 與目前剪輯決策"
+                f"{expected.total_duration_ms}ms 不符，需重建"
+            )
+
+    return stale, reasons
+
+
+def preflight_assembly(
+    artifact: ProductionArtifact, timeline: Timeline | None = None
+) -> AssemblyPreflight:
     """檢查成片組裝的前置條件。
 
     分鏡表上的每一顆鏡頭都必須有已選定的候選。若缺任何一顆仍照常輸出，
@@ -228,6 +283,10 @@ def preflight_assembly(artifact: ProductionArtifact) -> AssemblyPreflight:
             0, f"以下鏡頭尚未選定候選: {', '.join(without_selection)}"
         )
 
+    stale, stale_reasons = check_selection_consistency(artifact, timeline)
+    report.stale_shots = stale
+    report.reasons.extend(stale_reasons)
+
     return report
 
 
@@ -266,15 +325,18 @@ def render_by_profile(
             return None
         return render_preview(project_dir, artifact.cue_ledger, artifact.title)
 
-    preflight = preflight_assembly(artifact)
-    if not preflight.ok:
-        raise AssemblyBlocked(preflight.missing_shots, preflight.reasons)
-
-    from pipeline.adapters.video.shot_assembler import assemble_timeline
-
     active_timeline = timeline or build_timeline(
         artifact.project_id, artifact.edit_decisions
     )
+
+    preflight = preflight_assembly(artifact, active_timeline)
+    if not preflight.ok:
+        raise AssemblyBlocked(
+            [*preflight.missing_shots, *preflight.stale_shots], preflight.reasons
+        )
+
+    from pipeline.adapters.video.shot_assembler import assemble_timeline
+
     voiceover = None
     if artifact.voiceover_path and Path(artifact.voiceover_path).exists():
         voiceover = Path(artifact.voiceover_path)

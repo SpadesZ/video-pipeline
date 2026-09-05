@@ -126,6 +126,14 @@ class CapabilityJob(SQLModel, table=True):
     requested_duration_ms: int | None = Field(default=None, sa_column=Column(Integer))
     requested_aspect_ratio: str | None = None
 
+    # 派工當下的完整請求快照。匯入候選時的血緣只能取自此處，
+    # 不可回推當前 ShotPlan：分鏡在派工後可能已被修改，
+    # 那樣記錄下來的來源會是從未真正送出去的內容。
+    request_snapshot: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    provider_parameters: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    reference_asset_ids: list = Field(default_factory=list, sa_column=Column(JSON))
+    manifest_path: str | None = None
+
     submitted_at: datetime | None = None
     completed_at: datetime | None = None
     error_code: str | None = None

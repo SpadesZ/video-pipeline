@@ -29,7 +29,8 @@ from pipeline.capability.base import CapabilityRequest
 from pipeline.capability.model_registry import ModelEntry
 from pipeline.capability.provider_spec import ProviderSpec
 
-JOB_SCHEMA_VERSION = "1.0"
+JOB_SCHEMA_VERSION = "1.1"
+HASH_SEGMENT = 12
 JOB_FILENAME = "job.json"
 PROMPT_FILENAME = "prompt.txt"
 README_FILENAME = "README.md"
@@ -227,7 +228,12 @@ def build_job_package(
     """
     resolved_refs = reference_paths or {}
     shot_segment = request.shot_id or request.request_id
-    package_dir = output_root / shot_segment / provider.provider_id
+    request_hash = request.content_hash()
+    # 目錄含 request_hash：同一顆鏡頭在同一平台重新派工時，內容不同的
+    # 請求會落在不同目錄，舊 manifest 不會被覆寫，血緣才追得回去。
+    package_dir = (
+        output_root / shot_segment / provider.provider_id / request_hash[:HASH_SEGMENT]
+    )
     refs_dir = package_dir / REFS_DIRNAME
     package_dir.mkdir(parents=True, exist_ok=True)
     refs_dir.mkdir(parents=True, exist_ok=True)
@@ -258,7 +264,6 @@ def build_job_package(
         warnings.append(f"缺少平台必填欄位: {', '.join(missing_required)}")
 
     parameters = _provider_parameters(request, provider)
-    request_hash = request.content_hash()
 
     manifest = {
         "schema_version": JOB_SCHEMA_VERSION,

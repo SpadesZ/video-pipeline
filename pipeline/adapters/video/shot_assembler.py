@@ -30,6 +30,8 @@ FFMPEG_TIMEOUT_SECONDS = 600
 DEFAULT_FPS = 24
 FADE_IN_SECONDS = 0.5
 FADE_OUT_SECONDS = 1.0
+DURATION_TOLERANCE = 0.05
+MIN_TOLERANCE_MS = 500
 
 # 依畫面比例決定輸出尺寸。來源片段規格不一，統一後才能安全串接。
 RESOLUTION_BY_RATIO = {
@@ -63,6 +65,33 @@ def _run(command: list[str]) -> tuple[bool, str]:
     if completed.returncode != 0:
         return False, completed.stderr.strip()[:300]
     return True, ""
+
+
+def verify_output_duration(
+    output_path: Path, expected_ms: int, tolerance_ratio: float = DURATION_TOLERANCE
+) -> str | None:
+    """比對成片長度與時間線。相符回傳 None，否則回傳說明字串。
+
+    ffprobe 不可用時無法驗證，視為通過並由呼叫端自負；有 ffprobe 時
+    長度不符一律視為失敗，不可讓成片與時間線悄悄分歧。
+    """
+    from pipeline.adapters.video.media_probe import ffprobe_available, probe_media
+
+    if not ffprobe_available():
+        return None
+
+    info = probe_media(output_path)
+    if not info.probed or info.duration_ms is None:
+        return f"cannot verify output duration: {info.error or 'no duration'}"
+
+    tolerance_ms = max(MIN_TOLERANCE_MS, int(expected_ms * tolerance_ratio))
+    delta = info.duration_ms - expected_ms
+    if abs(delta) > tolerance_ms:
+        return (
+            f"output {info.duration_ms}ms deviates from timeline {expected_ms}ms "
+            f"by {delta:+d}ms (tolerance {tolerance_ms}ms)"
+        )
+    return None
 
 
 def _write_manifest(
@@ -198,22 +227,42 @@ def assemble_timeline(
             "format=yuv420p"
         )
 
+        has_audio = bool(audio_path and Path(audio_path).exists())
         command = [
             "ffmpeg", "-y", "-v", "error",
             "-f", "concat", "-safe", "0", "-i", str(concat_file),
         ]
-        if audio_path and Path(audio_path).exists():
+        if has_audio:
             command += ["-i", str(audio_path)]
-        command += ["-vf", video_filter, "-c:v", "libx264", "-preset", "fast", "-crf", "23"]
-        if audio_path and Path(audio_path).exists():
-            command += ["-c:a", "aac", "-b:a", "128k", "-shortest"]
-        command.append(str(output_path))
+        command += [
+            "-vf", video_filter,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        ]
+        if has_audio:
+            # 音訊政策：影片長度一律由時間線決定。
+            # 音訊較短時以 apad 補靜音，較長時由輸出總長截斷。
+            # 刻意不使用 -shortest：那會讓較短的音軌反過來截掉影片，
+            # 導致成片默默少了好幾秒卻毫無徵兆。
+            command += [
+                "-af", "apad",
+                "-c:a", "aac", "-b:a", "128k",
+            ]
+        command += ["-t", f"{total_seconds:.3f}", str(output_path)]
 
         ok, error = _run(command)
         if not ok:
             logger.warning("Concat failed: %s", error)
             return _write_manifest(
                 output_path, timeline, variant_paths, f"concat failed: {error[:80]}"
+            )
+
+        deviation = verify_output_duration(output_path, timeline.total_duration_ms)
+        if deviation is not None:
+            logger.error("Assembly duration mismatch: %s", deviation)
+            # 不留下長度錯誤的成片，避免被誤當作正確輸出使用
+            output_path.unlink(missing_ok=True)
+            return _write_manifest(
+                output_path, timeline, variant_paths, deviation
             )
         return output_path
     finally:

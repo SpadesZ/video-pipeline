@@ -143,6 +143,25 @@ def record_continuity_qc(
     if scope == ContinuityScope.PAIR.value and not ref_shot_id:
         raise QCValidationError("scope=pair 必須指定 ref_shot_id")
 
+    # 鏡頭與場景必須屬於本專案。連戲評分是跨鏡頭的關係資料，
+    # 若允許引用外部識別碼，統計時會出現無法追溯的記錄。
+    planned_ids = {shot.shot_id for shot in artifact.shot_plans}
+    for label, value in (("shot_id", shot_id), ("ref_shot_id", ref_shot_id)):
+        if value and value not in planned_ids:
+            raise QCValidationError(
+                f"{label} {value} 不屬於專案 {artifact.project_id} 的分鏡表"
+            )
+
+    if scene_id:
+        scene_ids = {
+            scene.scene_id
+            for scene in (artifact.narrative_ir.scenes if artifact.narrative_ir else [])
+        }
+        if scene_id not in scene_ids:
+            raise QCValidationError(
+                f"scene_id {scene_id} 不屬於專案 {artifact.project_id}"
+            )
+
     cleaned = validate_scores(scores, CONTINUITY_SCORE_FIELDS)
 
     # 引用的候選必須屬於本專案，否則會把別的專案的素材寫進連戲紀錄
@@ -238,6 +257,16 @@ class ProjectQCSummary(BaseModel):
     project_id: str
     shots: list[ShotQCSummary] = Field(default_factory=list)
     continuity_count: int = 0
+
+    # 分鏡表上已不存在的鏡頭所留下的工作與候選。分鏡被刪除或改名後
+    # 這些資料仍在資料庫中，但不得回填分母，否則可用率會被稀釋。
+    orphan_shot_ids: list[str] = Field(default_factory=list)
+    orphan_jobs: int = 0
+    orphan_variants: int = 0
+
+    @property
+    def has_orphans(self) -> bool:
+        return bool(self.orphan_shot_ids)
 
     @property
     def planned_count(self) -> int:
@@ -349,24 +378,31 @@ def summarize_project_qc(
 
     qc_by_variant = {row.variant_id: row for row in qc_rows}
 
-    # 分母來自分鏡表，而非只有已產生候選的鏡頭
+    # 分母只來自目前的分鏡表。資料庫中屬於已移除鏡頭的工作與候選
+    # 一律歸為 orphan，不建立新的統計列，也不影響任何比率。
+    planned_ids = {shot.shot_id for shot in artifact.shot_plans}
     by_shot: dict[str, ShotQCSummary] = {
-        shot.shot_id: ShotQCSummary(shot_id=shot.shot_id)
-        for shot in artifact.shot_plans
+        shot_id: ShotQCSummary(shot_id=shot_id) for shot_id in planned_ids
     }
     jobs_by_shot: dict[str, list[CapabilityJob]] = {}
+    orphans: set[str] = set()
 
     for job in jobs:
         if not job.shot_id:
             continue
+        if job.shot_id not in planned_ids:
+            orphans.add(job.shot_id)
+            summary.orphan_jobs += 1
+            continue
         jobs_by_shot.setdefault(job.shot_id, []).append(job)
-        entry = by_shot.setdefault(job.shot_id, ShotQCSummary(shot_id=job.shot_id))
-        entry.job_count += 1
+        by_shot[job.shot_id].job_count += 1
 
     for variant in variants:
-        entry = by_shot.setdefault(
-            variant.shot_id, ShotQCSummary(shot_id=variant.shot_id)
-        )
+        if variant.shot_id not in planned_ids:
+            orphans.add(variant.shot_id)
+            summary.orphan_variants += 1
+            continue
+        entry = by_shot[variant.shot_id]
         entry.variant_count += 1
 
         qc = qc_by_variant.get(variant.variant_id)
@@ -393,4 +429,5 @@ def summarize_project_qc(
         entry.outcome = _classify(entry, all_failed)
 
     summary.shots = [by_shot[key] for key in sorted(by_shot)]
+    summary.orphan_shot_ids = sorted(orphans)
     return summary
