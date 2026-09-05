@@ -79,6 +79,9 @@ class ProviderSpec(BaseModel):
 
     api_key_env: str | None = None
     base_url: str | None = None
+    # 人工操作時要開的平台網址。manual transport 的流程靠真人在這裡生成，
+    # 讓他自己去記或搜尋網址是沒必要的摩擦。這是給人點的連結，不是 API endpoint。
+    console_url: str | None = None
     notes: str | None = None
 
     def supports(self, capability: Capability) -> bool:

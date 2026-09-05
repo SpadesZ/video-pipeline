@@ -149,6 +149,99 @@ def validate_target(target: BenchmarkTarget, capability) -> None:
         )
 
 
+def models_for_provider(provider: str) -> list[str]:
+    """該平台在 catalog 中託管、且支援影片生成的模型。
+
+    確認頁只讓使用者從這裡挑，不開放自由輸入：打錯一個字元的 model_id
+    會通過表單卻在派工時才失敗，而那時他已經以為自己確認完了。
+    """
+    from pipeline.capability.model_registry import model_registry
+    from pipeline.models.capability import Capability
+
+    found: list[str] = []
+    for entry in model_registry().models_on(provider):
+        if not any(
+            entry.supports(capability)
+            for capability in (Capability.VIDEO_I2V, Capability.VIDEO_T2V)
+        ):
+            continue
+        if entry.model_id not in found:
+            found.append(entry.model_id)
+    return sorted(found)
+
+
+def save_target(
+    target_id: str,
+    model_id: str,
+    model_version: str,
+    ui_label: str,
+    notes: str | None = None,
+    confirmed: bool = False,
+    catalog_path: Path | None = None,
+) -> BenchmarkTarget:
+    """更新比較對象並寫回 catalog。
+
+    provisional 只有在使用者明確勾選「我已在平台確認」時才會變成 false，
+    而且必須同時填入版本字串：沒有版本的「已確認」沒有意義，
+    跨輪次比較時仍然無法得知當時用的是哪一版。
+
+    寫入前先跑一次 validate_target。若寫進去才發現模型不存在，
+    使用者會以為自己已經確認完成，直到 Build 失敗才知道。
+    """
+    from pipeline.models.capability import Capability
+
+    path = catalog_path or CATALOG_PATH
+    registry = load_targets(path)
+    existing = registry.by_id(target_id)
+    if existing is None:
+        raise ValueError(f"未登錄的比較對象: {target_id}")
+
+    model_id = (model_id or "").strip() or existing.model_id
+    model_version = (model_version or "").strip()
+    ui_label = (ui_label or "").strip()
+
+    if confirmed and not model_version:
+        raise ValueError(
+            "確認平台版本時必須填入版本字串，否則日後無法得知當時用的是哪一版"
+        )
+    if confirmed and not ui_label:
+        raise ValueError("確認平台版本時必須填入平台上顯示的選項名稱")
+
+    updated = existing.model_copy(
+        update={
+            "model_id": model_id,
+            "model_version": model_version or None,
+            "ui_label": ui_label,
+            "notes": (notes or "").strip() or existing.notes,
+            "provisional": not confirmed,
+        }
+    )
+
+    for capability in (Capability.VIDEO_I2V, Capability.VIDEO_T2V):
+        validate_target(updated, capability)
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    rows = data.get("targets") or []
+    for row in rows:
+        if row.get("target_id") == target_id:
+            row["model_id"] = updated.model_id
+            row["model_version"] = updated.model_version
+            row["ui_label"] = updated.ui_label
+            row["provisional"] = updated.provisional
+            if updated.notes:
+                row["notes"] = updated.notes
+            break
+    else:  # pragma: no cover - by_id 已確認存在
+        raise ValueError(f"catalog 中找不到 {target_id}")
+
+    path.write_text(
+        yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    targets.cache_clear()
+    return updated
+
+
 def resolve(target_id: str) -> BenchmarkTarget:
     target = targets().by_id(target_id)
     if target is None:

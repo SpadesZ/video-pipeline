@@ -63,6 +63,10 @@ class AttributedVariant(BaseModel):
     # 匯入後改名的 var_<uuid> 檔名，僅供除錯顯示，不參與對應。
     stored_filename: str | None = None
     benchmark_selected: bool = False
+    # 派工時的版本與 catalog 目前的版本不同。代表這支影片是舊版產物，
+    # 不可與新版的結果放在一起比較。
+    version_drift: bool = False
+    current_model_version: str | None = None
 
     model_config = {"protected_namespaces": ()}
 
@@ -151,14 +155,25 @@ def build_index(project_id: str) -> AttributionIndex:
             index.unattributed.append(variant.variant_id)
             continue
 
+        # 身份取自派工當下的快照，不取 catalog 現值。使用者之後在
+        # /benchmark/targets 修正版本字串時，舊影片必須仍顯示它實際
+        # 生成時的版本，否則舊資料會被冒充成新版本的成績。
+        snapshot_version = parameters.get("_bm_model_version") or None
+        dispatched_version = job.model_version or snapshot_version
+        current_version = target.model_version
+
         index.items.append(
             AttributedVariant(
                 variant_id=variant.variant_id,
                 shot_id=variant.shot_id,
                 target_id=target.target_id,
-                provider=target.provider,
-                model_id=target.model_id,
-                model_version=target.model_version,
+                provider=job.provider or target.provider,
+                model_id=job.model_id or target.model_id,
+                model_version=dispatched_version,
+                current_model_version=current_version,
+                version_drift=bool(
+                    (dispatched_version or "") != (current_version or "")
+                ),
                 local_path=variant.local_path,
                 # 匯入時檔案會被改名為 var_<uuid>，但人工在 ledger 記的是
                 # 平台下載的原始檔名。拿內部檔名去對，永遠對不上。

@@ -25,6 +25,25 @@ RATIO_TOLERANCE = 0.05
 MIN_SHORT_EDGE = 512
 
 
+def ratio_label(width: int, height: int) -> str:
+    """把尺寸換算成 16:9 這類看得懂的比例。
+
+    使用者看到的是平台上的「16:9」「9:16」，不是 1.778。
+    錯誤訊息若只給小數，他得自己換算才知道要改什麼。
+    """
+    from math import gcd
+
+    divisor = gcd(width, height) or 1
+    short, long = sorted((width // divisor, height // divisor))
+    # 約分後仍過大時退回近似的常見比例，避免出現 683:1214 這種無意義字串
+    if long > 32:
+        candidates = ((9, 16), (3, 4), (1, 1), (4, 3), (16, 9), (21, 9))
+        actual = width / height
+        best = min(candidates, key=lambda item: abs(item[0] / item[1] - actual))
+        return f"約 {best[0]}:{best[1]}"
+    return f"{width // divisor}:{height // divisor}"
+
+
 class ImageCheck(BaseModel):
     path: str
     ok: bool = False
@@ -38,6 +57,18 @@ class ImageCheck(BaseModel):
         if not self.width or not self.height:
             return None
         return self.width / self.height
+
+    @property
+    def ratio_text(self) -> str | None:
+        if not self.width or not self.height:
+            return None
+        return ratio_label(self.width, self.height)
+
+    @property
+    def dimensions(self) -> str | None:
+        if not self.width or not self.height:
+            return None
+        return f"{self.width}x{self.height}"
 
 
 def validate_image(
@@ -90,8 +121,8 @@ def validate_image(
         ratio = result.width / result.height
         if abs(ratio - VERTICAL_RATIO) > RATIO_TOLERANCE:
             result.problems.append(
-                f"比例 {result.width}:{result.height} "
-                f"({ratio:.3f}) 不符 9:16 ({VERTICAL_RATIO:.3f})"
+                f"比例為 {ratio_label(result.width, result.height)}"
+                f"（{result.width}x{result.height}），正式測試要求 9:16 直式"
             )
 
     result.ok = not result.problems

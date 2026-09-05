@@ -5,6 +5,8 @@
 # 必須於 V1 真實測試時校正，校正前不得視為事實。
 provider_id: runway
 label: Runway
+# 人工生成時要開的頁面。僅供真人點擊，不呼叫任何 API。
+console_url: https://app.runwayml.com/
 transport: manual
 
 supported_capabilities:

@@ -45,6 +45,8 @@ class AssetStatus(BaseModel):
     problems: list[str] = Field(default_factory=list)
     file_hash: str | None = None
     dimensions: str | None = None
+    ratio: str | None = None
+    require_vertical: bool = True
 
 
 class AssetReport(BaseModel):
@@ -96,18 +98,177 @@ def check_assets(settings: Settings) -> AssetReport:
             filename=required.filename,
             description=required.description,
             present=present,
+            require_vertical=required.require_vertical,
         )
         if present:
             check = validate_image(path, require_vertical=required.require_vertical)
             status.valid = check.ok
             status.problems = list(check.problems)
-            if check.width and check.height:
-                status.dimensions = f"{check.width}x{check.height}"
+            status.dimensions = check.dimensions
+            status.ratio = check.ratio_text
             if check.ok:
                 status.file_hash = file_sha256(path)
         report.statuses.append(status)
 
     return report
+
+
+def required_asset(asset_id: str):
+    """依 asset_id 取得素材規格。未登錄的 id 一律拒絕。"""
+    found = next(
+        (item for item in v1_pack.REQUIRED_ASSETS if item.asset_id == asset_id), None
+    )
+    if found is None:
+        raise ValueError(f"未登錄的素材欄位: {asset_id}")
+    return found
+
+
+class AssetUploadResult(BaseModel):
+    ok: bool = False
+    asset_id: str
+    filename: str = ""
+    problems: list[str] = Field(default_factory=list)
+    file_hash: str | None = None
+    dimensions: str | None = None
+    ratio: str | None = None
+
+
+def save_asset_upload(
+    settings: Settings, asset_id: str, upload_name: str, payload: bytes
+) -> AssetUploadResult:
+    """驗證通過才寫入素材目錄。
+
+    先落到暫存檔驗證再搬移，不直接覆寫目標路徑：若使用者不小心傳了
+    橫式圖或壞檔，原本已經通過驗證的那張不該因此消失。上傳失敗後
+    畫面仍應顯示舊圖，而不是變成空欄位。
+    """
+    from pipeline.capability.job_package import file_sha256
+
+    required = required_asset(asset_id)
+    result = AssetUploadResult(asset_id=asset_id, filename=required.filename)
+
+    if not payload:
+        result.problems.append("檔案為空")
+        return result
+
+    directory = assets_dir(settings)
+    directory.mkdir(parents=True, exist_ok=True)
+    staging = directory / f".staging_{asset_id}{Path(upload_name).suffix.lower()}"
+    try:
+        staging.write_bytes(payload)
+        check = validate_image(staging, require_vertical=required.require_vertical)
+        result.dimensions = check.dimensions
+        result.ratio = check.ratio_text
+        if not check.ok:
+            result.problems = list(check.problems)
+            return result
+
+        destination = directory / required.filename
+        staging.replace(destination)
+        result.ok = True
+        result.file_hash = file_sha256(destination)
+    finally:
+        if staging.exists():
+            staging.unlink()
+    return result
+
+
+def asset_path(settings: Settings, asset_id: str) -> Path:
+    """素材的實際位置。僅供後端讀取，不對使用者顯示。"""
+    return assets_dir(settings) / required_asset(asset_id).filename
+
+
+class BuildBlocker(BaseModel):
+    """一個阻擋正式派工的原因。code 供 UI 與 AI 助手辨識，不做字串比對。"""
+
+    code: str
+    message: str
+    target_id: str | None = None
+    fix_link: str | None = None
+
+
+class BuildGate(BaseModel):
+    """正式 Build 的前置條件。任一項不成立即不得產生 job packages。"""
+
+    blockers: list[BuildBlocker] = Field(default_factory=list)
+    assets_ready: bool = False
+    confirmed_target_ids: list[str] = Field(default_factory=list)
+    provisional_target_ids: list[str] = Field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.blockers
+
+    def codes(self) -> list[str]:
+        seen: list[str] = []
+        for item in self.blockers:
+            if item.code not in seen:
+                seen.append(item.code)
+        return seen
+
+    def summary(self) -> str:
+        return "; ".join(item.message for item in self.blockers[:5])
+
+
+def evaluate_build_gate(
+    settings: Settings, report: AssetReport | None = None
+) -> BuildGate:
+    """判斷是否可以建立正式 job packages。
+
+    三個條件必須同時成立：素材就緒、所有比較對象都已由真人確認版本、
+    且每個對象都通過 catalog 驗證。缺任何一項就產生派工，等於用不確定的
+    模型身份跑完整輪比較——事後無從得知當時實際用的是哪一版，
+    整輪資料只能作廢重跑。因此這裡 fail closed，只警告是不夠的。
+    """
+    gate = BuildGate()
+    report = report if report is not None else check_assets(settings)
+    gate.assets_ready = report.ready
+
+    if not report.ready:
+        for item in [*report.missing, *report.invalid]:
+            gate.blockers.append(
+                BuildBlocker(
+                    code="asset_not_ready",
+                    message=(
+                        f"{item.description[:24]}：{'; '.join(item.problems)}"
+                        if item.problems
+                        else f"{item.description[:24]}：尚未上傳"
+                    ),
+                    fix_link="/benchmark/assets",
+                )
+            )
+
+    registry = targets()
+    capabilities = {shot.capability for shot in v1_pack.shots()}
+    for item in registry.targets:
+        if item.provisional:
+            gate.provisional_target_ids.append(item.target_id)
+            gate.blockers.append(
+                BuildBlocker(
+                    code="target_provisional",
+                    target_id=item.target_id,
+                    message=f"{item.target_id} 的平台實際版本尚未確認",
+                    fix_link=f"/benchmark/targets#{item.target_id}",
+                )
+            )
+        else:
+            gate.confirmed_target_ids.append(item.target_id)
+
+        for capability in sorted(capabilities, key=lambda value: value.value):
+            try:
+                validate_target(item, capability)
+            except Exception as error:  # noqa: BLE001 - 驗證失敗種類不一
+                gate.blockers.append(
+                    BuildBlocker(
+                        code="target_invalid",
+                        target_id=item.target_id,
+                        message=str(error)[:200],
+                        fix_link=f"/benchmark/targets#{item.target_id}",
+                    )
+                )
+                break
+
+    return gate
 
 
 def register_assets(settings: Settings) -> int:
