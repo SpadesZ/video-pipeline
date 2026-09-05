@@ -81,6 +81,9 @@ class AttributionIndex(BaseModel):
             if item.target_id == target_id and item.shot_id == shot_id
         ]
 
+    # 舊名保留，避免既有呼叫端失效
+    for_target_shot = for_shot
+
     def by_variant_id(self, variant_id: str) -> AttributedVariant | None:
         return next(
             (item for item in self.items if item.variant_id == variant_id), None
