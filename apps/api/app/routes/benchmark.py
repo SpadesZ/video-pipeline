@@ -39,7 +39,6 @@ from pipeline.models.qc import ContinuityQC, VariantQC
 from pipeline.models.variant import AssetVariant, CapabilityJob
 from pipeline.project_store import load_project
 from pipeline.settings import Settings
-from pipeline.stages.shot_dispatcher import ShotReadinessState, assess_project_readiness
 
 logger = logging.getLogger(__name__)
 
@@ -52,290 +51,136 @@ def sheets_dir(settings: Settings) -> Path:
     return Path(settings.data_dir) / "benchmark" / "v1" / "sheets"
 
 
-def _step(number: int, title: str, state: str, detail: str, cta: str = "") -> str:
-    """一個流程步驟。state 決定顏色與圖示。"""
+def _control_button(
+    control: workflow.ControlState, form_action: str = "", primary: bool = False
+) -> str:
+    """把 ControlState 畫成按鈕。停用原因直接顯示，不讓使用者自己猜。
+
+    label 與 disabled_reason 來自 workflow，AI 助手讀的是同一份資料，
+    因此助手說的話不會和畫面上的狀態互相矛盾。
+    """
+    cls = "primary" if primary else "ghost-button"
+    attrs = (
+        f'data-control-id="{escape(control.control_id)}" '
+        f'data-danger="{escape(control.danger_level)}"'
+    )
+    if control.enabled and control.href:
+        body = (
+            f'<a class="{cls}" href="{escape(control.href)}" {attrs}>'
+            f"{escape(control.label)}</a>"
+        )
+    elif control.enabled and form_action:
+        body = (
+            f'<form method="post" action="{escape(form_action)}" class="inline-form">'
+            f'<button class="{cls}" type="submit" {attrs}>'
+            f"{escape(control.label)}</button></form>"
+        )
+    elif control.enabled:
+        body = f'<span class="{cls}" {attrs}>{escape(control.label)}</span>'
+    else:
+        reason = control.disabled_reason or "目前無法執行"
+        body = (
+            f'<button class="{cls}" type="button" disabled {attrs} '
+            f'title="{escape(reason)}">{escape(control.label)}</button>'
+            f'<span class="disabled-why">{escape(reason)}</span>'
+        )
+    return body
+
+
+# control_id 對應的 POST 端點。只有需要送出表單的控制項才列在這裡。
+CONTROL_ACTIONS = {
+    "benchmark.build": "/benchmark/build",
+    "benchmark.sync": "/benchmark/sync",
+}
+
+
+def _step_block(step: workflow.StepState) -> str:
     icons = {"done": "✓", "active": "→", "todo": "○", "blocked": "!"}
-    icon = icons.get(state, "○")
+    blockers = ""
+    if step.blockers:
+        items = "".join(f"<li>{escape(item)}</li>" for item in step.blockers)
+        blockers = f"<ul class='bm-list'>{items}</ul>"
+
+    buttons = "".join(
+        _control_button(
+            control,
+            CONTROL_ACTIONS.get(control.control_id, ""),
+            primary=control.control_id == "benchmark.build",
+        )
+        for control in step.controls
+    )
+
     return f"""
-    <div class="bm-step bm-{escape(state)}">
+    <div class="bm-step bm-{escape(step.state)}" data-step="{step.number}"
+         data-step-key="{escape(step.key)}">
       <div class="bm-step-head">
-        <span class="bm-icon">{icon}</span>
-        <strong>{number}. {escape(title)}</strong>
+        <span class="bm-icon">{icons.get(step.state, '○')}</span>
+        <strong>{step.number}. {escape(step.title)}</strong>
       </div>
-      <div class="bm-detail">{detail}</div>
-      <div class="bm-cta">{cta}</div>
+      <div class="bm-detail">{escape(step.summary)}{blockers}</div>
+      <div class="bm-cta">{buttons}</div>
     </div>
     """
 
 
-def _collect_state(settings: Settings) -> dict:
-    """收集頁面所需的全部狀態。任何一段失敗都不應讓整頁無法開啟。"""
-    state: dict = {
-        "assets": None,
-        "targets": target.targets(),
-        "artifact": None,
-        "readiness": {},
-        "jobs": {},
-        "index": None,
-        "qc_count": 0,
-        "continuity_count": 0,
-        "ledger": None,
-        "error": None,
-    }
-    try:
-        state["assets"] = builder.check_assets(settings)
-        state["artifact"] = load_project(settings, PROJECT_ID)
-        if state["artifact"] is not None:
-            state["readiness"] = assess_project_readiness(state["artifact"])
-            state["index"] = attribution.build_index(PROJECT_ID)
-            with Session(engine) as session:
-                jobs = session.exec(
-                    select(CapabilityJob).where(
-                        CapabilityJob.project_id == PROJECT_ID
-                    )
-                ).all()
-                for job in jobs:
-                    snapshot = (job.request_snapshot or {}).get("parameters") or {}
-                    key = snapshot.get("_bm_target_id") or job.provider
-                    state["jobs"][key] = state["jobs"].get(key, 0) + 1
-                state["qc_count"] = len(
-                    session.exec(
-                        select(VariantQC).where(VariantQC.project_id == PROJECT_ID)
-                    ).all()
-                )
-                state["continuity_count"] = len(
-                    session.exec(
-                        select(ContinuityQC).where(
-                            ContinuityQC.project_id == PROJECT_ID
-                        )
-                    ).all()
-                )
-        state["ledger"] = attempts.read_ledger(
-            sheets_dir(settings) / attempts.ATTEMPTS_SHEET
-        )
-    except Exception as error:  # noqa: BLE001 - 控制台不應因單一區塊失敗而全毀
-        logger.warning("Benchmark state collection failed: %s", error)
-        state["error"] = str(error)[:300]
-    return state
-
-
-def _asset_step(state: dict) -> str:
-    report = state["assets"]
-    if report is None:
-        return _step(1, "準備參考素材", "blocked", "無法讀取素材目錄")
-
-    total = len(report.statuses)
-    ready = total - len(report.missing) - len(report.invalid)
-    if report.ready:
-        detail = f"{ready}/{total} 已就緒並通過驗證"
-        return _step(1, "準備參考素材", "done", detail)
-
-    rows = "".join(
-        f"<li><code>{escape(item.filename)}</code> — "
-        f"{escape('; '.join(item.problems) if item.problems else '尚未放入')}</li>"
-        for item in [*report.missing, *report.invalid][:10]
-    )
-    detail = (
-        f"{ready}/{total} 就緒。放入 <code>{escape(report.assets_dir)}</code>："
-        f"<ul class='bm-list'>{rows}</ul>"
-        "<p class='muted'>首幀需 9:16、短邊至少 512px，必須是可開啟的圖片。</p>"
-    )
-    return _step(1, "準備參考素材", "blocked", detail)
-
-
-def _target_step(state: dict) -> str:
-    registry = state["targets"]
-    provisional = registry.provisional_targets
+def _target_table(state: workflow.WorkflowState) -> str:
     rows = "".join(
         f"<tr><td class='mono'>{escape(item.target_id)}</td>"
         f"<td>{escape(item.provider)}</td>"
         f"<td class='mono'>{escape(item.model_id)}</td>"
         f"<td class='mono'>{escape(item.model_version or '—')}</td>"
         f"<td>{escape(item.ui_label or '—')}</td>"
-        f"<td>{'待確認' if item.provisional else '已確認'}</td></tr>"
-        for item in registry.targets
+        f"<td>{'待確認' if item.provisional else '已確認'}</td>"
+        f"<td>{item.job_count}</td><td>{item.variant_count}</td></tr>"
+        for item in state.targets
     )
-    table = (
+    return (
         "<table class='data-table'><thead><tr>"
         "<th>Target</th><th>Provider</th><th>Model</th><th>Version</th>"
-        "<th>UI Label</th><th>狀態</th></tr></thead>"
+        "<th>平台選項名稱</th><th>狀態</th><th>派工</th><th>候選</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
     )
-    if provisional:
-        detail = (
-            f"{len(provisional)}/{len(registry.targets)} 個比較對象的實際版本尚未確認。"
-            "<p class='muted'>登入各平台確認版本與選項名稱後，更新 "
-            "<code>pipeline/benchmark/catalog/v1_targets.yaml</code> 並將 "
-            "<code>provisional</code> 改為 false，再重新建立派工。</p>"
-            + table
-        )
-        return _step(2, "確認平台版本", "active", detail)
-    return _step(2, "確認平台版本", "done", "全部已確認" + table)
-
-
-def _dispatch_step(state: dict) -> str:
-    artifact = state["artifact"]
-    registry = state["targets"]
-    if artifact is None:
-        return _step(
-            3, "建立派工", "todo",
-            "尚未建立 benchmark 專案。",
-            '<form method="post" action="/benchmark/build">'
-            '<button class="primary" type="submit">建立專案並產生 Job Packages</button>'
-            "</form>",
-        )
-
-    not_ready = [
-        shot_id
-        for shot_id, item in state["readiness"].items()
-        if item.state is not ShotReadinessState.READY
-    ]
-    jobs = state["jobs"]
-    expected = len(artifact.shot_plans)
-    rows = "".join(
-        f"<tr><td class='mono'>{escape(item.target_id)}</td>"
-        f"<td>{jobs.get(item.target_id, 0)}/{expected}</td></tr>"
-        for item in registry.targets
-    )
-    table = (
-        "<table class='data-table'><thead><tr><th>Target</th>"
-        "<th>Job Packages</th></tr></thead>"
-        f"<tbody>{rows}</tbody></table>"
-    )
-
-    cta = (
-        '<form method="post" action="/benchmark/build" class="inline-form">'
-        '<button class="ghost-button" type="submit">重新產生</button></form>'
-        f'<a class="ghost-button" href="/projects/{PROJECT_ID}/job-packages.zip">'
-        "下載 Job Packages</a>"
-    )
-    if not_ready:
-        detail = (
-            f"{len(not_ready)} 顆鏡頭未就緒：{escape(', '.join(not_ready))}"
-            + table
-        )
-        return _step(3, "建立派工", "blocked", detail, cta)
-
-    total_jobs = sum(jobs.get(item.target_id, 0) for item in registry.targets)
-    if total_jobs == 0:
-        return _step(3, "建立派工", "active", "尚未產生 job packages" + table, cta)
-    detail = f"{total_jobs} 份 job package 已產生" + table
-    return _step(3, "建立派工", "done", detail, cta)
-
-
-def _generation_step(state: dict) -> str:
-    ledger = state["ledger"]
-    index = state["index"]
-    recorded = len(ledger.attempts) if ledger else 0
-    failed = (
-        sum(1 for item in ledger.attempts if not item.succeeded) if ledger else 0
-    )
-    imported = len(index.items) if index else 0
-    unattributed = len(index.unattributed) if index else 0
-
-    detail = (
-        f"已記錄 {recorded} 次嘗試（其中未成功 {failed} 次）、"
-        f"已匯入 {imported} 支候選"
-    )
-    if unattributed:
-        detail += (
-            f"<p class='bm-warn'>{unattributed} 支候選沒有派工來源，"
-            "不會計入 benchmark。匯入時請選擇對應的 Job。</p>"
-        )
-    detail += (
-        "<p class='muted'>每按一次平台的 Generate 就記一列，"
-        "失敗與取消也要記，重試次數本身就是評估指標。</p>"
-    )
-
-    cta = (
-        f'<a class="ghost-button" href="/projects/{PROJECT_ID}/view#variants">'
-        "匯入候選影片</a>"
-        '<a class="ghost-button" href="/benchmark/attempts">記錄生成嘗試</a>'
-    )
-    state_name = "done" if imported else ("active" if recorded else "todo")
-    return _step(4, "生成與匯入", state_name, detail, cta)
-
-
-def _scoring_step(state: dict) -> str:
-    index = state["index"]
-    imported = len(index.items) if index else 0
-    scored = state["qc_count"]
-    selected = (
-        sum(1 for item in index.items if item.benchmark_selected) if index else 0
-    )
-    continuity = state["continuity_count"]
-
-    detail = (
-        f"已評分 {scored}/{imported} 支候選、"
-        f"已選定 {selected} 組代表作、"
-        f"已完成 {continuity} 組連戲評分"
-    )
-    cta = (
-        f'<a class="ghost-button" href="/projects/{PROJECT_ID}/view#variants">'
-        "評分與選片</a>"
-        '<form method="post" action="/benchmark/sync" class="inline-form">'
-        '<button class="ghost-button" type="submit">同步評分表</button></form>'
-    )
-    if not imported:
-        return _step(5, "評分與選定代表作", "todo", "尚無候選可評分")
-    state_name = "done" if scored >= imported and selected else "active"
-    return _step(5, "評分與選定代表作", state_name, detail, cta)
-
-
-def _result_step(state: dict) -> str:
-    scored = state["qc_count"]
-    if not scored:
-        return _step(6, "查看情境結果", "todo", "尚無評分資料")
-    detail = (
-        "依情境分別評選，不產生跨情境總冠軍。"
-        "<p class='muted'>低重試獎為明確的跨情境指標，其餘只讀該情境資料。</p>"
-    )
-    cta = '<a class="ghost-button" href="/benchmark/results">查看結果</a>'
-    return _step(6, "查看情境結果", "active", detail, cta)
 
 
 @router.get("/benchmark", response_class=HTMLResponse)
 def benchmark_console(settings: Settings = Depends(settings_dep)) -> str:
+    """V1 Benchmark 控制台。狀態全部由 workflow.collect 推導。"""
     from app.routes.web import page
 
-    state = _collect_state(settings)
-    error_banner = (
-        f'<div class="bm-warn">載入部分資料時發生問題：{escape(state["error"])}</div>'
-        if state["error"]
-        else ""
-    )
+    state = workflow.collect(settings)
 
-    steps = "".join(
-        [
-            _asset_step(state),
-            _target_step(state),
-            _dispatch_step(state),
-            _generation_step(state),
-            _scoring_step(state),
-            _result_step(state),
-        ]
+    degraded = "".join(
+        f'<div class="bm-warn">載入部分資料時發生問題：{escape(item)}</div>'
+        for item in state.degraded
     )
+    steps = "".join(_step_block(step) for step in state.steps)
 
     return page(
         title="V1 Benchmark",
         active_nav="benchmark",
         body=f"""
-        <section class="app-shell">
+        <section class="app-shell" data-route="/benchmark"
+                 data-step="{state.current_step}"
+                 data-entity-type="benchmark_console">
           <header class="project-hero">
             <div>
               <h1>V1 Benchmark</h1>
               <p class="muted">
-                比較 {len(state["targets"].targets)} 個對象在
-                {len(v1_pack.shots())} 顆固定鏡頭上的表現。
-                真實生成需在各平台手動完成。
+                比較 {len(state.targets)} 個對象在 {state.shots_total} 顆固定鏡頭上的表現。
+                真實生成需在各平台手動完成，本系統不呼叫任何影片 API。
               </p>
+              <p class="next-action">下一步：{escape(state.next_action())}</p>
             </div>
             <div class="actions">
               <a class="ghost-button" href="/projects/{PROJECT_ID}/view">專案詳情</a>
             </div>
           </header>
-          {error_banner}
+          {degraded}
           <div class="bm-steps">{steps}</div>
+          <section class="panel">
+            <div class="section-head"><h2>比較對象</h2></div>
+            {_target_table(state)}
+          </section>
         </section>
         <style>
           .bm-steps {{ display: grid; gap: 12px; margin-top: 16px; }}
@@ -354,8 +199,11 @@ def benchmark_console(settings: Settings = Depends(settings_dep)) -> str:
           .bm-cta {{ margin-top: 10px; display: flex; gap: 8px;
                      flex-wrap: wrap; align-items: center; }}
           .bm-cta form {{ display: inline; }}
-          .bm-list {{ margin: 8px 0; padding-left: 18px; }}
+          .bm-list {{ margin: 8px 0; padding-left: 18px; color: #e8b; }}
           .bm-warn {{ color: #e8b; margin: 8px 0; }}
+          .next-action {{ color: #7ec8e2; font-size: 14px; margin-top: 6px; }}
+          .disabled-why {{ color: #8a94a6; font-size: 12px; }}
+          button[disabled] {{ opacity: 0.5; cursor: not-allowed; }}
           .bm-steps table {{ margin-top: 10px; }}
           @media (max-width: 720px) {{
             .bm-cta {{ flex-direction: column; align-items: stretch; }}
@@ -1481,6 +1329,339 @@ async def record_attempt(
             detail=str(error), back_link="/benchmark/attempts"
         ) from error
     return RedirectResponse(url="/benchmark/attempts", status_code=303)
+
+
+# --------------------------------------------------------------------------
+# Step 5: 連戲評分
+# --------------------------------------------------------------------------
+
+@router.get("/benchmark/variants/{variant_id}/video")
+def variant_video(variant_id: str, settings: Settings = Depends(settings_dep)):
+    """播放候選影片。只服務本 benchmark 專案內的候選。"""
+    from app.routes.web import WebException
+
+    with Session(engine) as session:
+        variant = session.get(AssetVariant, variant_id)
+    if variant is None or variant.project_id != PROJECT_ID:
+        raise WebException(
+            detail=f"找不到候選 {variant_id}", back_link="/benchmark/continuity"
+        )
+    if not variant.local_path or not Path(variant.local_path).exists():
+        raise WebException(
+            detail=f"候選 {variant_id} 的影片檔不存在",
+            back_link="/benchmark/continuity",
+        )
+    return FileResponse(Path(variant.local_path), media_type="video/mp4")
+
+
+@router.get("/benchmark/continuity", response_class=HTMLResponse)
+def continuity_index(settings: Settings = Depends(settings_dep)) -> str:
+    """連戲評分總覽。列出每個比較對象的每一組配對與其狀態。"""
+    from app.routes.web import page
+
+    try:
+        pairs = workflow.continuity_pairs(PROJECT_ID)
+    except Exception as error:  # noqa: BLE001
+        logger.warning("continuity pairs failed: %s", error)
+        pairs = []
+
+    rows = "".join(
+        f"<tr>"
+        f"<td class='mono'>{escape(item.target_id)}</td>"
+        f"<td class='mono'>{escape(item.shot_id)} ↔ {escape(item.ref_shot_id)}</td>"
+        f"<td>{escape(item.scenario)}</td>"
+        f"<td>{'已評分' if item.scored else ('可評分' if item.ready else '缺代表作')}</td>"
+        f"<td>{escape('；'.join(item.missing) or '—')}</td>"
+        f"<td>"
+        + (
+            f"<a class='ghost-button' href='/benchmark/continuity/"
+            f"{escape(item.target_id)}/{escape(item.shot_id)}'>"
+            f"{'重新評分' if item.scored else '評分'}</a>"
+            if item.ready
+            else "<span class='muted'>—</span>"
+        )
+        + "</td></tr>"
+        for item in pairs
+    ) or '<tr><td colspan="6" class="muted empty">尚無配對</td></tr>'
+
+    ready = [item for item in pairs if item.ready]
+    done = [item for item in ready if item.scored]
+    nxt = next((item for item in ready if not item.scored), None)
+    cta = (
+        f'<a class="primary button-link" href="/benchmark/continuity/'
+        f'{escape(nxt.target_id)}/{escape(nxt.shot_id)}">開始評下一組</a>'
+        if nxt
+        else '<span class="muted">沒有待評的配對</span>'
+    )
+
+    return page(
+        title="連戲評分",
+        active_nav="benchmark",
+        body=f"""
+        <section class="app-shell" data-route="/benchmark/continuity"
+                 data-step="5" data-entity-type="continuity_index">
+          <header class="project-hero">
+            <div>
+              <h1>連戲評分</h1>
+              <p class="muted">
+                {len(done)}/{len(ready)} 組已完成（共 {len(pairs)} 組配對）。
+                連戲評的是兩支實際影片的關係，配對只由各鏡頭的代表作組成。
+              </p>
+            </div>
+            <div class="actions">{cta}
+              <a class="ghost-button" href="/benchmark">返回 Benchmark</a>
+            </div>
+          </header>
+          <section class="panel">
+            <table class="data-table">
+              <thead><tr><th>Target</th><th>配對</th><th>情境</th>
+              <th>狀態</th><th>缺什麼</th><th></th></tr></thead>
+              <tbody>{rows}</tbody>
+            </table>
+          </section>
+        </section>
+        """,
+    )
+
+
+def _score_field(name: str, label: str, value, disabled: bool = False) -> str:
+    """一個 0-100 的評分欄位。留白代表 N/A，不以 0 分混淆。"""
+    current = "" if value is None else str(value)
+    note = "<p class='muted'>此項目在 V1 不評分</p>" if disabled else ""
+    return f"""
+    <div class="field">
+      <label for="{escape(name)}">{escape(label)}</label>
+      <input id="{escape(name)}" name="{escape(name)}" type="number"
+             min="0" max="100" step="1" value="{escape(current)}"
+             placeholder="0-100，留白為 N/A" {"disabled" if disabled else ""} />
+      {note}
+    </div>
+    """
+
+
+@router.get("/benchmark/continuity/{target_id}/{shot_id}", response_class=HTMLResponse)
+def continuity_form(
+    target_id: str,
+    shot_id: str,
+    ok: str = "",
+    message: str = "",
+    settings: Settings = Depends(settings_dep),
+) -> str:
+    """並排評分。兩支影片與其歸屬都由代表作決定，使用者不需要挑檔案。"""
+    from app.routes.web import WebException, page
+    from pipeline.models.qc import ContinuityQC
+
+    try:
+        pair = workflow.find_continuity_pair(target_id, shot_id, PROJECT_ID)
+    except LookupError as error:
+        raise WebException(
+            detail=str(error), back_link="/benchmark/continuity"
+        ) from error
+
+    if not pair.ready:
+        raise WebException(
+            detail=(
+                f"{target_id} 的 {shot_id} ↔ {pair.ref_shot_id} 尚無法評分："
+                + "；".join(pair.missing)
+            ),
+            back_link="/benchmark/continuity",
+        )
+
+    existing = None
+    if pair.qc_id:
+        with Session(engine) as session:
+            existing = session.get(ContinuityQC, pair.qc_id)
+
+    def value_of(field: str):
+        return getattr(existing, field, None) if existing else None
+
+    flash = ""
+    if message:
+        flash = (
+            f'<div class="{"bm-ok" if ok == "1" else "bm-warn"}">'
+            f"{escape(message)}</div>"
+        )
+
+    pairs = workflow.continuity_pairs(PROJECT_ID)
+    remaining = [
+        item for item in pairs if item.ready and not item.scored and item.key != pair.key
+    ]
+
+    return page(
+        title=f"連戲 · {target_id}",
+        active_nav="benchmark",
+        body=f"""
+        <section class="app-shell" data-route="/benchmark/continuity/{escape(target_id)}/{escape(shot_id)}"
+                 data-step="5" data-entity-type="continuity_pair"
+                 data-entity-id="{escape(pair.key)}">
+          <header class="project-hero">
+            <div>
+              <h1>{escape(target_id)}</h1>
+              <p class="muted">
+                {escape(pair.scenario)} · {escape(pair.shot_id)} ↔ {escape(pair.ref_shot_id)}
+                · 還有 {len(remaining)} 組待評
+              </p>
+            </div>
+            <div class="actions">
+              <a class="ghost-button" href="/benchmark/continuity">全部配對</a>
+            </div>
+          </header>
+          {flash}
+          <section class="panel">
+            <div class="pair-grid">
+              <div>
+                <strong class="mono">{escape(pair.shot_id)}</strong>
+                <video controls preload="metadata"
+                       src="/benchmark/variants/{escape(pair.variant_id)}/video"></video>
+                <p class="mono muted">{escape(pair.variant_id)}</p>
+              </div>
+              <div>
+                <strong class="mono">{escape(pair.ref_shot_id)}</strong>
+                <video controls preload="metadata"
+                       src="/benchmark/variants/{escape(pair.ref_variant_id)}/video"></video>
+                <p class="mono muted">{escape(pair.ref_variant_id)}</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="section-head"><h2>兩顆鏡頭之間的一致性</h2></div>
+            <form method="post"
+                  action="/benchmark/continuity/{escape(target_id)}/{escape(shot_id)}">
+              <div class="split">
+                {_score_field("cross_shot_identity", "跨鏡頭身份一致", value_of("cross_shot_identity"))}
+                {_score_field("wardrobe_continuity", "服裝連戲", value_of("wardrobe_continuity"))}
+              </div>
+              <div class="split">
+                {_score_field("location_continuity", "場景連戲", value_of("location_continuity"))}
+                {_score_field("lip_sync_quality", "嘴型同步", None, disabled=not v1_pack.LIP_SYNC_ENABLED)}
+              </div>
+              <div class="field">
+                <label for="notes">備註</label>
+                <input id="notes" name="notes"
+                       value="{escape(getattr(existing, 'notes', None) or '')}" />
+              </div>
+              <button class="primary" type="submit">儲存並下一組</button>
+            </form>
+          </section>
+        </section>
+        <style>
+          .pair-grid {{ display: grid; gap: 16px;
+                        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }}
+          .pair-grid video {{ width: 100%; border-radius: 6px;
+                              background: #0d1219; margin-top: 6px; }}
+          .bm-warn {{ color: #e8b; margin: 8px 0; }}
+          .bm-ok {{ color: #7ee2a8; margin: 8px 0; }}
+        </style>
+        """,
+    )
+
+
+@router.post("/benchmark/continuity/{target_id}/{shot_id}")
+async def continuity_save(
+    target_id: str,
+    shot_id: str,
+    cross_shot_identity: str = Form(""),
+    wardrobe_continuity: str = Form(""),
+    location_continuity: str = Form(""),
+    notes: str = Form(""),
+    settings: Settings = Depends(settings_dep),
+):
+    """儲存連戲評分。配對合法性由 score_import 的守門函式判定。"""
+    from urllib.parse import quote
+
+    from app.routes.web import WebException
+    from pipeline.benchmark import score_import
+
+    def score(raw: str) -> int | None:
+        text = (raw or "").strip()
+        if not text:
+            return None
+        value = int(float(text))
+        if not 0 <= value <= 100:
+            raise ValueError(f"評分必須介於 0 與 100 之間，收到 {value}")
+        return value
+
+    try:
+        pair = workflow.find_continuity_pair(target_id, shot_id, PROJECT_ID)
+    except LookupError as error:
+        raise WebException(
+            detail=str(error), back_link="/benchmark/continuity"
+        ) from error
+
+    if not pair.ready:
+        raise WebException(
+            detail="；".join(pair.missing), back_link="/benchmark/continuity"
+        )
+
+    try:
+        values = {
+            "cross_shot_identity": score(cross_shot_identity),
+            "wardrobe_continuity": score(wardrobe_continuity),
+            "location_continuity": score(location_continuity),
+        }
+        await run_in_threadpool(
+            score_import.validate_continuity_pair,
+            PROJECT_ID,
+            target_id,
+            pair.shot_id,
+            pair.ref_shot_id,
+            pair.variant_id,
+            pair.ref_variant_id,
+        )
+        await run_in_threadpool(
+            _persist_continuity, PROJECT_ID, pair, values, notes.strip() or None
+        )
+    except (score_import.PairMismatch, ValueError) as error:
+        raise WebException(
+            detail=str(error),
+            back_link=f"/benchmark/continuity/{target_id}/{shot_id}",
+        ) from error
+
+    remaining = [
+        item
+        for item in workflow.continuity_pairs(PROJECT_ID)
+        if item.ready and not item.scored
+    ]
+    if remaining:
+        nxt = remaining[0]
+        return RedirectResponse(
+            url=(
+                f"/benchmark/continuity/{nxt.target_id}/{nxt.shot_id}"
+                f"?ok=1&message={quote('上一組已儲存')}"
+            ),
+            status_code=303,
+        )
+    return RedirectResponse(url="/benchmark/continuity", status_code=303)
+
+
+def _persist_continuity(
+    project_id: str, pair, values: dict, notes: str | None
+) -> None:
+    """寫入或更新連戲評分。同一組配對只留一列，重評即覆寫。"""
+    from pipeline.models.qc import ContinuityQC, ContinuityScope
+
+    qc_id = f"cqc_{project_id}_{pair.target_id}_{pair.shot_id}"[:120]
+    with Session(engine) as session:
+        row = session.get(ContinuityQC, qc_id)
+        if row is None:
+            row = ContinuityQC(
+                qc_id=qc_id,
+                project_id=project_id,
+                scope=ContinuityScope.PAIR.value,
+                shot_id=pair.shot_id,
+                ref_shot_id=pair.ref_shot_id,
+            )
+        row.variant_id = pair.variant_id
+        row.ref_variant_id = pair.ref_variant_id
+        row.cross_shot_identity = values["cross_shot_identity"]
+        row.wardrobe_continuity = values["wardrobe_continuity"]
+        row.location_continuity = values["location_continuity"]
+        # V1 沒有音訊 ground truth，嘴型一律不評，不得寫入 0 分
+        row.lip_sync_quality = None
+        row.notes = notes
+        session.add(row)
+        session.commit()
 
 
 @router.get("/benchmark/results", response_class=HTMLResponse)

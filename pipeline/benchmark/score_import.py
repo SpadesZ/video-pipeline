@@ -141,6 +141,23 @@ def validate_continuity_pair(
             f"配對跨模型: {primary.model_id} vs {reference.model_id}"
         )
 
+    # provider 與 model_id 相同仍可能分屬兩個比較對象：同一平台同一模型的
+    # 兩個版本各自獨立。歸屬只認派工血緣，這裡的檢查也一樣。
+    from pipeline.benchmark.attribution import resolve_variant_target_id
+
+    for label, variant in (("variant", primary), ("ref_variant", reference)):
+        owner = resolve_variant_target_id(variant)
+        if owner is None:
+            raise PairMismatch(
+                f"{label} {variant.variant_id} 沒有派工血緣，"
+                "無法確認屬於哪個比較對象"
+            )
+        if owner != target_id:
+            raise PairMismatch(
+                f"{label} {variant.variant_id} 屬於比較對象 {owner}，"
+                f"與指定的 {target_id} 不符"
+            )
+
 
 def import_variant_scores(
     artifact: ProductionArtifact, csv_path: Path, reviewer: str = "local"

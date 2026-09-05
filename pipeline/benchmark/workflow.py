@@ -499,6 +499,104 @@ def collect(settings: Settings) -> WorkflowState:
     return state
 
 
+class ContinuityPair(BaseModel):
+    """一組待評連戲的鏡頭配對。
+
+    兩支影片都必須是同一個比較對象在各自鏡頭上的代表作。
+    缺任何一邊就無法評，這時列出缺的是哪一邊，而不是讓使用者
+    在畫面上看到一個空的播放器卻不知道為什麼。
+    """
+
+    target_id: str
+    shot_id: str
+    ref_shot_id: str
+    scenario: str = ""
+    variant_id: str | None = None
+    ref_variant_id: str | None = None
+    scored: bool = False
+    qc_id: str | None = None
+
+    @property
+    def key(self) -> str:
+        return f"{self.target_id}|{self.shot_id}|{self.ref_shot_id}"
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.variant_id and self.ref_variant_id)
+
+    @property
+    def missing(self) -> list[str]:
+        gaps = []
+        if not self.variant_id:
+            gaps.append(f"{self.shot_id} 尚未選定代表作")
+        if not self.ref_variant_id:
+            gaps.append(f"{self.ref_shot_id} 尚未選定代表作")
+        return gaps
+
+
+def continuity_pairs(project_id: str = PROJECT_ID) -> list[ContinuityPair]:
+    """列出所有連戲配對及其代表作。
+
+    配對只由 benchmark_selected 的代表作組成。若允許任意兩支候選配對，
+    分數會落在使用者當下隨手挑的組合上，換一次選片結論就變了。
+    """
+    from sqlmodel import Session, select
+
+    from pipeline.db import engine
+    from pipeline.models.qc import ContinuityQC
+
+    index = attribution.build_index(project_id)
+    selected: dict[tuple[str, str], str] = {}
+    for item in index.items:
+        if item.benchmark_selected:
+            selected[(item.target_id, item.shot_id)] = item.variant_id
+
+    with Session(engine) as session:
+        rows = session.exec(
+            select(ContinuityQC).where(ContinuityQC.project_id == project_id)
+        ).all()
+    scored = {
+        (row.shot_id, row.ref_shot_id or "", row.variant_id or ""): row
+        for row in rows
+    }
+
+    pairs: list[ContinuityPair] = []
+    for item in target.targets().targets:
+        for shot_id, ref_shot_id in v1_pack.CONTINUITY_PAIRS:
+            variant_id = selected.get((item.target_id, shot_id))
+            ref_variant_id = selected.get((item.target_id, ref_shot_id))
+            existing = scored.get((shot_id, ref_shot_id, variant_id or ""))
+            pairs.append(
+                ContinuityPair(
+                    target_id=item.target_id,
+                    shot_id=shot_id,
+                    ref_shot_id=ref_shot_id,
+                    scenario=v1_pack.SHOT_SCENARIOS.get(shot_id, ""),
+                    variant_id=variant_id,
+                    ref_variant_id=ref_variant_id,
+                    scored=existing is not None,
+                    qc_id=existing.qc_id if existing else None,
+                )
+            )
+    return pairs
+
+
+def find_continuity_pair(
+    target_id: str, shot_id: str, project_id: str = PROJECT_ID
+) -> ContinuityPair:
+    found = next(
+        (
+            item
+            for item in continuity_pairs(project_id)
+            if item.target_id == target_id and item.shot_id == shot_id
+        ),
+        None,
+    )
+    if found is None:
+        raise LookupError(f"{target_id}/{shot_id} 不是已登錄的連戲配對")
+    return found
+
+
 def sheets_dir(settings: Settings):
     from pathlib import Path
 
