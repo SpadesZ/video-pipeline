@@ -28,7 +28,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from pipeline.benchmark import builder, score_import, score_sheet, v1_pack
+from pipeline.benchmark import (
+    attempts,
+    builder,
+    score_import,
+    score_sheet,
+    target,
+    v1_pack,
+)
 from pipeline.db import init_db
 from pipeline.project_store import load_project
 from pipeline.settings import get_settings
@@ -55,13 +62,13 @@ def cmd_check() -> int:
     return 1
 
 
-def cmd_build(providers: tuple[str, ...] | None) -> int:
+def cmd_build(target_ids: tuple[str, ...] | None) -> int:
     settings = get_settings()
     init_db()
 
     report = builder.check_assets(settings)
     if not report.ready:
-        print("素材尚未就緒，先執行 check 並補齊檔案", file=sys.stderr)
+        print("素材尚未就緒或未通過驗證", file=sys.stderr)
         for line in report.instructions():
             print(f"  - {line}", file=sys.stderr)
         return 1
@@ -73,53 +80,92 @@ def cmd_build(providers: tuple[str, ...] | None) -> int:
     print(f"專案 {artifact.project_id}: {len(artifact.shot_plans)} 顆鏡頭, "
           f"{len(artifact.character_packs)} 個角色")
 
-    targets = providers or v1_pack.TARGET_PROVIDERS
-    reports = asyncio.run(builder.dispatch_all(artifact, targets))
+    registry = target.targets()
+    selected = (
+        [registry.by_id(item) for item in target_ids]
+        if target_ids
+        else list(registry.targets)
+    )
+    if any(item is None for item in selected):
+        print(f"未登錄的 target。可用: {', '.join(registry.target_ids)}",
+              file=sys.stderr)
+        return 1
+
+    reports = asyncio.run(
+        builder.dispatch_all(artifact, tuple(item.target_id for item in selected))
+    )
 
     from pipeline.project_store import save_project
 
     save_project(settings, artifact)
 
     print()
-    blocked_total = 0
-    for provider, result in reports.items():
-        blocked_total += result.blocked_count + (
-            result.failed_count - result.blocked_count
-        )
-        print(f"{provider:10s} {result.summary()}")
+    problems = 0
+    for target_id, result in reports.items():
+        problems += result.failed_count
+        print(f"{target_id:20s} {result.summary()}")
         for item in result.results:
             if item.dispatched:
                 continue
             print(f"    ! {item.shot_id} [{item.readiness}] {item.message}")
 
-    variant_path = score_sheet.write_variant_sheet(sheets_dir(settings), targets)
-    continuity_path = score_sheet.write_continuity_sheet(sheets_dir(settings), targets)
+    directory = sheets_dir(settings)
+    variant_path = score_sheet.write_variant_sheet(directory, selected)
+    continuity_path = score_sheet.write_continuity_sheet(directory, selected)
+    attempts_path = attempts.write_blank_ledger(directory, selected)
+
     print()
-    print(f"評分表: {variant_path}")
-    print(f"連戲表: {continuity_path}")
+    print(f"評分表:   {variant_path}")
+    print(f"連戲表:   {continuity_path}")
+    print(f"嘗試紀錄: {attempts_path}")
     print()
-    print(f"預計人工生成次數: {len(v1_pack.shots())} 鏡頭 x {len(targets)} 平台 "
+    print(f"預計人工生成次數: {len(v1_pack.shots())} 鏡頭 x {len(selected)} 目標 "
           f"x {v1_pack.CANDIDATES_PER_SHOT} 候選 = "
-          f"{len(v1_pack.shots()) * len(targets) * v1_pack.CANDIDATES_PER_SHOT}")
-    return 1 if blocked_total else 0
+          f"{len(v1_pack.shots()) * len(selected) * v1_pack.CANDIDATES_PER_SHOT}")
+
+    provisional = [item.target_id for item in selected if item.provisional]
+    if provisional:
+        print()
+        print(f"注意: 以下 target 的實際版本尚未確認: {', '.join(provisional)}")
+        print("      請於平台確認後更新 pipeline/benchmark/catalog/v1_targets.yaml")
+    return 1 if problems else 0
 
 
 def cmd_sheets() -> int:
     settings = get_settings()
-    variant_path, continuity_path = score_sheet.write_all(sheets_dir(settings))
+    directory = sheets_dir(settings)
+    variant_path, continuity_path = score_sheet.write_all(directory)
+    attempts_path = attempts.write_blank_ledger(directory)
     print(f"OK {variant_path}")
     print(f"OK {continuity_path}")
+    print(f"OK {attempts_path}")
     return 0
 
 
 def cmd_sync() -> int:
+    """回填三張表。嘗試紀錄只補 variant_id，不刪除任何列。"""
     settings = get_settings()
     init_db()
-    path, rows = score_sheet.sync_variant_sheet(
-        sheets_dir(settings), v1_pack.BENCHMARK_PROJECT_ID
+    directory = sheets_dir(settings)
+
+    variant_path, variant_rows = score_sheet.sync_variant_sheet(
+        directory, v1_pack.BENCHMARK_PROJECT_ID
     )
-    print(f"OK 已回填 {rows} 列候選至 {path}")
-    if rows == 0:
+    print(f"評分表:   回填 {variant_rows} 列 -> {variant_path}")
+
+    continuity_path, pairs = score_sheet.sync_continuity_sheet(
+        directory, v1_pack.BENCHMARK_PROJECT_ID
+    )
+    print(f"連戲表:   完成 {pairs} 組配對 -> {continuity_path}")
+    if pairs == 0:
+        print("      連戲配對需要兩顆鏡頭都已選定候選（Select）")
+
+    updated, total = attempts.sync_variant_ids(
+        directory / attempts.ATTEMPTS_SHEET, v1_pack.BENCHMARK_PROJECT_ID
+    )
+    print(f"嘗試紀錄: 補齊 {updated} 列 variant_id，共 {total} 列（失敗紀錄保留）")
+
+    if variant_rows == 0:
         print("尚未匯入任何候選影片，請先於專案頁匯入", file=sys.stderr)
         return 1
     return 0
@@ -181,10 +227,19 @@ def cmd_status() -> int:
     for shot_id in not_ready:
         print(f"    ! {shot_id}: {'; '.join(readiness[shot_id].issues)}")
 
+    registry = target.targets()
     jobs = builder.jobs_summary()
     print(f"派工: {sum(jobs.values())} 筆")
-    for provider in v1_pack.TARGET_PROVIDERS:
-        print(f"    {provider:10s} {jobs.get(provider, 0)}")
+    for item in registry.targets:
+        flag = " (版本未確認)" if item.provisional else ""
+        print(f"    {item.target_id:20s} {jobs.get(item.provider, 0)}{flag}")
+
+    ledger = attempts.read_ledger(sheets_dir(settings) / attempts.ATTEMPTS_SHEET)
+    if ledger.attempts:
+        failed = sum(1 for item in ledger.attempts if not item.succeeded)
+        print(f"嘗試紀錄: {len(ledger.attempts)} 次，其中失敗 {failed} 次")
+    for error in ledger.errors:
+        print(f"    ! {error}", file=sys.stderr)
 
     from pipeline.stages.shot_qc import summarize_project_qc
     from pipeline.stages.variant_importer import list_variants
@@ -205,8 +260,8 @@ def main() -> int:
     sub.add_parser("check", help="檢查素材是否就緒")
     build = sub.add_parser("build", help="建立專案並產出 job packages")
     build.add_argument(
-        "--providers", nargs="*", default=None,
-        help=f"指定平台，預設全部: {' '.join(v1_pack.TARGET_PROVIDERS)}",
+        "--targets", nargs="*", default=None,
+        help="指定比較對象 target_id，預設全部",
     )
     sub.add_parser("sheets", help="產生空白評分表")
     sub.add_parser("sync", help="影片匯入後回填 variant_id")
@@ -220,8 +275,8 @@ def main() -> int:
     if command == "check":
         return cmd_check()
     if command == "build":
-        providers = tuple(args.providers) if args.providers else None
-        return cmd_build(providers)
+        selected = tuple(args.targets) if args.targets else None
+        return cmd_build(selected)
     if command == "sheets":
         return cmd_sheets()
     if command == "sync":

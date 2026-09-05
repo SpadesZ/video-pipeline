@@ -74,10 +74,49 @@ data/projects/benchmark_v1/job_packages/<shot_id>/<provider>/<hash>/
 
 ---
 
+## 步驟 2.5：確認各平台的實際版本
+
+`pipeline/benchmark/catalog/v1_targets.yaml` 目前四個 target 的
+`model_version` 都是空的，`provisional` 皆為 `true`。
+
+登入各平台後，把介面上實際選到的版本填進去：
+
+```yaml
+  - target_id: kling_default
+    provider: kling
+    model_id: kling-video
+    model_version: "2.1"        # 平台顯示的版本
+    ui_label: "Kling 2.1 標準模式"  # 介面上的選項名稱
+    provisional: false           # 確認後改為 false
+```
+
+**若平台同時提供多個版本且你打算都測，為每個版本各建一個 target**
+（例如 `kling_v1_6` 與 `kling_v2_1`）。只記「這是 Kling 生的」，
+日後無從得知當時用的是哪一版。
+
 ## 步驟 3：到各平台生成
 
-**每顆鏡頭每個平台生成 3 次**，全部保留，包含失敗的。
+**每顆鏡頭每個 target 生成 3 次**，全部保留，包含失敗的。
 重試次數本身就是要測的指標，不要只留好的那一支。
+
+### 每按一次 Generate 就記一列
+
+打開 `data/benchmark/v1/sheets/v1_attempts.csv`，**每次按下生成就填一列**，
+即使沒有產出任何影片：
+
+| status | 什麼時候用 |
+|---|---|
+| `success` | 有產出影片 |
+| `failed` | 平台報錯、內容政策拒絕、生成崩壞到不可用 |
+| `cancelled` | 你自己中斷 |
+
+`generation_seconds`、`credits_used` 一律要填，失敗的也要——失敗同樣
+花時間和點數。`failure_reason` 寫清楚原因。
+
+這張表是重試次數、耗時與成本的**唯一統計來源**。只看成功的候選會嚴重
+高估平台表現：試十次成功兩次，和一次就中，成品看起來一樣好。
+
+實際重試超過預留的三列時直接增列，不要覆蓋既有列。
 
 對每個 `<shot_id>/<provider>/<hash>/` 目錄：
 
@@ -129,8 +168,16 @@ benchmark 結論**。
 docker compose run --rm api python scripts/benchmark_v1.py sync
 ```
 
-會把已匯入的候選回填進 `data/benchmark/v1/sheets/v1_variant_scores.csv`，
-每列帶 `variant_id` 與檔名。
+`sync` 會處理三張表：
+
+- **評分表**：回填 `variant_id` 與檔名
+- **連戲表**：依已選定（Select）的候選建立配對，填入 `variant_id` 與
+  `ref_variant_id`。兩顆鏡頭都要先選定候選才會產生配對
+- **嘗試紀錄**：為成功的列補上 `variant_id`。**不會刪除任何列**，
+  失敗的嘗試維持原樣
+
+連戲配對必須是同一個 target 的兩支影片。跨平台或跨版本的配對會在匯入時
+被拒絕——那種分數無法歸因給任何一個比較對象。
 
 用 Excel 或任何試算表打開，逐列填分：
 

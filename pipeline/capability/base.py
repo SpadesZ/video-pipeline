@@ -48,6 +48,10 @@ class VisualPayload(BaseModel):
     aspect_ratio: str | None = None
     camera: str | None = None
     character_refs: list[str] = Field(default_factory=list)
+    # asset_id -> 檔案內容 SHA256。素材識別碼不變但圖片換了的情況，
+    # 若只記錄 asset_id，兩次生成會被視為同一份請求，血緣就錯了。
+    # 內容雜湊納入請求後，換圖必然產生新的 request identity。
+    reference_hashes: dict[str, str] = Field(default_factory=dict)
 
 
 class AudioPayload(BaseModel):

@@ -42,7 +42,6 @@ BENCHMARK_PROJECT_ID = "benchmark_v1"
 SHOT_DURATION_MS = 6000
 ASPECT_RATIO = "9:16"
 
-TARGET_PROVIDERS = ("kling", "seedance", "veo", "runway")
 CANDIDATES_PER_SHOT = 3
 
 # 共用的負面提示詞。四個平台使用同一份，不做個別調整。
@@ -106,6 +105,8 @@ class RequiredAsset(BaseModel):
     asset_type: str
     filename: str
     description: str
+    # 首幀會實際上傳至平台，比例必須正確；設定圖僅供人工對照，不限比例。
+    require_vertical: bool = True
 
 
 # 人工需準備的素材。每顆鏡頭一張首幀，另兩張角色設定圖僅供人工製作首幀時
@@ -119,6 +120,7 @@ REQUIRED_ASSETS: tuple[RequiredAsset, ...] = (
             "角色 A 的視覺設定圖。短髮、深色長風衣的女性，二十多歲。"
             "僅供人工製作首幀時對照，不會上傳至平台。"
         ),
+        require_vertical=False,
     ),
     RequiredAsset(
         asset_id="ref_char_b_sheet",
@@ -128,6 +130,7 @@ REQUIRED_ASSETS: tuple[RequiredAsset, ...] = (
             "角色 B 的視覺設定圖。中長髮、淺色針織外套的男性，三十多歲。"
             "僅供人工製作首幀時對照，不會上傳至平台。"
         ),
+        require_vertical=False,
     ),
     RequiredAsset(
         asset_id="ref_frame_a1",
@@ -444,6 +447,37 @@ CONTINUITY_PAIRS: tuple[tuple[str, str], ...] = (
     ("bm_c1_run_tracking", "bm_a1_walk_slow_push"),
 )
 
+# 可評估表情演技的鏡頭。以鏡頭而非情境判定：
+# a2 雖屬單角色情境，但它是特寫且明確要求表情變化，是表情演技的
+# 主要觀察對象；a1 的遠景與 c1 的高速奔跑則看不清臉部。
+FACIAL_ACTING_SHOTS: frozenset[str] = frozenset(
+    {
+        "bm_a2_closeup_expression",
+        "bm_b1_two_shot_dialogue",
+        "bm_b2_ots_on_a",
+        "bm_b3_ots_on_b",
+    }
+)
+
+# V1 沒有音訊，也沒有嘴型的 ground truth，因此嘴型一律不評、不排名。
+# 待 short_drama profile 引入對白軌後再啟用。
+LIP_SYNC_ENABLED = False
+
+
+def evaluates_facial_acting(shot_id: str) -> bool:
+    return shot_id in FACIAL_ACTING_SHOTS
+
+
+def target_providers() -> tuple[str, ...]:
+    """比較對象涵蓋的平台。
+
+    以 BenchmarkTarget registry 為準而非另外維護一份清單，
+    避免兩處不同步時出現「有 target 卻沒派工」的漏測。
+    """
+    from pipeline.benchmark.target import targets
+
+    return targets().providers
+
 
 def shots_by_scenario(scenario_id: str) -> list[ShotPlan]:
     return [
@@ -451,6 +485,9 @@ def shots_by_scenario(scenario_id: str) -> list[ShotPlan]:
     ]
 
 
-def total_generations() -> int:
+def total_generations(target_count: int | None = None) -> int:
     """完整跑完一輪所需的人工生成次數。"""
-    return len(shots()) * len(TARGET_PROVIDERS) * CANDIDATES_PER_SHOT
+    from pipeline.benchmark.target import targets
+
+    count = target_count if target_count is not None else len(targets().targets)
+    return len(shots()) * count * CANDIDATES_PER_SHOT

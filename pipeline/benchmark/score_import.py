@@ -84,6 +84,64 @@ def _flag(raw: str | None) -> bool | None:
     raise ValueError(f"無法判讀的布林值: {raw!r}")
 
 
+class PairMismatch(ValueError):
+    """連戲配對的兩支候選不屬於同一比較對象或鏡頭。"""
+
+
+def validate_continuity_pair(
+    project_id: str,
+    target_id: str,
+    shot_id: str,
+    ref_shot_id: str,
+    variant_id: str,
+    ref_variant_id: str,
+) -> None:
+    """驗證連戲配對。
+
+    連戲評的是兩支實際影片的關係。若允許跨平台或跨版本配對，
+    得到的分數無法歸因給任何一個比較對象，統計就失去意義。
+    """
+    from sqlmodel import Session
+
+    from pipeline.benchmark.target import resolve
+    from pipeline.db import engine
+    from pipeline.stages.variant_importer import load_owned_variant
+
+    target = resolve(target_id)
+
+    with Session(engine) as session:
+        primary = load_owned_variant(session, project_id, variant_id)
+        reference = load_owned_variant(session, project_id, ref_variant_id)
+
+    for label, variant, expected_shot in (
+        ("variant", primary, shot_id),
+        ("ref_variant", reference, ref_shot_id),
+    ):
+        if variant.shot_id != expected_shot:
+            raise PairMismatch(
+                f"{label} {variant.variant_id} 屬於鏡頭 {variant.shot_id}，"
+                f"與指定的 {expected_shot} 不符"
+            )
+        if variant.provider != target.provider:
+            raise PairMismatch(
+                f"{label} {variant.variant_id} 由 {variant.provider} 生成，"
+                f"與 target {target_id} 的平台 {target.provider} 不符"
+            )
+
+    if primary.variant_id == reference.variant_id:
+        raise PairMismatch("連戲配對不可指向同一支候選")
+
+    if primary.provider != reference.provider:
+        raise PairMismatch(
+            f"配對跨平台: {primary.provider} vs {reference.provider}"
+        )
+
+    if (primary.model_id or "") != (reference.model_id or ""):
+        raise PairMismatch(
+            f"配對跨模型: {primary.model_id} vs {reference.model_id}"
+        )
+
+
 def import_variant_scores(
     artifact: ProductionArtifact, csv_path: Path, reviewer: str = "local"
 ) -> ImportReport:
@@ -147,7 +205,27 @@ def import_continuity_scores(
                 report.skipped.append(f"line {line_no}: {shot_id} 尚未評分")
                 continue
 
+            target_id = (row.get("target_id") or "").strip()
+            variant_id = (row.get("variant_id") or "").strip()
+            ref_variant_id = (row.get("ref_variant_id") or "").strip()
+
+            # 連戲分數必須能歸因到具體的兩支影片與一個比較對象
+            if not (target_id and variant_id and ref_variant_id):
+                report.skipped.append(
+                    f"line {line_no}: {shot_id} 缺少 target_id 或候選配對，"
+                    "先執行 sync 取得配對"
+                )
+                continue
+
             try:
+                validate_continuity_pair(
+                    artifact.project_id,
+                    target_id,
+                    shot_id,
+                    ref_shot_id,
+                    variant_id,
+                    ref_variant_id,
+                )
                 record_continuity_qc(
                     artifact,
                     shot_id=shot_id,
@@ -156,12 +234,12 @@ def import_continuity_scores(
                     scores={
                         column: _score(value) for column, value in scores.items()
                     },
-                    variant_id=(row.get("variant_id") or "").strip() or None,
-                    ref_variant_id=(row.get("ref_variant_id") or "").strip() or None,
+                    variant_id=variant_id,
+                    ref_variant_id=ref_variant_id,
                     reviewer=reviewer,
                     notes=(row.get("notes") or "").strip() or None,
                 )
                 report.applied += 1
-            except (QCValidationError, ValueError) as error:
+            except (PairMismatch, QCValidationError, ValueError) as error:
                 report.errors.append(f"line {line_no}: {shot_id}: {error}")
     return report

@@ -22,6 +22,8 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from pipeline.benchmark import v1_pack
+from pipeline.benchmark.asset_validation import validate_image
+from pipeline.benchmark.target import BenchmarkTarget, targets
 from pipeline.models.production_artifact import ProductionArtifact
 from pipeline.models.production_profile import load_preset
 from pipeline.models.reference_asset import ReferenceAsset, ReferenceRights
@@ -39,6 +41,10 @@ class AssetStatus(BaseModel):
     filename: str
     description: str
     present: bool
+    valid: bool = False
+    problems: list[str] = Field(default_factory=list)
+    file_hash: str | None = None
+    dimensions: str | None = None
 
 
 class AssetReport(BaseModel):
@@ -50,13 +56,20 @@ class AssetReport(BaseModel):
         return [item for item in self.statuses if not item.present]
 
     @property
+    def invalid(self) -> list[AssetStatus]:
+        return [item for item in self.statuses if item.present and not item.valid]
+
+    @property
     def ready(self) -> bool:
-        return not self.missing
+        return not self.missing and not self.invalid
 
     def instructions(self) -> list[str]:
-        return [
-            f"{item.filename}  <-  {item.description}" for item in self.missing
-        ]
+        lines = [f"{item.filename}  <-  {item.description}" for item in self.missing]
+        lines.extend(
+            f"{item.filename}  !!  {'; '.join(item.problems)}"
+            for item in self.invalid
+        )
+        return lines
 
 
 def assets_dir(settings: Settings) -> Path:
@@ -64,25 +77,46 @@ def assets_dir(settings: Settings) -> Path:
 
 
 def check_assets(settings: Settings) -> AssetReport:
-    """檢查素材目錄。只回報狀態，不建立任何資料。"""
+    """檢查素材目錄。實際解碼驗證，只回報狀態，不建立任何資料。
+
+    僅檢查檔案大小不足以擋下壞圖：PNG 檔頭加隨機位元組會通過大小檢查，
+    卻在上傳平台時失敗；比例錯誤的首幀會讓四個平台各自裁切，結果無法比較。
+    """
+    from pipeline.capability.job_package import file_sha256
+
     directory = assets_dir(settings)
     directory.mkdir(parents=True, exist_ok=True)
     report = AssetReport(assets_dir=str(directory))
+
     for required in v1_pack.REQUIRED_ASSETS:
         path = directory / required.filename
-        report.statuses.append(
-            AssetStatus(
-                asset_id=required.asset_id,
-                filename=required.filename,
-                description=required.description,
-                present=path.exists() and path.stat().st_size > 0,
-            )
+        present = path.exists() and path.stat().st_size > 0
+        status = AssetStatus(
+            asset_id=required.asset_id,
+            filename=required.filename,
+            description=required.description,
+            present=present,
         )
+        if present:
+            check = validate_image(path, require_vertical=required.require_vertical)
+            status.valid = check.ok
+            status.problems = list(check.problems)
+            if check.width and check.height:
+                status.dimensions = f"{check.width}x{check.height}"
+            if check.ok:
+                status.file_hash = file_sha256(path)
+        report.statuses.append(status)
+
     return report
 
 
 def register_assets(settings: Settings) -> int:
-    """將已就緒的素材登錄至 reference_assets。回傳登錄筆數。"""
+    """將已驗證的素材登錄至 reference_assets。回傳登錄筆數。
+
+    file_hash 每次都以檔案內容重算並覆寫：素材可能在登錄後被替換，
+    沿用舊值會讓換圖後的請求得到與換圖前相同的識別。
+    """
+    from pipeline.capability.job_package import file_sha256
     from pipeline.db import engine
 
     directory = assets_dir(settings)
@@ -92,6 +126,16 @@ def register_assets(settings: Settings) -> int:
             path = directory / required.filename
             if not path.exists():
                 continue
+            check = validate_image(path, require_vertical=required.require_vertical)
+            if not check.ok:
+                logger.warning(
+                    "跳過未通過驗證的素材 %s: %s",
+                    required.filename,
+                    "; ".join(check.problems),
+                )
+                continue
+
+            digest = file_sha256(path)
             existing = session.get(ReferenceAsset, required.asset_id)
             if existing is None:
                 session.add(
@@ -101,12 +145,14 @@ def register_assets(settings: Settings) -> int:
                         asset_type=required.asset_type,
                         label=required.description[:80],
                         local_path=str(path),
+                        file_hash=digest,
                         rights=ReferenceRights.APPROVED.value,
                         source="benchmark_v1_manual",
                     )
                 )
             else:
                 existing.local_path = str(path)
+                existing.file_hash = digest
                 session.add(existing)
             registered += 1
         session.commit()
@@ -132,24 +178,47 @@ def build_artifact(settings: Settings) -> ProductionArtifact:
     return artifact
 
 
-async def dispatch_provider(
-    artifact: ProductionArtifact, provider: str
+async def dispatch_target(
+    artifact: ProductionArtifact, target: BenchmarkTarget
 ) -> ShotDispatchReport:
-    """對單一平台產出全部鏡頭的 job packages。"""
+    """對單一比較對象產出全部鏡頭的 job packages。
+
+    target 身份以底線前綴寫入 request.parameters，因此會進入
+    job manifest 與工作快照，但不會混入交給平台的參數欄位。
+    """
     return await dispatch_project_shots(
         artifact,
-        only_provider=provider,
-        preferred_provider=provider,
+        only_provider=target.provider,
+        preferred_provider=target.provider,
+        extra_parameters={
+            "_bm_target_id": target.target_id,
+            "_bm_model_version": target.model_version or "",
+            "_bm_ui_label": target.ui_label,
+            "_bm_provisional": target.provisional,
+        },
     )
 
 
 async def dispatch_all(
-    artifact: ProductionArtifact, providers: tuple[str, ...] | None = None
+    artifact: ProductionArtifact, target_ids: tuple[str, ...] | None = None
 ) -> dict[str, ShotDispatchReport]:
-    targets = providers or v1_pack.TARGET_PROVIDERS
+    registry = targets()
+    selected = (
+        [registry.by_id(item) for item in target_ids]
+        if target_ids
+        else list(registry.targets)
+    )
+    missing = [
+        target_id
+        for target_id, target in zip(target_ids or (), selected)
+        if target is None
+    ]
+    if missing:
+        raise ValueError(f"未登錄的 benchmark target: {', '.join(missing)}")
+
     reports: dict[str, ShotDispatchReport] = {}
-    for provider in targets:
-        reports[provider] = await dispatch_provider(artifact, provider)
+    for target in selected:
+        reports[target.target_id] = await dispatch_target(artifact, target)
     return reports
 
 

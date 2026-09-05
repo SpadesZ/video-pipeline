@@ -123,6 +123,31 @@ def resolve_reference_availability(asset_ids: list[str]) -> dict[str, bool]:
     return available
 
 
+def resolve_reference_hashes(asset_ids: list[str]) -> dict[str, str]:
+    """取得素材的檔案內容雜湊，供納入請求識別。
+
+    以檔案實際內容重算，不採用資料庫既有值：素材可能在登錄後被替換，
+    若沿用舊值，換圖後的請求會與換圖前得到相同的 identity。
+    """
+    if not asset_ids:
+        return {}
+    from pipeline.capability.job_package import file_sha256
+    from pipeline.db import engine
+
+    hashes: dict[str, str] = {}
+    with Session(engine) as session:
+        rows = session.exec(
+            select(ReferenceAsset).where(ReferenceAsset.asset_id.in_(asset_ids))
+        ).all()
+        for row in rows:
+            if not row.local_path:
+                continue
+            path = Path(row.local_path)
+            if path.exists():
+                hashes[row.asset_id] = file_sha256(path)
+    return hashes
+
+
 def check_shot_readiness(
     shot: ShotPlan, packs: dict[str, CharacterIdentityPack]
 ) -> ShotReadiness:
@@ -213,6 +238,13 @@ def build_shot_request(
     profile: ProductionProfile,
 ) -> CapabilityRequest:
     duration_ms = profile.shot_duration.clamp_ms(shot.target_duration_ms)
+    reference_ids = collect_reference_ids(shot, packs)
+
+    # 首幀也是實際上傳的素材，其內容必須納入請求識別
+    hashed_ids = list(reference_ids)
+    if shot.first_frame_ref:
+        hashed_ids = [shot.first_frame_ref, *hashed_ids]
+
     return CapabilityRequest(
         request_id=f"req_{artifact.project_id}_{shot.shot_id}",
         capability=shot.capability,
@@ -224,11 +256,12 @@ def build_shot_request(
             prompt=shot.prompt,
             negative_prompt=shot.negative_prompt,
             first_frame_ref=shot.first_frame_ref,
-            reference_asset_ids=collect_reference_ids(shot, packs),
+            reference_asset_ids=reference_ids,
             duration_ms=duration_ms,
             aspect_ratio=shot.aspect_ratio or profile.aspect_ratio,
             camera=shot.camera.describe(),
             character_refs=list(shot.character_refs),
+            reference_hashes=resolve_reference_hashes(hashed_ids),
         ),
     )
 
@@ -240,6 +273,7 @@ async def dispatch_project_shots(
     shot_ids: list[str] | None = None,
     allow_incomplete: bool = False,
     only_provider: str | None = None,
+    extra_parameters: dict | None = None,
 ) -> ShotDispatchReport:
     """為專案的每個 ShotPlan 派工。
 
@@ -277,6 +311,10 @@ async def dispatch_project_shots(
             continue
 
         request = build_shot_request(artifact, shot, packs, profile)
+        if extra_parameters:
+            request = request.model_copy(
+                update={"parameters": {**request.parameters, **extra_parameters}}
+            )
         result = await dispatch_capability(
             request,
             profile=profile,

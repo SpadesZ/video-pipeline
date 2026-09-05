@@ -10,13 +10,33 @@ Pack 版本：`v1.0`　專案 ID：`benchmark_v1`
 刻意不產生單一「全球最佳模型」排名。一個在對話戲表現最好的模型，
 在高動態場景可能崩壞得最嚴重，把兩者平均成一個分數會抹掉這個資訊。
 
-## 目標平台
+## 比較對象（BenchmarkTarget）
 
-`kling`、`seedance`、`veo`、`runway`
+比較的單位是 **BenchmarkTarget**，不是 provider。同一平台會同時提供多個
+版本，介面上的選項名稱也未必等同 catalog 的 model_id。若只記錄「這是
+Kling 生的」，日後無從得知當時選的是哪一版，跨輪次比較會失效。
 
-> **平台規格為 provisional。** catalog 中的片長範圍、參考素材上限與支援
-> 比例皆為保守預設，**尚未經過實測**。V1 的任務之一就是校正這些值。
-> 在校正前，不得將它們當作事實引用。
+定義於 `pipeline/benchmark/catalog/v1_targets.yaml`：
+
+| 欄位 | 說明 |
+|---|---|
+| `target_id` | 唯一識別。job package、attempt ledger、評分表與統計皆以此為關聯鍵 |
+| `provider` | 平台 |
+| `model_id` | catalog 中的模型識別 |
+| `model_version` | 平台介面顯示的實際版本 |
+| `ui_label` | 平台介面上該選項的名稱 |
+| `transport` | V1 一律 `manual` |
+| `provisional` | 尚未經真人於平台確認者為 `true` |
+
+目前四個 target（`kling_default`、`seedance_default`、`veo_default`、
+`runway_default`）的 `model_id` 皆為通稱，`model_version` 未填，
+**全部標記 provisional**。
+
+> **provisional 的 target 不得視為最終模型真相。** 真人登入平台確認實際
+> 版本後，需更新 YAML 並將 `provisional` 改為 `false`。
+> 若平台提供多個版本，應為每個版本各建一個 target。
+>
+> catalog 中的片長範圍、參考素材上限與支援比例同樣是未實測的保守預設。
 
 ## 公平性約束
 
@@ -116,20 +136,120 @@ V1 Gate 只要求至少兩個平台，可先做 `6 x 2 x 3 = 36` 次再擴充。
 - 全部 0–100，**留空代表不適用，不可填 0**。0 分是「極差」，
   與「不適用」是兩件事，混用會把加權拉低。
 - `artifact_severity` 方向相反，加權時以 `100 - severity` 計入。
-- 成本（credits）目前無法由系統取得，於評分表以 `credits_used` 人工記錄。
+- 成本（credits）目前無法由系統取得，於 attempt ledger 人工記錄。
   V1 不建置成本 UI。
 
-## 核心指標
+### 適用性（依鏡頭而非情境）
 
-判定依據**不是**「最好看的那一支」，而是：
+`facial_acting` 依**鏡頭**判定，不依情境。`bm_a2_closeup_expression`
+雖屬單角色情境，但它是特寫且明確要求表情變化，是表情演技的主要觀察
+對象，必須評分。
+
+| 鏡頭 | facial_acting |
+|---|---|
+| `bm_a2_closeup_expression` | **可評** |
+| `bm_b1` / `bm_b2` / `bm_b3` | **可評** |
+| `bm_a1_walk_slow_push` | n/a（遠景看不清臉） |
+| `bm_c1_run_tracking` | n/a（高速運動） |
+
+`lip_sync_quality` 於 V1 **一律 n/a**，權重為 0，不參與任何排名。
+
+### 素材驗證
+
+`check_assets` 會實際解碼檔案，而非只看大小：
+
+- 必須能以 Pillow 解碼且為有效影像
+- 首幀比例須為 9:16（容差 ±0.05）
+- 短邊至少 512px
+- 角色設定圖不上傳平台，不限比例
+
+壞圖、假 PNG 與錯比例一律 fail-closed，不會進入派工。
+
+### 素材內容血緣
+
+派工時對**實際複製進 job package 的檔案**計算 SHA256，寫入：
+
+- `job.json` 的 `reference_hashes`
+- 請求本身的 `visual.reference_hashes`（因此納入 `request_hash`）
+- `ReferenceAsset.file_hash`（每次登錄以檔案內容重算）
+
+同一個 `asset_id` 換了圖片內容時，`request_hash` 必然改變，
+產生新的 job package 目錄，**舊 manifest 保留**。
+兩次生成用的不是同一張參考圖，這件事必須看得出來。
+
+## 嘗試紀錄（Attempt Ledger）
+
+`data/benchmark/v1/sheets/v1_attempts.csv`
+
+**每按一次 Generate 就記一列，即使沒有產出影片。** 只統計成功匯入的候選
+會嚴重高估平台表現：一個試十次才成功兩次的平台，若只看那兩支成品，
+會看起來和一次就中的平台一樣好。
+
+| 欄位 | 說明 |
+|---|---|
+| `shot_id` / `target_id` / `provider` / `model_id` | 身份 |
+| `attempt_no` | 第幾次嘗試 |
+| `status` | `success` / `failed` / `cancelled` |
+| `generation_seconds` | 平台耗時 |
+| `credits_used` | 消耗點數 |
+| `output_file` | 產出檔名，失敗留空 |
+| `variant_id` | 匯入後由 `sync` 回填，失敗列維持空白 |
+| `failure_reason` | 失敗原因 |
+
+**重試次數、耗時與成本一律以此為統計基礎**，不以匯入的候選數推算。
+`sync` 只會補齊 `variant_id`，**不會刪除任何列**。
+
+## 統計公式（預先註冊）
+
+定義於 `pipeline/benchmark/aggregation.py`，版本 `v1.0`。
+**這些公式在真人生成開始前就已寫死**，不得於看到結果後修改。
+若要調整，必須重跑全部資料。
+
+### 聚合方式
+
+一律採**中位數**。平均會被單次崩壞或單次神來一筆拉走；
+最佳值等於獎勵運氣，與「穩定產出可用鏡頭」的目標相反。
+
+| 層級 | 公式 |
+|---|---|
+| candidate quality | 該候選的加權分數（權重見下） |
+| 每 (shot, target) | 該組合所有候選 quality 的**中位數** |
+| 每 target | 各鏡頭中位數的**中位數** |
+| scenario quality | 該情境內各鏡頭中位數的**中位數** |
+| scenario stability | 該情境內各鏡頭中位數的 **IQR**（樣本少於 4 時退回全距），**越小越穩定** |
+| continuity | 該 target 所有配對加權分數的**中位數** |
+| generation time | 成功嘗試的 `generation_seconds` **中位數** |
+| credits | 全部嘗試的 `credits_used` **總和**，含失敗 |
+
+### 核心指標
 
 | 指標 | 定義 |
 |---|---|
-| **usable-shot rate** | 至少有一個可用候選的鏡頭比例。分母為分鏡表全部鏡頭，含完全生不出東西的 |
-| **retries per usable shot** | 每產出一顆可用鏡頭平均重試次數 |
-| **human minutes per usable shot** | 每產出一顆可用鏡頭平均人工修正時間 |
-| **cross-shot continuity** | 配對鏡頭的身份與場景連戲平均分 |
-| **scenario 穩定性** | 同一平台在同情境下三個候選的分數離散程度 |
+| **usable-shot rate** | `有可用候選的鏡頭數 / 有嘗試過的鏡頭數` |
+| **retries per usable shot** | `總嘗試次數（含失敗） / 有可用候選的鏡頭數` |
+| **human minutes per usable shot** | `人工修正總分鐘 / 有可用候選的鏡頭數` |
+| **failure rate** | `失敗嘗試數 / 總嘗試數` |
+
+無可用鏡頭時，`retries per usable` 與 `human minutes per usable` 回傳
+空值而非 0，避免「完全失敗」看起來像「零成本」。
+
+### benchmark 權重
+
+與 ProductionProfile 的權重分開，因為 benchmark 衡量的是模型能力，
+不是某支片的製作偏好：
+
+```
+identity_consistency 3.0    cross_shot_identity  3.0
+temporal_stability   2.0    wardrobe_continuity  2.0
+prompt_adherence     1.5    location_continuity  1.5
+motion_quality       1.5    lip_sync_quality     0.0
+camera_control       1.5
+artifact_severity    1.5   （加權時取 100 - severity）
+facial_acting        1.0
+```
+
+**`lip_sync_quality` 權重為 0**：V1 沒有音訊，也沒有嘴型 ground truth，
+一律不評、不排名。
 
 一個平均分高但每三次才成功一次的平台，在生產上不如平均分中等但穩定
 命中的平台。
@@ -139,15 +259,29 @@ V1 Gate 只要求至少兩個平台，可先做 `6 x 2 x 3 = 36` 次再擴充。
 各情境獨立評選，供 `RoutingPolicy` 依 scenario 決定派工對象。
 **不產生跨情境的總排名。**
 
-| 標籤 | 評選依據（依序） |
-|---|---|
-| **best for character dialogue** | `cross_shot_identity` → `identity_consistency` → `facial_acting` → usable-shot rate |
-| **best for cinematic camera** | `camera_control` → `temporal_stability` → usable-shot rate |
-| **best for anime-comic motion** | `motion_quality` → `artifact_severity`（反向） → `identity_consistency` |
-| **best for high-dynamic action** | `temporal_stability` → `artifact_severity`（反向） → `motion_quality` |
-| **best for low-retry production** | usable-shot rate → retries per usable → human minutes per usable |
+| 標籤 | 適用情境 | 評選依據（依序） |
+|---|---|---|
+| **best for character dialogue** | 雙角色對話 | `continuity_identity` → `identity_consistency` → `facial_acting` → usable-shot rate |
+| **best for cinematic camera** | 單角色 cinematic | `camera_control` → `temporal_stability` → usable-shot rate |
+| **best for anime-comic motion** | 單角色 + 對話 | `motion_quality` → `artifact_cleanliness` → `identity_consistency` |
+| **best for high-dynamic action** | 高動態 | `temporal_stability` → `artifact_cleanliness` → `motion_quality` |
+| **best for low-retry production** | 全部情境 | usable-shot rate → retries per usable → human minutes per usable |
 
-同一平台可同時是多個標籤的贏家，也可能一個都不是。
+同一 target 可同時是多個標籤的贏家，也可能一個都不是。
+
+### Tie-break
+
+上述依據全部相同時，依序比較（皆為越小越好）：
+
+```
+retries_per_usable → human_minutes_per_usable
+→ median_generation_seconds → target_id（字典序，確保結果可重現）
+```
+
+缺資料的維度一律排在最後，不因缺漏而意外勝出。
+
+**報表不含跨情境的總冠軍欄位。** 這不是疏漏，是刻意的：一個在對話戲
+最強的模型可能在高動態場景崩壞得最嚴重，平均成一個分數會抹掉這個資訊。
 
 ## V1 Gate 判定門檻
 

@@ -52,6 +52,7 @@ class JobPackage(BaseModel):
     prompt_path: str
     readme_path: str
     reference_paths: list[str] = Field(default_factory=list)
+    reference_hashes: dict[str, str] = Field(default_factory=dict)
 
     missing_references: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
@@ -111,7 +112,15 @@ def _provider_parameters(
         if audio.style:
             values["style"] = audio.style
 
-    values.update(request.parameters)
+    # 底線開頭的鍵為內部標記（例如 benchmark target 身份），
+    # 不屬於要交給平台填寫的欄位。
+    values.update(
+        {
+            key: value
+            for key, value in request.parameters.items()
+            if not key.startswith("_")
+        }
+    )
     values.pop("model_id", None)
     return provider.map_parameters(values)
 
@@ -242,6 +251,7 @@ def build_job_package(
     missing_references: list[str] = []
     copied_names: list[str] = []
     copied_paths: list[str] = []
+    copied_hashes: dict[str, str] = {}
 
     for asset_id in _collect_reference_ids(request):
         source = resolved_refs.get(asset_id)
@@ -253,6 +263,8 @@ def build_job_package(
         shutil.copyfile(source_path, target)
         copied_names.append(target.name)
         copied_paths.append(str(target))
+        # 對實際複製進 package 的檔案重算雜湊，作為這份工作的素材憑證
+        copied_hashes[asset_id] = file_sha256(target)
 
     if missing_references:
         warnings.append(
@@ -281,6 +293,9 @@ def build_job_package(
         "profile_version": request.profile_version,
         "provider_parameters": parameters,
         "reference_files": copied_names,
+        # 素材內容憑證。同一 asset_id 換圖後雜湊改變，可據此辨識
+        # 兩次生成用的並非同一張參考圖。
+        "reference_hashes": copied_hashes,
         "missing_references": missing_references,
         "warnings": warnings,
         # 完整請求，API transport 未來直接讀取此欄位
@@ -315,6 +330,7 @@ def build_job_package(
         prompt_path=str(prompt_path),
         readme_path=str(readme_path),
         reference_paths=copied_paths,
+        reference_hashes=copied_hashes,
         missing_references=missing_references,
         warnings=warnings,
     )
