@@ -11,8 +11,17 @@
 #   統計公式於 aggregation.py 預先固定，不得在看到結果後調整。
 # --------------------------------------------------------------------------
 
-from pipeline.benchmark import aggregation, attempts, v1_pack
+from pipeline.benchmark import aggregation, attempts, attribution, v1_pack
 from pipeline.benchmark.asset_validation import ImageCheck, validate_image
+from pipeline.benchmark.attribution import (
+    AmbiguousAttribution,
+    AttributedVariant,
+    AttributionIndex,
+    auto_select_benchmark_candidates,
+    build_index,
+    resolve_variant_target_id,
+    select_benchmark_candidate,
+)
 from pipeline.benchmark.attempts import (
     Attempt,
     AttemptLedger,
@@ -40,17 +49,25 @@ from pipeline.benchmark.target import (
 )
 
 __all__ = [
+    "AmbiguousAttribution",
     "AssetReport",
     "AssetStatus",
     "Attempt",
     "AttemptLedger",
     "AttemptStatus",
+    "AttributedVariant",
+    "AttributionIndex",
     "BenchmarkTarget",
     "ImageCheck",
     "TargetRegistry",
     "aggregation",
     "attempts",
+    "attribution",
+    "auto_select_benchmark_candidates",
     "build_artifact",
+    "build_index",
+    "resolve_variant_target_id",
+    "select_benchmark_candidate",
     "check_assets",
     "dispatch_all",
     "dispatch_target",

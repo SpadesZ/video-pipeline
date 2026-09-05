@@ -1,11 +1,11 @@
 # 檔案路徑: video-pipeline/pipeline/benchmark/aggregation.py
 # 產生時間: 2026-09-05 +08:00
-# 版本: v1.0
+# 版本: v2.0
 # 模組定位:
 #   V1 Benchmark 統計公式（預先註冊）。
 # 主要責任:
 #   1. 在看到任何真實結果前，固定所有聚合方式與排序規則。
-#   2. 依情境產生各自的優勝對象，不產生跨情境總冠軍。
+#   2. 以情境為單位聚合，依情境產生各自的優勝對象。
 # 說明:
 #   本檔案的公式在真人生成開始前就已寫死。測完再挑對自己有利的算法
 #   會讓 benchmark 失去意義，因此聚合方式、失敗計入方式與 tie-break
@@ -14,6 +14,10 @@
 #   聚合一律採中位數而非平均或最佳值：
 #     平均會被單次崩壞或單次神來一筆拉走；
 #     最佳值等於獎勵運氣，與「穩定產出可用鏡頭」的目標相反。
+#
+#   情境獎項只能使用該情境的資料。用全域平均去評「對話戲最佳」，
+#   等於讓高動態場景的表現污染對話戲的結論。唯一例外是明確跨情境的
+#   低重試獎，它衡量的就是整體生產成本。
 # --------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ from pipeline.benchmark.attempts import AttemptLedger
 from pipeline.benchmark.target import BenchmarkTarget, targets
 from pipeline.models.production_profile import QCWeights
 
-AGGREGATION_VERSION = "v1.0"
+AGGREGATION_VERSION = "v2.0"
 
 # 各維度在 benchmark 排名中的權重。與 ProductionProfile 的權重分開，
 # 因為 benchmark 要衡量的是模型能力，不是某支片的製作偏好。
@@ -46,6 +50,8 @@ BENCHMARK_WEIGHTS = QCWeights(
     # V1 沒有音訊 ground truth，嘴型不參與排名
     lip_sync_quality=0.0,
 )
+
+GLOBAL_SCOPE = "__global__"
 
 
 class ScenarioAward(StrEnum):
@@ -87,18 +93,14 @@ AWARD_CRITERIA: dict[ScenarioAward, tuple[tuple[str, bool], ...]] = {
     ),
 }
 
-# 各獎項對應的情境。低重試獎跨全部情境，其餘限定於相關情境。
-AWARD_SCENARIOS: dict[ScenarioAward, tuple[str, ...]] = {
-    ScenarioAward.CHARACTER_DIALOGUE: ("two_character_dialogue",),
-    ScenarioAward.CINEMATIC_CAMERA: ("single_character_cinematic",),
-    ScenarioAward.ANIME_COMIC_MOTION: (
-        "single_character_cinematic",
-        "two_character_dialogue",
-    ),
-    ScenarioAward.HIGH_DYNAMIC_ACTION: ("high_dynamic_action",),
-    ScenarioAward.LOW_RETRY_PRODUCTION: tuple(
-        item.scenario_id for item in v1_pack.SCENARIOS
-    ),
+# 各獎項的評分範圍。單一情境的獎項只讀該情境的資料；
+# 低重試獎明確跨情境，讀全域聚合。
+AWARD_SCOPE: dict[ScenarioAward, str] = {
+    ScenarioAward.CHARACTER_DIALOGUE: "two_character_dialogue",
+    ScenarioAward.CINEMATIC_CAMERA: "single_character_cinematic",
+    ScenarioAward.ANIME_COMIC_MOTION: "two_character_dialogue",
+    ScenarioAward.HIGH_DYNAMIC_ACTION: "high_dynamic_action",
+    ScenarioAward.LOW_RETRY_PRODUCTION: GLOBAL_SCOPE,
 }
 
 # tie-break：上述依據全部相同時的最終排序，一律以生產成本較低者勝出。
@@ -141,32 +143,26 @@ class ShotAggregate(BaseModel):
         return self.usable > 0
 
 
-class TargetAggregate(BaseModel):
-    """單一比較對象的統計結果。所有欄位的計算方式皆預先固定。"""
+class ScopedAggregate(BaseModel):
+    """某個範圍（單一情境或全域）內的統計。
 
-    target_id: str
-    provider: str
-    model_id: str
-    model_version: str | None = None
-    provisional: bool = True
+    所有指標的計算方式與全域一致，差別只在納入哪些鏡頭。
+    情境獎項讀對應情境的實例，跨情境獎項讀全域實例。
+    """
 
+    scope: str
     shots: list[ShotAggregate] = Field(default_factory=list)
-
     total_attempts: int = 0
     failed_attempts: int = 0
     total_credits: float = 0.0
     total_human_minutes: float = 0.0
     generation_seconds: list[float] = Field(default_factory=list)
-
     dimension_scores: dict[str, list[float]] = Field(default_factory=dict)
     continuity_scores: list[float] = Field(default_factory=list)
     continuity_identity_scores: list[float] = Field(default_factory=list)
 
-    # ---- 核心指標 ----
-
     @property
     def attempted_shots(self) -> int:
-        """有嘗試過的鏡頭數。分母只計實際派工並嘗試過的鏡頭。"""
         return sum(1 for shot in self.shots if shot.attempts > 0)
 
     @property
@@ -181,7 +177,6 @@ class TargetAggregate(BaseModel):
 
     @property
     def retries_per_usable(self) -> float | None:
-        """每產出一顆可用鏡頭的平均嘗試次數，含失敗。"""
         if not self.usable_shots:
             return None
         return round(self.total_attempts / self.usable_shots, 3)
@@ -205,9 +200,21 @@ class TargetAggregate(BaseModel):
     @property
     def median_quality(self) -> float | None:
         values = [
-            shot.median_quality for shot in self.shots if shot.median_quality is not None
+            shot.median_quality
+            for shot in self.shots
+            if shot.median_quality is not None
         ]
         return _median(values)
+
+    @property
+    def stability(self) -> float | None:
+        """各鏡頭品質的四分位距。數值越小代表表現越穩定。"""
+        values = [
+            shot.median_quality
+            for shot in self.shots
+            if shot.median_quality is not None
+        ]
+        return _iqr(values)
 
     @property
     def continuity_identity(self) -> float | None:
@@ -226,37 +233,72 @@ class TargetAggregate(BaseModel):
         severity = self.dimension("artifact_severity")
         return None if severity is None else round(100 - severity, 3)
 
-    def scenario_qualities(self, scenario_id: str) -> list[float]:
-        return [
-            shot.median_quality
-            for shot in self.shots
-            if shot.scenario == scenario_id and shot.median_quality is not None
-        ]
+    @property
+    def has_data(self) -> bool:
+        return bool(self.shots) and self.attempted_shots > 0
 
-    def scenario_quality(self, scenario_id: str) -> float | None:
-        return _median(self.scenario_qualities(scenario_id))
-
-    def scenario_stability(self, scenario_id: str) -> float | None:
-        """情境內各鏡頭品質的四分位距。數值越小代表表現越穩定。"""
-        return _iqr(self.scenario_qualities(scenario_id))
-
-    def metric(self, name: str) -> float | str | None:
-        """供排序使用的統一取值入口。"""
-        if name == "target_id":
-            return self.target_id
+    def metric(self, name: str) -> float | None:
         if hasattr(self, name):
             return getattr(self, name)
-        if name == "continuity_identity":
-            return self.continuity_identity
         return self.dimension(name)
+
+
+class TargetAggregate(BaseModel):
+    """單一比較對象的統計。global 為跨情境，scenarios 為各情境獨立。"""
+
+    target_id: str
+    provider: str
+    model_id: str
+    model_version: str | None = None
+    provisional: bool = True
+
+    overall: ScopedAggregate
+    scenarios: dict[str, ScopedAggregate] = Field(default_factory=dict)
+
+    model_config = {"protected_namespaces": ()}
+
+    def scope(self, scope_id: str) -> ScopedAggregate | None:
+        if scope_id == GLOBAL_SCOPE:
+            return self.overall
+        return self.scenarios.get(scope_id)
+
+    # 便利屬性，供報表摘要使用
+    @property
+    def usable_shot_rate(self) -> float | None:
+        return self.overall.usable_shot_rate
+
+    @property
+    def retries_per_usable(self) -> float | None:
+        return self.overall.retries_per_usable
+
+    @property
+    def human_minutes_per_usable(self) -> float | None:
+        return self.overall.human_minutes_per_usable
+
+    @property
+    def total_attempts(self) -> int:
+        return self.overall.total_attempts
+
+    @property
+    def failed_attempts(self) -> int:
+        return self.overall.failed_attempts
+
+    @property
+    def total_credits(self) -> float:
+        return self.overall.total_credits
+
+    @property
+    def median_generation_seconds(self) -> float | None:
+        return self.overall.median_generation_seconds
 
 
 class AwardResult(BaseModel):
     award: str
-    scenarios: list[str] = Field(default_factory=list)
+    scope: str
     winner: str | None = None
     ranking: list[str] = Field(default_factory=list)
     reason: str = ""
+    note: str = ""
 
 
 class BenchmarkReport(BaseModel):
@@ -267,46 +309,72 @@ class BenchmarkReport(BaseModel):
     awards: list[AwardResult] = Field(default_factory=list)
     ledger_errors: list[str] = Field(default_factory=list)
     provisional_targets: list[str] = Field(default_factory=list)
+    unattributed_variants: list[str] = Field(default_factory=list)
 
     def by_target(self, target_id: str) -> TargetAggregate | None:
         return next(
             (item for item in self.aggregates if item.target_id == target_id), None
         )
 
+    def award(self, award_id: str) -> AwardResult | None:
+        return next((item for item in self.awards if item.award == award_id), None)
+
 
 def _sort_key(
-    aggregate: TargetAggregate, criteria: tuple[tuple[str, bool], ...]
+    scoped: ScopedAggregate,
+    target_id: str,
+    criteria: tuple[tuple[str, bool], ...],
 ) -> tuple:
     key: list = []
     for name, ascending in (*criteria, *FINAL_TIE_BREAK):
-        value = aggregate.metric(name)
+        if name == "target_id":
+            key.append((0, target_id))
+            continue
+        value = scoped.metric(name)
         if value is None:
             # 缺資料一律排在最後，不因缺漏而意外勝出
-            key.append((1, 0))
-            continue
-        if isinstance(value, str):
-            key.append((0, value if ascending else value[::-1]))
+            key.append((1, 0.0))
             continue
         key.append((0, value if ascending else -value))
     return tuple(key)
+
+
+def _new_scope(scope_id: str, shot_ids: list[str]) -> ScopedAggregate:
+    return ScopedAggregate(
+        scope=scope_id,
+        shots=[
+            ShotAggregate(
+                shot_id=shot_id, scenario=v1_pack.SHOT_SCENARIOS[shot_id]
+            )
+            for shot_id in shot_ids
+        ],
+    )
 
 
 def build_report(
     ledger: AttemptLedger,
     variant_records: list[dict],
     continuity_records: list[dict],
+    unattributed: list[str] | None = None,
 ) -> BenchmarkReport:
     """依預先註冊的公式產生報表。
 
     variant_records 每筆需含 target_id、shot_id、weighted_score、
     usable、human_minutes 與各維度分數。
-    continuity_records 每筆需含 target_id、weighted_score 與 cross_shot_identity。
+    continuity_records 每筆需含 target_id、shot_id、weighted_score
+    與 cross_shot_identity；shot_id 用於判定該筆屬於哪個情境。
     """
     registry = targets()
     report = BenchmarkReport(ledger_errors=list(ledger.errors))
     report.provisional_targets = [
         item.target_id for item in registry.provisional_targets
     ]
+    report.unattributed_variants = list(unattributed or [])
+
+    all_shots = [shot.shot_id for shot in v1_pack.shots()]
+    by_scenario: dict[str, list[str]] = {}
+    for shot_id in all_shots:
+        by_scenario.setdefault(v1_pack.SHOT_SCENARIOS[shot_id], []).append(shot_id)
 
     aggregates: dict[str, TargetAggregate] = {}
 
@@ -318,15 +386,20 @@ def build_report(
                 model_id=target.model_id,
                 model_version=target.model_version,
                 provisional=target.provisional,
-                shots=[
-                    ShotAggregate(
-                        shot_id=shot.shot_id,
-                        scenario=v1_pack.SHOT_SCENARIOS[shot.shot_id],
-                    )
-                    for shot in v1_pack.shots()
-                ],
+                overall=_new_scope(GLOBAL_SCOPE, all_shots),
+                scenarios={
+                    scenario_id: _new_scope(scenario_id, shot_ids)
+                    for scenario_id, shot_ids in by_scenario.items()
+                },
             )
         return aggregates[target.target_id]
+
+    def scopes_for(aggregate: TargetAggregate, shot_id: str) -> list[ScopedAggregate]:
+        scenario_id = v1_pack.SHOT_SCENARIOS.get(shot_id)
+        result = [aggregate.overall]
+        if scenario_id and scenario_id in aggregate.scenarios:
+            result.append(aggregate.scenarios[scenario_id])
+        return result
 
     # 嘗試紀錄是重試、耗時與成本的唯一來源
     for attempt in ledger.attempts:
@@ -334,81 +407,95 @@ def build_report(
         if target is None:
             continue
         aggregate = ensure(target)
-        aggregate.total_attempts += 1
-        if not attempt.succeeded:
-            aggregate.failed_attempts += 1
-        if attempt.credits_used:
-            aggregate.total_credits += attempt.credits_used
-        if attempt.generation_seconds and attempt.succeeded:
-            aggregate.generation_seconds.append(attempt.generation_seconds)
-
-        shot = next(
-            (item for item in aggregate.shots if item.shot_id == attempt.shot_id), None
-        )
-        if shot is not None:
-            shot.attempts += 1
-            if attempt.succeeded:
-                shot.successes += 1
+        for scoped in scopes_for(aggregate, attempt.shot_id):
+            scoped.total_attempts += 1
+            if not attempt.succeeded:
+                scoped.failed_attempts += 1
+            if attempt.credits_used:
+                scoped.total_credits += attempt.credits_used
+            if attempt.generation_seconds and attempt.succeeded:
+                scoped.generation_seconds.append(attempt.generation_seconds)
+            shot = next(
+                (item for item in scoped.shots if item.shot_id == attempt.shot_id),
+                None,
+            )
+            if shot is not None:
+                shot.attempts += 1
+                if attempt.succeeded:
+                    shot.successes += 1
 
     for record in variant_records:
         target = registry.by_id(record["target_id"])
         if target is None:
             continue
         aggregate = ensure(target)
-        shot = next(
-            (item for item in aggregate.shots if item.shot_id == record["shot_id"]),
-            None,
-        )
-        if shot is None:
-            continue
-        quality = record.get("weighted_score")
-        if quality is not None:
-            shot.candidate_qualities.append(quality)
-        if record.get("usable"):
-            shot.usable += 1
-        if record.get("human_minutes"):
-            aggregate.total_human_minutes += record["human_minutes"]
-        for name, value in (record.get("dimensions") or {}).items():
-            if value is not None:
-                aggregate.dimension_scores.setdefault(name, []).append(value)
+        for scoped in scopes_for(aggregate, record["shot_id"]):
+            shot = next(
+                (item for item in scoped.shots if item.shot_id == record["shot_id"]),
+                None,
+            )
+            if shot is None:
+                continue
+            quality = record.get("weighted_score")
+            if quality is not None:
+                shot.candidate_qualities.append(quality)
+            if record.get("usable"):
+                shot.usable += 1
+            if record.get("human_minutes"):
+                scoped.total_human_minutes += record["human_minutes"]
+            for name, value in (record.get("dimensions") or {}).items():
+                if value is not None:
+                    scoped.dimension_scores.setdefault(name, []).append(value)
 
     for record in continuity_records:
         target = registry.by_id(record["target_id"])
         if target is None:
             continue
         aggregate = ensure(target)
-        if record.get("weighted_score") is not None:
-            aggregate.continuity_scores.append(record["weighted_score"])
-        if record.get("cross_shot_identity") is not None:
-            aggregate.continuity_identity_scores.append(record["cross_shot_identity"])
+        # 連戲屬於主鏡頭所在的情境
+        for scoped in scopes_for(aggregate, record.get("shot_id", "")):
+            if record.get("weighted_score") is not None:
+                scoped.continuity_scores.append(record["weighted_score"])
+            if record.get("cross_shot_identity") is not None:
+                scoped.continuity_identity_scores.append(
+                    record["cross_shot_identity"]
+                )
 
     report.aggregates = [aggregates[key] for key in sorted(aggregates)]
 
     # 各情境獨立評選，刻意不產生跨情境總冠軍
     for award, criteria in AWARD_CRITERIA.items():
-        scenarios = AWARD_SCENARIOS[award]
-        eligible = [
-            item
-            for item in report.aggregates
-            if any(item.scenario_qualities(scenario) for scenario in scenarios)
-        ]
+        scope_id = AWARD_SCOPE[award]
+        eligible: list[tuple[str, ScopedAggregate]] = []
+        for aggregate in report.aggregates:
+            scoped = aggregate.scope(scope_id)
+            if scoped is not None and scoped.has_data:
+                eligible.append((aggregate.target_id, scoped))
+
         if not eligible:
             report.awards.append(
                 AwardResult(
                     award=award.value,
-                    scenarios=list(scenarios),
-                    reason="無足夠資料",
+                    scope=scope_id,
+                    reason=" > ".join(name for name, _ in criteria),
+                    note="無足夠資料",
                 )
             )
             continue
-        ranked = sorted(eligible, key=lambda item: _sort_key(item, criteria))
+
+        ranked = sorted(
+            eligible, key=lambda item: _sort_key(item[1], item[0], criteria)
+        )
         report.awards.append(
             AwardResult(
                 award=award.value,
-                scenarios=list(scenarios),
-                winner=ranked[0].target_id,
-                ranking=[item.target_id for item in ranked],
+                scope=scope_id,
+                winner=ranked[0][0],
+                ranking=[target_id for target_id, _ in ranked],
                 reason=" > ".join(name for name, _ in criteria),
+                note=(
+                    "跨情境指標" if scope_id == GLOBAL_SCOPE else "僅使用該情境資料"
+                ),
             )
         )
 

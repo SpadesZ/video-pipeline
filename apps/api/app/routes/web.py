@@ -924,6 +924,7 @@ def page(title: str, body: str, active_nav: str = "") -> str:
       <a class="nav-brand" href="/">Video Pipeline MVP</a>
       <div class="nav-links">
         <a href="/" class="{'active' if active_nav == 'projects' else ''}">Projects</a>
+        <a href="/benchmark" class="{'active' if active_nav == 'benchmark' else ''}">Benchmark</a>
         <a href="/settings/lava" class="{'active' if active_nav == 'lava' else ''}">LAVA Settings</a>
         <a href="/docs">API Docs</a>
       </div>
@@ -1366,6 +1367,17 @@ def variant_panel(artifact: ProductionArtifact) -> str:
         logger.warning("Failed to load variants: %s", error)
         variants, summary = [], None
 
+    # benchmark 歸屬走派工血緣。沒有血緣的候選不屬於任何比較對象，
+    # 必須在介面上標示出來，否則使用者會以為它已計入統計。
+    attributions: dict[str, object] = {}
+    try:
+        from pipeline.benchmark.attribution import build_index
+
+        index = build_index(project_id)
+        attributions = {item.variant_id: item for item in index.items}
+    except Exception as error:  # noqa: BLE001 - 非 benchmark 專案無需歸屬
+        logger.debug("Attribution unavailable for %s: %s", project_id, error)
+
     by_shot: dict[str, list] = {}
     for variant in variants:
         by_shot.setdefault(variant.shot_id, []).append(variant)
@@ -1398,15 +1410,38 @@ def variant_panel(artifact: ProductionArtifact) -> str:
                 else "?"
             )
             selected = " selected" if variant.is_selected else ""
+            attributed = attributions.get(variant.variant_id)
+            if attributed is None:
+                origin = (
+                    f'<span class="mono">{escape(variant.provider)}</span>'
+                    '<br /><span class="muted" title="沒有派工來源，不計入 benchmark">'
+                    "未歸屬</span>"
+                )
+                bench_cta = '<span class="muted">無法選為代表作</span>'
+            else:
+                mark = " ★" if attributed.benchmark_selected else ""
+                origin = (
+                    f'<span class="mono">{escape(attributed.target_id)}</span>{mark}'
+                    f'<br /><span class="muted mono">{escape(attributed.model_id)}'
+                    f"{escape(' @' + attributed.model_version) if attributed.model_version else ''}"
+                    "</span>"
+                )
+                bench_cta = (
+                    f'<form method="post" action="/benchmark/variants/'
+                    f'{escape(variant.variant_id)}/benchmark-select" class="inline-form">'
+                    '<button class="ghost-button" type="submit">設為代表作</button>'
+                    "</form>"
+                )
             rows.append(
                 f"""
             <tr class="variant-row{selected}">
               <td class="mono">{escape(variant.variant_id[-16:])}</td>
-              <td>{escape(variant.provider)}</td>
+              <td>{origin}</td>
               <td class="mono">{escape(duration)}</td>
               <td class="mono">{escape(variant.resolution or "?")}</td>
               <td>{escape(variant.status)}</td>
               <td>
+                {bench_cta}
                 <form method="post" action="/projects/{escape(project_id)}/variants/{escape(variant.variant_id)}/select" class="inline-form">
                   <input name="reason" placeholder="reason" />
                   <button class="ghost-button" type="submit">Select</button>
@@ -1432,7 +1467,7 @@ def variant_panel(artifact: ProductionArtifact) -> str:
         <div class="variant-group">
           <strong class="mono">{escape(shot.shot_id)}</strong>
           <table class="data-table">
-            <thead><tr><th>Variant</th><th>Provider</th><th>Actual</th><th>Res</th><th>Status</th><th>Select</th><th>QC (0-100, blank = N/A)</th></tr></thead>
+            <thead><tr><th>Variant</th><th>Target / Model</th><th>Actual</th><th>Res</th><th>Status</th><th>選定</th><th>QC (0-100, blank = N/A)</th></tr></thead>
             <tbody>{"".join(rows)}</tbody>
           </table>
         </div>

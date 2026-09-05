@@ -178,12 +178,20 @@ class AssetVariant(SQLModel, table=True):
 
     file_hash: str | None = Field(default=None, index=True)
     local_path: str | None = None
+    # 匯入時檔案會改名為 variant_id，保留原始檔名才能與嘗試紀錄的
+    # output_file 精確對應，不必依匯入順序猜測。
+    original_filename: str | None = Field(default=None, index=True)
 
     status: str = Field(
         default=VariantStatus.PENDING.value,
         sa_column=Column(String, nullable=False, index=True),
     )
     selected_reason: str | None = None
+
+    # benchmark 專用。production 的 status=selected 是每顆鏡頭全域單選，
+    # 用於決定成片素材；benchmark 需要每個比較對象各自選一支代表作，
+    # 同一顆鏡頭會同時有多支被選中。兩者語義不同，不可共用欄位。
+    benchmark_selected: bool | None = Field(default=None, index=True)
 
     cost: GenerationCost | None = Field(
         default=None, sa_column=Column(PydanticJSON(GenerationCost))

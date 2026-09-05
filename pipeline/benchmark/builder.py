@@ -23,7 +23,7 @@ from sqlmodel import Session, select
 
 from pipeline.benchmark import v1_pack
 from pipeline.benchmark.asset_validation import validate_image
-from pipeline.benchmark.target import BenchmarkTarget, targets
+from pipeline.benchmark.target import BenchmarkTarget, targets, validate_target
 from pipeline.models.production_artifact import ProductionArtifact
 from pipeline.models.production_profile import load_preset
 from pipeline.models.reference_asset import ReferenceAsset, ReferenceRights
@@ -186,9 +186,15 @@ async def dispatch_target(
     target 身份以底線前綴寫入 request.parameters，因此會進入
     job manifest 與工作快照，但不會混入交給平台的參數欄位。
     """
+    # 派工前確認 target 對應到 catalog 中真實可用的模型。
+    # 只貼標籤而不驗證，標籤與實際生成的模型可能不同。
+    for shot in artifact.shot_plans:
+        validate_target(target, shot.capability)
+
     return await dispatch_project_shots(
         artifact,
         only_provider=target.provider,
+        only_model_id=target.model_id,
         preferred_provider=target.provider,
         extra_parameters={
             "_bm_target_id": target.target_id,

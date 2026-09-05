@@ -30,6 +30,7 @@ if str(ROOT) not in sys.path:
 
 from pipeline.benchmark import (
     attempts,
+    attribution,
     builder,
     score_import,
     score_sheet,
@@ -160,10 +161,21 @@ def cmd_sync() -> int:
     if pairs == 0:
         print("      連戲配對需要兩顆鏡頭都已選定候選（Select）")
 
-    updated, total = attempts.sync_variant_ids(
+    auto_selected = attribution.auto_select_benchmark_candidates(
+        v1_pack.BENCHMARK_PROJECT_ID
+    )
+    if auto_selected:
+        print(f"代表作:   自動選定 {auto_selected} 組（可於 UI 改選）")
+
+    attempt_report = attempts.sync_variant_ids(
         directory / attempts.ATTEMPTS_SHEET, v1_pack.BENCHMARK_PROJECT_ID
     )
-    print(f"嘗試紀錄: 補齊 {updated} 列 variant_id，共 {total} 列（失敗紀錄保留）")
+    print(
+        f"嘗試紀錄: 補齊 {attempt_report.updated} 列 variant_id，"
+        f"共 {attempt_report.total} 列（失敗紀錄保留）"
+    )
+    for problem in attempt_report.unresolved:
+        print(f"    ! {problem}", file=sys.stderr)
 
     if variant_rows == 0:
         print("尚未匯入任何候選影片，請先於專案頁匯入", file=sys.stderr)

@@ -151,24 +151,69 @@ def write_all(
     )
 
 
-def _variants_by_key(project_id: str) -> dict[tuple[str, str], list]:
-    from pipeline.stages.variant_importer import list_variants
+# 人工填寫的欄位。sync 重寫檔案時必須原樣保留，
+# 否則已評好的分數會在補齊 variant_id 時被清空。
+VARIANT_USER_COLUMNS = (
+    "generation_seconds",
+    "credits_used",
+    "retries_to_usable",
+    "human_correction_minutes",
+    "identity_consistency",
+    "temporal_stability",
+    "prompt_adherence",
+    "motion_quality",
+    "camera_control",
+    "facial_acting",
+    "artifact_severity",
+    "usable_without_repair",
+    "notes",
+)
 
-    grouped: dict[tuple[str, str], list] = {}
-    for variant in list_variants(project_id):
-        grouped.setdefault((variant.shot_id, variant.provider), []).append(variant)
-    for items in grouped.values():
-        items.sort(key=lambda item: item.created_at)
-    return grouped
+CONTINUITY_USER_COLUMNS = (
+    "cross_shot_identity",
+    "wardrobe_continuity",
+    "location_continuity",
+    "lip_sync_quality",
+    "notes",
+)
+
+
+def _load_existing(path: Path, key_columns: tuple[str, ...]) -> dict[tuple, dict]:
+    """讀取既有 CSV，以指定欄位組合為鍵。檔案不存在時回傳空字典。"""
+    if not path.exists():
+        return {}
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    existing: dict[tuple, dict] = {}
+    for row in rows:
+        key = tuple((row.get(column) or "").strip() for column in key_columns)
+        if any(key):
+            existing[key] = row
+    return existing
+
+
+def _preserve(row: dict, previous: dict | None, columns: tuple[str, ...]) -> None:
+    for column in columns:
+        value = (previous or {}).get(column)
+        if value is not None and str(value).strip() != "":
+            row[column] = value
 
 
 def sync_variant_sheet(output_dir: Path, project_id: str) -> tuple[Path, int]:
-    """依實際匯入的候選重寫評分表，回填 variant_id 與檔名。"""
-    grouped = _variants_by_key(project_id)
-    target_list = list(targets().targets)
+    """依實際匯入的候選重寫評分表。
 
+    歸屬走 job lineage 而非 (shot_id, provider)：同一平台可能同時測試
+    多個版本，以平台分組會把不同比較對象的候選混在一起。
+
+    已填寫的人工欄位一律沿用。sync 只補系統欄位，不得把辛苦評好的分數
+    連同 variant_id 一起重置。
+    """
+    from pipeline.benchmark.attribution import build_index
+
+    attribution = build_index(project_id)
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / VARIANT_SHEET
+    previous = _load_existing(path, ("variant_id",))
     rows = 0
 
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
@@ -176,9 +221,9 @@ def sync_variant_sheet(output_dir: Path, project_id: str) -> tuple[Path, int]:
         writer.writeheader()
         for shot in v1_pack.shots():
             scenario = v1_pack.SHOT_SCENARIOS[shot.shot_id]
-            for target in target_list:
-                items = grouped.get((shot.shot_id, target.provider), [])
-                for index, variant in enumerate(items, start=1):
+            for target in targets().targets:
+                entries = attribution.for_shot(target.target_id, shot.shot_id)
+                for index, entry in enumerate(entries, start=1):
                     row = {column: "" for column in VARIANT_COLUMNS}
                     row["scenario"] = scenario
                     row["shot_id"] = shot.shot_id
@@ -187,32 +232,35 @@ def sync_variant_sheet(output_dir: Path, project_id: str) -> tuple[Path, int]:
                     row["model_id"] = target.model_id
                     row["model_version"] = target.model_version or ""
                     row["candidate_no"] = index
-                    row["variant_id"] = variant.variant_id
-                    row["video_filename"] = (
-                        Path(variant.local_path).name if variant.local_path else ""
-                    )
+                    row["variant_id"] = entry.variant_id
+                    row["video_filename"] = entry.file_name or ""
                     row["facial_acting"] = _facial_cell(shot.shot_id)
+                    _preserve(
+                        row, previous.get((entry.variant_id,)), VARIANT_USER_COLUMNS
+                    )
                     writer.writerow(row)
                     rows += 1
     return path, rows
 
 
 def sync_continuity_sheet(output_dir: Path, project_id: str) -> tuple[Path, int]:
-    """依已選定的候選建立連戲配對。
+    """依 benchmark 代表作建立連戲配對。
 
-    連戲比較的是兩支實際影片，因此只針對已選定（selected）的候選建立
-    配對。兩支必須來自同一個比較對象，跨平台或跨版本的配對沒有意義。
+    使用 benchmark_selected 而非 production 的 status=selected：
+    後者每顆鏡頭全域只能有一支，四個比較對象就無法各自成對。
     """
-    from pipeline.models.variant import VariantStatus
-    from pipeline.stages.variant_importer import list_variants
+    from pipeline.benchmark.attribution import build_index
 
-    selected_by_key: dict[tuple[str, str], object] = {}
-    for variant in list_variants(project_id):
-        if variant.status == VariantStatus.SELECTED:
-            selected_by_key[(variant.shot_id, variant.provider)] = variant
+    attribution = build_index(project_id)
+    selection = {
+        (item.target_id, item.shot_id): item.variant_id
+        for item in attribution.items
+        if item.benchmark_selected
+    }
 
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / CONTINUITY_SHEET
+    previous = _load_existing(path, ("target_id", "shot_id", "ref_shot_id"))
     rows = 0
 
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
@@ -221,8 +269,6 @@ def sync_continuity_sheet(output_dir: Path, project_id: str) -> tuple[Path, int]
         for shot_id, ref_shot_id in v1_pack.CONTINUITY_PAIRS:
             scenario = v1_pack.SHOT_SCENARIOS[shot_id]
             for target in targets().targets:
-                primary = selected_by_key.get((shot_id, target.provider))
-                reference = selected_by_key.get((ref_shot_id, target.provider))
                 row = {column: "" for column in CONTINUITY_COLUMNS}
                 row["scenario"] = scenario
                 row["shot_id"] = shot_id
@@ -230,9 +276,16 @@ def sync_continuity_sheet(output_dir: Path, project_id: str) -> tuple[Path, int]
                 row["target_id"] = target.target_id
                 row["provider"] = target.provider
                 row["model_id"] = target.model_id
-                row["variant_id"] = getattr(primary, "variant_id", "") or ""
-                row["ref_variant_id"] = getattr(reference, "variant_id", "") or ""
+                row["variant_id"] = selection.get((target.target_id, shot_id), "")
+                row["ref_variant_id"] = selection.get(
+                    (target.target_id, ref_shot_id), ""
+                )
                 row["lip_sync_quality"] = _lip_sync_cell()
+                _preserve(
+                    row,
+                    previous.get((target.target_id, shot_id, ref_shot_id)),
+                    CONTINUITY_USER_COLUMNS,
+                )
                 writer.writerow(row)
                 if row["variant_id"] and row["ref_variant_id"]:
                     rows += 1

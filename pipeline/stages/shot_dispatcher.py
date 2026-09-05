@@ -273,6 +273,7 @@ async def dispatch_project_shots(
     shot_ids: list[str] | None = None,
     allow_incomplete: bool = False,
     only_provider: str | None = None,
+    only_model_id: str | None = None,
     extra_parameters: dict | None = None,
 ) -> ShotDispatchReport:
     """為專案的每個 ShotPlan 派工。
@@ -321,6 +322,7 @@ async def dispatch_project_shots(
             scenario_type=scenario_type,
             preferred_provider=preferred_provider,
             only_provider=only_provider,
+            only_model_id=only_model_id,
         )
         package_dir = result.outputs[0] if result.outputs else None
         message = result.error_message

@@ -321,6 +321,7 @@ def import_variants(
                     fps=media.fps,
                     file_hash=digest,
                     local_path=str(destination),
+                    original_filename=filename,
                     status=VariantStatus.IMPORTED.value,
                     generation_timestamp=datetime.now(timezone.utc),
                 )

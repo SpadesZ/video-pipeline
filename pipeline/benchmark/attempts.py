@@ -218,51 +218,151 @@ def read_ledger(path: Path) -> AttemptLedger:
     return ledger
 
 
-def sync_variant_ids(path: Path, project_id: str) -> tuple[int, int]:
+def append_attempt(
+    path: Path,
+    shot_id: str,
+    target_id: str,
+    status: str,
+    output_file: str | None = None,
+    generation_seconds: str | None = None,
+    credits_used: str | None = None,
+    failure_reason: str | None = None,
+) -> int:
+    """追加一筆嘗試紀錄，回傳該組合的第幾次嘗試。
+
+    以追加而非覆寫的方式寫入：實際重試次數常多於預留列數，
+    而每一次嘗試都必須留下痕跡。
+    """
+    registry = targets()
+    target = registry.by_id(target_id)
+    if target is None:
+        raise ValueError(f"未登錄的比較對象: {target_id}")
+    if shot_id not in v1_pack.SHOT_SCENARIOS:
+        raise ValueError(f"未知的鏡頭: {shot_id}")
+    normalised = (status or "").strip().lower()
+    if normalised not in VALID_STATUSES:
+        raise ValueError(
+            f"無效的結果: {status!r}，應為 {'/'.join(sorted(VALID_STATUSES))}"
+        )
+    if normalised == AttemptStatus.SUCCESS and not (output_file or "").strip():
+        raise ValueError("成功的嘗試必須填寫產出檔名，否則無法與匯入的候選對應")
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+    if path.exists():
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+
+    existing = [
+        row
+        for row in rows
+        if (row.get("shot_id") or "").strip() == shot_id
+        and (row.get("target_id") or "").strip() == target_id
+        and (row.get("status") or "").strip()
+    ]
+    attempt_no = len(existing) + 1
+
+    # 優先填入預留但尚未使用的空白列，避免檔案越來越零散
+    placeholder = next(
+        (
+            row
+            for row in rows
+            if (row.get("shot_id") or "").strip() == shot_id
+            and (row.get("target_id") or "").strip() == target_id
+            and not (row.get("status") or "").strip()
+        ),
+        None,
+    )
+    payload = {
+        "scenario": v1_pack.SHOT_SCENARIOS[shot_id],
+        "shot_id": shot_id,
+        "target_id": target_id,
+        "provider": target.provider,
+        "model_id": target.model_id,
+        "model_version": target.model_version or "",
+        "attempt_no": attempt_no,
+        "status": normalised,
+        "generation_seconds": (generation_seconds or "").strip(),
+        "credits_used": (credits_used or "").strip(),
+        "output_file": (output_file or "").strip(),
+        "variant_id": "",
+        "failure_reason": (failure_reason or "").strip(),
+        "notes": "",
+    }
+    if placeholder is not None:
+        placeholder.update(payload)
+    else:
+        rows.append(payload)
+
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=ATTEMPT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return attempt_no
+
+
+class SyncReport(BaseModel):
+    updated: int = 0
+    total: int = 0
+    unresolved: list[str] = Field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.unresolved
+
+
+def sync_variant_ids(path: Path, project_id: str) -> SyncReport:
     """依已匯入的候選補齊 variant_id，不刪除任何既有列。
 
-    比對依據為 output_file 與候選的原始檔名。對應不到就留空，
-    失敗的嘗試本來就沒有 variant_id，不應因此被移除。
-    回傳 (更新列數, 總列數)。
+    對應依據為 target_id + shot_id + output_file 三者精確相符。
+    刻意不以匯入順序推測：一旦某次生成沒有匯入或匯入順序與記錄順序
+    不同，後續整批都會錯位，而錯位不會有任何徵兆。
+    找不到或同名多筆時留空並記入 unresolved，交由人工釐清。
+
+    失敗的嘗試本來就沒有 variant_id，不會被移除也不會被硬塞。
     """
-    from pipeline.stages.variant_importer import list_variants
+    from pipeline.benchmark.attribution import AmbiguousAttribution, build_index
 
+    report = SyncReport()
     if not Path(path).exists():
-        return 0, 0
+        return report
 
-    variants = list_variants(project_id)
-    by_key: dict[tuple[str, str], list] = {}
-    for variant in variants:
-        by_key.setdefault((variant.shot_id, variant.provider), []).append(variant)
-    for items in by_key.values():
-        items.sort(key=lambda item: item.created_at)
+    index = build_index(project_id)
 
     with Path(path).open(encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
+    report.total = len(rows)
 
-    cursor: dict[tuple[str, str], int] = {}
-    updated = 0
-    for row in rows:
+    for line_no, row in enumerate(rows, start=2):
         status = (row.get("status") or "").strip().lower()
         if status != AttemptStatus.SUCCESS:
             continue
         if (row.get("variant_id") or "").strip():
             continue
-        key = (
-            (row.get("shot_id") or "").strip(),
-            (row.get("provider") or "").strip(),
-        )
-        pool = by_key.get(key, [])
-        index = cursor.get(key, 0)
-        if index >= len(pool):
+
+        target_id = (row.get("target_id") or "").strip()
+        shot_id = (row.get("shot_id") or "").strip()
+        output_file = (row.get("output_file") or "").strip()
+        if not output_file:
+            report.unresolved.append(
+                f"line {line_no}: {target_id}/{shot_id} 成功的嘗試未填 output_file"
+            )
             continue
-        row["variant_id"] = pool[index].variant_id
-        cursor[key] = index + 1
-        updated += 1
+
+        try:
+            match = index.find_by_file(target_id, shot_id, output_file)
+        except (AmbiguousAttribution, LookupError) as error:
+            report.unresolved.append(f"line {line_no}: {error}")
+            continue
+
+        row["variant_id"] = match.variant_id
+        report.updated += 1
 
     with Path(path).open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=ATTEMPT_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
 
-    return updated, len(rows)
+    return report

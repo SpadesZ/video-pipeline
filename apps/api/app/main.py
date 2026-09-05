@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 
-from app.routes import health, projects, render, web
+from app.routes import benchmark, health, projects, render, web
 from app.routes.web import WebException, error_page
 from pipeline.db import init_db, log_schema_status
 
@@ -34,6 +34,7 @@ async def web_exception_handler(request: Request, exc: WebException):
     )
 
 app.include_router(web.router)
+app.include_router(benchmark.router)
 app.include_router(health.router)
 app.include_router(projects.router, prefix="/projects", tags=["projects"])
 app.include_router(render.router, prefix="/render", tags=["render"])

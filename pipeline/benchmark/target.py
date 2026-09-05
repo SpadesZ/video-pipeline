@@ -111,6 +111,44 @@ def targets() -> TargetRegistry:
     return load_targets()
 
 
+class TargetValidationError(ValueError):
+    """比較對象與 catalog 不一致。"""
+
+
+def validate_target(target: BenchmarkTarget, capability) -> None:
+    """驗證比較對象確實對應到 catalog 中一個可用的模型。
+
+    僅在請求上貼 target 標籤而不限制路由，標籤與實際生成的模型可能不同，
+    比較結果就會歸錯對象。派工前必須確認 model_id 存在、由該平台託管、
+    且支援所需能力，任一不符即拒絕。
+    """
+    from pipeline.capability.model_registry import model_registry
+    from pipeline.capability.provider_spec import get_provider
+
+    entry = model_registry().get(target.model_id)
+    if entry is None:
+        raise TargetValidationError(
+            f"{target.target_id}: model_id {target.model_id!r} 未登錄於 registry"
+        )
+    if not entry.hosted_on(target.provider):
+        raise TargetValidationError(
+            f"{target.target_id}: {target.model_id} 未由 {target.provider} 託管"
+        )
+    if not entry.supports(capability):
+        raise TargetValidationError(
+            f"{target.target_id}: {target.model_id} 不支援 {capability.value}"
+        )
+    spec = get_provider(target.provider)
+    if spec is None:
+        raise TargetValidationError(
+            f"{target.target_id}: 平台 {target.provider} 未登錄"
+        )
+    if not spec.supports(capability):
+        raise TargetValidationError(
+            f"{target.target_id}: {target.provider} 不支援 {capability.value}"
+        )
+
+
 def resolve(target_id: str) -> BenchmarkTarget:
     target = targets().by_id(target_id)
     if target is None:

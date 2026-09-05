@@ -5,6 +5,31 @@
 
 規格定義見 [v1-spec.md](v1-spec.md)。
 
+## 建議從 Web UI 操作
+
+多數步驟可在瀏覽器完成，不必記指令：
+
+```
+http://localhost:8010/benchmark
+```
+
+該頁以六個步驟呈現進度，每步都有下一步按鈕：素材就緒 → 版本確認 →
+建立派工 → 生成與匯入 → 評分與選定代表作 → 查看情境結果。
+
+本文的 CLI 指令保留作為進階與備援用途，兩者操作同一份資料。
+
+## 正確順序
+
+```
+1. 準備素材
+2. 登入平台，確認實際 model 與 UI 選項名稱
+3. 更新 v1_targets.yaml（含 model_version、ui_label），provisional 改為 false
+4. 建立 job packages          <- 一定要在步驟 3 之後
+5. 到平台生成，逐次記錄嘗試
+6. 匯入、評分、選代表作
+7. 查看情境結果
+```
+
 ---
 
 ## 步驟 1：準備參考素材
@@ -39,6 +64,14 @@ docker compose run --rm api python scripts/benchmark_v1.py check
 素材備齊後再跑一次 `check`，顯示 `OK 全部就緒` 才往下。
 
 ---
+
+> **步驟順序很重要。** 必須先確認平台版本、更新 target 並將
+> `provisional` 設為 false，**才能**建立正式的 job packages。
+> job package 與工作快照會凍結當下的 target 身份；若在 build 之後才改
+> target，既有的派工仍指向舊身份，統計會歸錯對象。
+>
+> **若 target 在 build 之後有任何變動，正式 benchmark 必須重新 build。**
+> 探索階段可以先 build 來熟悉流程，但那批資料不得計入正式結果。
 
 ## 步驟 2：建立專案並產出 job packages
 

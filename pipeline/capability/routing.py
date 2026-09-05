@@ -117,19 +117,41 @@ class RoutingPolicy:
         scenario_type: str | None = None,
         preferred_provider: str | None = None,
         only_provider: str | None = None,
+        only_model_id: str | None = None,
     ) -> RoutingDecision:
         """解析可用的模型與平台候選。
 
         preferred_provider 只調整順序，不相容時仍會退到其他平台。
-        only_provider 則完全排除其他平台：benchmark 需要確保某顆鏡頭
-        確實由指定平台生成，一旦退而求其次，比較資料就失去意義。
+        only_provider 排除其他平台；only_model_id 進一步鎖定到單一模型。
+
+        benchmark 必須兩者並用。只鎖平台的話，路由仍可能挑到同平台的
+        另一個模型，比較結果就會歸錯對象；僅在請求上貼標籤而不限制路由，
+        標籤與實際生成的模型會不一致。
         """
         decision = RoutingDecision()
         seen: set[tuple[str, str]] = set()
 
+        if only_model_id:
+            entry = self._registry.get(only_model_id)
+            if entry is None:
+                decision.rejected.append(f"{only_model_id}: 模型未登錄於 registry")
+                return decision
+            if not entry.supports(request.capability):
+                decision.rejected.append(
+                    f"{only_model_id}: 不支援 {request.capability.value}"
+                )
+                return decision
+            if only_provider and not entry.hosted_on(only_provider):
+                decision.rejected.append(
+                    f"{only_model_id}: 未由 {only_provider} 託管"
+                )
+                return decision
+
         for model, rule_id in self._ordered_models(
             request.capability, profile, scenario_type
         ):
+            if only_model_id and model.model_id != only_model_id:
+                continue
             for provider_id in model.hosted_by:
                 if only_provider and provider_id != only_provider:
                     continue

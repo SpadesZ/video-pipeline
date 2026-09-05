@@ -31,6 +31,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# UI 驗證需要 import app。容器內 WORKDIR 已是 apps/api，
+# 但 native 執行時得自行補上，否則 PR CI 會少驗證整個 Web 層。
+API_ROOT = ROOT / "apps" / "api"
+if str(API_ROOT) not in sys.path:
+    sys.path.insert(0, str(API_ROOT))
+
 _TMP_DIR = Path(tempfile.mkdtemp(prefix="benchmark_v1_smoke_"))
 os.environ["DATA_DIR"] = str(_TMP_DIR / "data")
 os.environ["DATABASE_URL"] = f"sqlite:///{(_TMP_DIR / 'smoke.db').as_posix()}"
@@ -43,6 +49,7 @@ from sqlmodel import Session, select
 from pipeline.benchmark import (
     aggregation,
     attempts,
+    attribution,
     builder,
     score_import,
     score_sheet,
@@ -58,6 +65,7 @@ from pipeline.capability import (
     routing_policy,
 )
 from pipeline.db import engine, init_db
+from pipeline.models.capability import Capability
 from pipeline.models.production_artifact import ProductionArtifact
 from pipeline.models.production_profile import load_preset
 from pipeline.models.qc import ContinuityQC, VariantQC
@@ -495,6 +503,348 @@ def verify_sheets_and_applicability() -> None:
     )
 
 
+def _seed_variant(
+    target_obj,
+    shot_id: str,
+    variant_id: str,
+    filename: str,
+    with_lineage: bool = True,
+) -> None:
+    """建立候選並視需要附上派工血緣。
+
+    benchmark 歸屬只認血緣，因此測試必須真的建立 CapabilityJob，
+    不能只塞一個 provider 名稱。
+    """
+    from pipeline.models.variant import CapabilityJob, JobStatus, TransportKind
+
+    job_id = f"job_{variant_id}"
+    with Session(engine) as session:
+        if with_lineage:
+            session.add(
+                CapabilityJob(
+                    job_id=job_id,
+                    project_id=v1_pack.BENCHMARK_PROJECT_ID,
+                    shot_id=shot_id,
+                    capability=Capability.VIDEO_I2V.value,
+                    provider=target_obj.provider,
+                    model_id=target_obj.model_id,
+                    transport=TransportKind.MANUAL.value,
+                    status=JobStatus.COMPLETED.value,
+                    request_snapshot={
+                        "parameters": {"_bm_target_id": target_obj.target_id}
+                    },
+                )
+            )
+        session.add(
+            AssetVariant(
+                variant_id=variant_id,
+                project_id=v1_pack.BENCHMARK_PROJECT_ID,
+                shot_id=shot_id,
+                job_id=job_id if with_lineage else None,
+                provider=target_obj.provider,
+                model_id=target_obj.model_id,
+                prompt_snapshot="snapshot",
+                local_path=str(_TMP_DIR / "clips" / filename),
+                original_filename=filename,
+                status=VariantStatus.IMPORTED.value,
+            )
+        )
+        session.commit()
+
+
+def verify_only_model_id_enforced() -> None:
+    """target 的 exact model 必須真正限制路由，不能只靠標籤。"""
+    from pipeline.benchmark.target import (
+        BenchmarkTarget,
+        TargetValidationError,
+        validate_target,
+    )
+
+    settings = get_settings()
+    artifact = load_project(settings, v1_pack.BENCHMARK_PROJECT_ID)
+    profile = artifact.production_profile
+    packs = {pack.character_id: pack for pack in artifact.character_packs}
+    shot = artifact.shot_plans[0]
+    request = build_shot_request(artifact, shot, packs, profile)
+
+    registry = target.targets()
+    real = registry.targets[0]
+
+    # 指定正確模型時應有候選，且只會是該模型
+    decision = routing_policy().resolve(
+        request,
+        profile=profile,
+        only_provider=real.provider,
+        only_model_id=real.model_id,
+    )
+    check(decision.ok, f"正確的 target 應有候選: {decision.rejected}")
+    check(
+        all(c.model.model_id == real.model_id for c in decision.candidates),
+        "路由不得挑到其他模型",
+    )
+
+    # 不存在的模型必須被拒絕，而非退回同平台其他模型
+    ghost = routing_policy().resolve(
+        request, profile=profile, only_provider=real.provider,
+        only_model_id="model-does-not-exist",
+    )
+    check(not ghost.ok, "不存在的模型不應有候選")
+    check(
+        any("未登錄" in reason for reason in ghost.rejected),
+        f"應說明模型未登錄: {ghost.rejected}",
+    )
+
+    # 模型存在但不屬於該平台
+    other = next(item for item in registry.targets if item.provider != real.provider)
+    mismatch = routing_policy().resolve(
+        request, profile=profile, only_provider=real.provider,
+        only_model_id=other.model_id,
+    )
+    check(not mismatch.ok, "跨平台的模型不應有候選")
+    check(
+        any("託管" in reason for reason in mismatch.rejected),
+        f"應說明託管關係不符: {mismatch.rejected}",
+    )
+
+    # target 驗證同樣 fail-closed
+    validate_target(real, shot.capability)
+    for bad in (
+        BenchmarkTarget(
+            target_id="bad_model", provider=real.provider,
+            model_id="model-does-not-exist",
+        ),
+        BenchmarkTarget(
+            target_id="bad_provider", provider=real.provider,
+            model_id=other.model_id,
+        ),
+    ):
+        try:
+            validate_target(bad, shot.capability)
+        except TargetValidationError:
+            pass
+        else:
+            raise AssertionError(f"{bad.target_id} 應被拒絕")
+
+
+def verify_attribution_requires_lineage() -> None:
+    """歸屬只走派工血緣，沒有血緣的候選不得被猜進 benchmark。"""
+    registry = target.targets()
+    primary = registry.targets[0]
+
+    _seed_variant(primary, "bm_a1_walk_slow_push", "var_lineage_ok", "ok.mp4")
+    _seed_variant(
+        primary, "bm_a1_walk_slow_push", "var_no_lineage", "orphan.mp4",
+        with_lineage=False,
+    )
+
+    index = attribution.build_index(v1_pack.BENCHMARK_PROJECT_ID)
+    check(
+        index.by_variant_id("var_lineage_ok") is not None,
+        "有血緣的候選應可歸屬",
+    )
+    check(
+        index.by_variant_id("var_lineage_ok").target_id == primary.target_id,
+        "歸屬的 target 錯誤",
+    )
+    check(
+        "var_no_lineage" in index.unattributed,
+        "無血緣的候選應列為不可歸屬",
+    )
+    check(
+        index.by_variant_id("var_no_lineage") is None,
+        "無血緣的候選不得出現在索引中",
+    )
+
+    # 檔名對應：精確、找不到、歧義
+    found = index.find_by_file(primary.target_id, "bm_a1_walk_slow_push", "ok.mp4")
+    check(found.variant_id == "var_lineage_ok", "檔名對應錯誤")
+
+    try:
+        index.find_by_file(primary.target_id, "bm_a1_walk_slow_push", "nope.mp4")
+    except LookupError:
+        pass
+    else:
+        raise AssertionError("找不到檔名時應拒絕")
+
+    _seed_variant(primary, "bm_a1_walk_slow_push", "var_dup_a", "dup.mp4")
+    _seed_variant(primary, "bm_a1_walk_slow_push", "var_dup_b", "dup.mp4")
+    dup_index = attribution.build_index(v1_pack.BENCHMARK_PROJECT_ID)
+    try:
+        dup_index.find_by_file(primary.target_id, "bm_a1_walk_slow_push", "dup.mp4")
+    except attribution.AmbiguousAttribution:
+        pass
+    else:
+        raise AssertionError("同名多筆時應拒絕，不得挑第一個")
+
+
+def verify_benchmark_selection_independent() -> None:
+    """每個 target 在同一顆鏡頭都能各自選代表作。"""
+    registry = target.targets()
+    shot_id = "bm_a2_closeup_expression"
+
+    chosen = []
+    for index_no, item in enumerate(registry.targets[:3], start=1):
+        variant_id = f"var_sel_{index_no}"
+        _seed_variant(item, shot_id, variant_id, f"sel_{index_no}.mp4")
+        attribution.select_benchmark_candidate(
+            v1_pack.BENCHMARK_PROJECT_ID, variant_id
+        )
+        chosen.append((item.target_id, variant_id))
+
+    index = attribution.build_index(v1_pack.BENCHMARK_PROJECT_ID)
+    selected = [
+        item for item in index.items
+        if item.shot_id == shot_id and item.benchmark_selected
+    ]
+    check(
+        len(selected) == 3,
+        f"同一顆鏡頭應可同時有三個 target 各自選定，實際 {len(selected)}",
+    )
+    check(
+        len({item.target_id for item in selected}) == 3,
+        "三支代表作應分屬不同比較對象",
+    )
+
+    # production 的 SELECTED 不受影響
+    with Session(engine) as session:
+        rows = session.exec(
+            select(AssetVariant).where(
+                AssetVariant.project_id == v1_pack.BENCHMARK_PROJECT_ID,
+                AssetVariant.shot_id == shot_id,
+            )
+        ).all()
+    check(
+        not any(row.status == VariantStatus.SELECTED for row in rows),
+        "benchmark 選定不應改動 production 的 SELECTED",
+    )
+
+    # 同一 target 改選時，舊的要退掉
+    first_target, first_variant = chosen[0]
+    replacement = "var_sel_replace"
+    _seed_variant(registry.by_id(first_target), shot_id, replacement, "replace.mp4")
+    attribution.select_benchmark_candidate(
+        v1_pack.BENCHMARK_PROJECT_ID, replacement
+    )
+    index = attribution.build_index(v1_pack.BENCHMARK_PROJECT_ID)
+    same_target = [
+        item for item in index.for_shot(first_target, shot_id)
+        if item.benchmark_selected
+    ]
+    check(len(same_target) == 1, "同一 target 同一鏡頭只能有一支代表作")
+    check(same_target[0].variant_id == replacement, "改選未生效")
+
+    # 其他 target 的選擇不受影響
+    still_selected = [
+        item for item in index.items
+        if item.shot_id == shot_id and item.benchmark_selected
+    ]
+    check(len(still_selected) == 3, "改選不應影響其他比較對象")
+
+    # 無血緣的候選不得被選為代表作
+    _seed_variant(
+        registry.targets[0], shot_id, "var_sel_orphan", "orphan2.mp4",
+        with_lineage=False,
+    )
+    try:
+        attribution.select_benchmark_candidate(
+            v1_pack.BENCHMARK_PROJECT_ID, "var_sel_orphan"
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("無血緣的候選不應可被選為代表作")
+
+
+def verify_sync_preserves_user_input() -> None:
+    """sync 不得洗掉已填的人工欄位。"""
+    settings = get_settings()
+    directory = Path(settings.data_dir) / "benchmark" / "v1" / "sheets"
+    registry = target.targets()
+    primary = registry.targets[0]
+    shot_id = "bm_b1_two_shot_dialogue"
+
+    _seed_variant(primary, shot_id, "var_keep_1", "keep1.mp4")
+    path, _ = score_sheet.sync_variant_sheet(
+        directory, v1_pack.BENCHMARK_PROJECT_ID
+    )
+
+    with path.open(encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    row = next(item for item in rows if item["variant_id"] == "var_keep_1")
+    row["identity_consistency"] = "77"
+    row["temporal_stability"] = "81"
+    row["facial_acting"] = "69"
+    row["usable_without_repair"] = "yes"
+    row["human_correction_minutes"] = "4.5"
+    row["generation_seconds"] = "120"
+    row["credits_used"] = "8"
+    row["retries_to_usable"] = "2"
+    row["notes"] = "手寫備註不可遺失"
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=score_sheet.VARIANT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    # 新增另一支候選後重新 sync
+    _seed_variant(primary, shot_id, "var_keep_2", "keep2.mp4")
+    path, _ = score_sheet.sync_variant_sheet(
+        directory, v1_pack.BENCHMARK_PROJECT_ID
+    )
+
+    with path.open(encoding="utf-8-sig") as handle:
+        after = list(csv.DictReader(handle))
+    kept = next(item for item in after if item["variant_id"] == "var_keep_1")
+    for column, expected in (
+        ("identity_consistency", "77"),
+        ("temporal_stability", "81"),
+        ("facial_acting", "69"),
+        ("usable_without_repair", "yes"),
+        ("human_correction_minutes", "4.5"),
+        ("generation_seconds", "120"),
+        ("credits_used", "8"),
+        ("retries_to_usable", "2"),
+        ("notes", "手寫備註不可遺失"),
+    ):
+        check(
+            kept[column] == expected,
+            f"sync 洗掉了人工填寫的 {column}: {kept[column]!r} != {expected!r}",
+        )
+
+    check(
+        any(item["variant_id"] == "var_keep_2" for item in after),
+        "新候選應被加入",
+    )
+
+    # 連戲表同樣要保留人工輸入
+    continuity_path, _ = score_sheet.sync_continuity_sheet(
+        directory, v1_pack.BENCHMARK_PROJECT_ID
+    )
+    with continuity_path.open(encoding="utf-8-sig") as handle:
+        crows = list(csv.DictReader(handle))
+    target_row = next(
+        item for item in crows if item["target_id"] == primary.target_id
+    )
+    target_row["cross_shot_identity"] = "84"
+    target_row["notes"] = "連戲備註"
+    with continuity_path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=score_sheet.CONTINUITY_COLUMNS)
+        writer.writeheader()
+        writer.writerows(crows)
+
+    score_sheet.sync_continuity_sheet(directory, v1_pack.BENCHMARK_PROJECT_ID)
+    with continuity_path.open(encoding="utf-8-sig") as handle:
+        cafter = list(csv.DictReader(handle))
+    kept_c = next(
+        item
+        for item in cafter
+        if item["target_id"] == primary.target_id
+        and item["shot_id"] == target_row["shot_id"]
+        and item["ref_shot_id"] == target_row["ref_shot_id"]
+    )
+    check(kept_c["cross_shot_identity"] == "84", "連戲分數被 sync 洗掉")
+    check(kept_c["notes"] == "連戲備註", "連戲備註被 sync 洗掉")
+
+
 def verify_attempt_ledger_keeps_failures() -> None:
     """失敗的嘗試在 sync 之後仍必須存在。"""
     settings = get_settings()
@@ -503,7 +853,9 @@ def verify_attempt_ledger_keeps_failures() -> None:
 
     registry = target.targets()
     primary = registry.targets[0]
-    shot_id = v1_pack.shots()[0].shot_id
+    shot_id = "bm_c1_run_tracking"
+
+    _seed_variant(primary, shot_id, "var_attempt_ok", "c1_run_3.mp4")
 
     with path.open(encoding="utf-8-sig") as handle:
         rows = list(csv.DictReader(handle))
@@ -525,7 +877,7 @@ def verify_attempt_ledger_keeps_failures() -> None:
             row["status"] = "success"
             row["generation_seconds"] = "88"
             row["credits_used"] = "10"
-            row["output_file"] = "a1_kling_3.mp4"
+            row["output_file"] = "c1_run_3.mp4"
 
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=attempts.ATTEMPT_COLUMNS)
@@ -540,23 +892,11 @@ def verify_attempt_ledger_keeps_failures() -> None:
         "應保留兩次未成功的嘗試",
     )
 
-    # 匯入一支影片後 sync
-    with Session(engine) as session:
-        session.add(
-            AssetVariant(
-                variant_id="var_bm_a1_1",
-                project_id=v1_pack.BENCHMARK_PROJECT_ID,
-                shot_id=shot_id,
-                provider=primary.provider,
-                model_id=primary.model_id,
-                prompt_snapshot="snapshot",
-                status=VariantStatus.SELECTED.value,
-            )
-        )
-        session.commit()
-
-    updated, total = attempts.sync_variant_ids(path, v1_pack.BENCHMARK_PROJECT_ID)
-    check(updated == 1, f"應補齊 1 列 variant_id，實際 {updated}")
+    report = attempts.sync_variant_ids(path, v1_pack.BENCHMARK_PROJECT_ID)
+    check(
+        report.updated == 1,
+        f"應補齊 1 列 variant_id，實際 {report.updated}: {report.unresolved}",
+    )
 
     after = attempts.read_ledger(path)
     check(
@@ -567,14 +907,42 @@ def verify_attempt_ledger_keeps_failures() -> None:
         sum(1 for item in after.attempts if not item.succeeded) == 2,
         "sync 不得洗掉失敗的嘗試",
     )
+    matched = [
+        item for item in after.attempts if item.succeeded and item.variant_id
+    ]
+    check(matched, "成功的嘗試應被補上 variant_id")
     check(
-        any(item.variant_id for item in after.attempts if item.succeeded),
-        "成功的嘗試應被補上 variant_id",
+        matched[0].variant_id == "var_attempt_ok",
+        f"應依 output_file 精確對應，實際 {matched[0].variant_id}",
     )
     check(
         all(item.variant_id is None for item in after.attempts if not item.succeeded),
         "失敗的嘗試不應被硬塞 variant_id",
     )
+
+    # 檔名對不上時必須留空並回報，不得猜測
+    with path.open(encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    for row in rows:
+        if row["shot_id"] == shot_id and row["target_id"] == primary.target_id:
+            if row["status"] == "failed":
+                row["status"] = "success"
+                row["output_file"] = "file_that_was_never_imported.mp4"
+                row["variant_id"] = ""
+                break
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=attempts.ATTEMPT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    unresolved_report = attempts.sync_variant_ids(
+        path, v1_pack.BENCHMARK_PROJECT_ID
+    )
+    check(
+        unresolved_report.unresolved,
+        "對應不到的成功嘗試應被回報，而非靜默略過",
+    )
+    check(not unresolved_report.ok, "有未解析項目時 ok 應為 False")
 
 
 def verify_continuity_pair_guard() -> None:
@@ -587,43 +955,16 @@ def verify_continuity_pair_guard() -> None:
         item for item in registry.targets if item.provider != primary.provider
     )
 
-    shot_id, ref_shot_id = v1_pack.CONTINUITY_PAIRS[0]
+    shot_id, ref_shot_id = v1_pack.CONTINUITY_PAIRS[1]
 
-    with Session(engine) as session:
-        session.add(
-            AssetVariant(
-                variant_id="var_pair_ref",
-                project_id=v1_pack.BENCHMARK_PROJECT_ID,
-                shot_id=ref_shot_id,
-                provider=primary.provider,
-                model_id=primary.model_id,
-                prompt_snapshot="ref",
-                status=VariantStatus.SELECTED.value,
-            )
+    _seed_variant(primary, ref_shot_id, "var_pair_ref", "pair_ref.mp4")
+    _seed_variant(primary, shot_id, "var_pair_primary", "pair_primary.mp4")
+    _seed_variant(other, ref_shot_id, "var_pair_foreign", "pair_foreign.mp4")
+
+    for variant_id in ("var_pair_ref", "var_pair_primary", "var_pair_foreign"):
+        attribution.select_benchmark_candidate(
+            v1_pack.BENCHMARK_PROJECT_ID, variant_id
         )
-        session.add(
-            AssetVariant(
-                variant_id="var_pair_primary",
-                project_id=v1_pack.BENCHMARK_PROJECT_ID,
-                shot_id=shot_id,
-                provider=primary.provider,
-                model_id=primary.model_id,
-                prompt_snapshot="primary",
-                status=VariantStatus.SELECTED.value,
-            )
-        )
-        session.add(
-            AssetVariant(
-                variant_id="var_pair_foreign",
-                project_id=v1_pack.BENCHMARK_PROJECT_ID,
-                shot_id=ref_shot_id,
-                provider=other.provider,
-                model_id=other.model_id,
-                prompt_snapshot="foreign",
-                status=VariantStatus.SELECTED.value,
-            )
-        )
-        session.commit()
 
     # 正確配對
     score_import.validate_continuity_pair(
@@ -750,14 +1091,17 @@ def verify_aggregation_is_deterministic() -> None:
             }
         )
 
+    dialogue_shot = v1_pack.shots_by_scenario("two_character_dialogue")[0].shot_id
     continuity_records = [
         {
             "target_id": strong.target_id,
+            "shot_id": dialogue_shot,
             "weighted_score": 88.0,
             "cross_shot_identity": 92.0,
         },
         {
             "target_id": weak.target_id,
+            "shot_id": dialogue_shot,
             "weighted_score": 40.0,
             "cross_shot_identity": 38.0,
         },
@@ -804,18 +1148,17 @@ def verify_aggregation_is_deterministic() -> None:
         f"人工時間換算錯誤: {strong_agg.human_minutes_per_usable}",
     )
     check(
-        strong_agg.artifact_cleanliness == 90.0,
-        f"瑕疵應取反: {strong_agg.artifact_cleanliness}",
+        strong_agg.overall.artifact_cleanliness == 90.0,
+        f"瑕疵應取反: {strong_agg.overall.artifact_cleanliness}",
     )
-    check(
-        strong_agg.scenario_stability("single_character_cinematic") is not None,
-        "應能計算情境穩定性",
-    )
+    cinematic = strong_agg.scope("single_character_cinematic")
+    check(cinematic is not None and cinematic.stability is not None,
+          "應能計算情境穩定性")
 
     # 各情境獨立評選，不存在總冠軍欄位
     check(len(report.awards) == len(aggregation.ScenarioAward), "獎項數量不符")
     for award in report.awards:
-        check(award.scenarios, f"{award.award} 應標明適用情境")
+        check(award.scope, f"{award.award} 應標明評分範圍")
         if award.winner:
             check(
                 award.winner == strong.target_id,
@@ -825,6 +1168,55 @@ def verify_aggregation_is_deterministic() -> None:
         not hasattr(report, "overall_winner"),
         "不得產生跨情境總冠軍",
     )
+
+    # 情境獎項只能讀該情境的資料
+    dialogue_award = report.award(
+        aggregation.ScenarioAward.CHARACTER_DIALOGUE.value
+    )
+    check(
+        dialogue_award.scope == "two_character_dialogue",
+        f"對話獎應限定於對話情境: {dialogue_award.scope}",
+    )
+    check("僅使用該情境" in dialogue_award.note, "應標明範圍限制")
+
+    action_award = report.award(
+        aggregation.ScenarioAward.HIGH_DYNAMIC_ACTION.value
+    )
+    check(
+        action_award.scope == "high_dynamic_action",
+        f"高動態獎應限定於高動態情境: {action_award.scope}",
+    )
+
+    low_retry = report.award(
+        aggregation.ScenarioAward.LOW_RETRY_PRODUCTION.value
+    )
+    check(
+        low_retry.scope == aggregation.GLOBAL_SCOPE,
+        "低重試獎為明確的跨情境指標",
+    )
+
+    # 情境聚合的鏡頭數必須小於全域
+    dialogue_scope = strong_agg.scope("two_character_dialogue")
+    check(
+        len(dialogue_scope.shots) < len(strong_agg.overall.shots),
+        "情境聚合不應包含其他情境的鏡頭",
+    )
+    check(
+        all(
+            v1_pack.SHOT_SCENARIOS[shot.shot_id] == "two_character_dialogue"
+            for shot in dialogue_scope.shots
+        ),
+        "情境聚合混入了其他情境的鏡頭",
+    )
+    # 連戲資料應落在主鏡頭所屬的情境，而非全部情境
+    check(
+        dialogue_scope.continuity_identity == 92.0,
+        f"連戲應計入對話情境: {dialogue_scope.continuity_identity}",
+    )
+    check(
+        strong_agg.scope("high_dynamic_action").continuity_identity is None,
+        "對話情境的連戲不應污染高動態情境",
+    )
     check(
         report.provisional_targets,
         "報表應標示哪些比較對象的版本尚未確認",
@@ -833,6 +1225,96 @@ def verify_aggregation_is_deterministic() -> None:
         report.aggregation_version == aggregation.AGGREGATION_VERSION,
         "報表應記錄統計公式版本",
     )
+
+
+def verify_attempt_append() -> None:
+    """UI 記錄嘗試：追加而非覆寫，成功必須帶檔名。"""
+    settings = get_settings()
+    path = Path(settings.data_dir) / "benchmark" / "v1" / "sheets" / (
+        attempts.ATTEMPTS_SHEET
+    )
+    registry = target.targets()
+    primary = registry.targets[0]
+    shot_id = "bm_b2_ots_on_a"
+
+    before = len(attempts.read_ledger(path).attempts)
+
+    no1 = attempts.append_attempt(
+        path, shot_id, primary.target_id, "failed",
+        failure_reason="測試失敗紀錄", generation_seconds="30",
+    )
+    no2 = attempts.append_attempt(
+        path, shot_id, primary.target_id, "cancelled",
+    )
+    check(no1 == 1 and no2 == 2, f"嘗試序號應遞增: {no1}, {no2}")
+
+    after = attempts.read_ledger(path)
+    check(
+        len(after.attempts) == before + 2,
+        f"應追加 2 列，實際 {len(after.attempts) - before}",
+    )
+    check(
+        sum(1 for item in after.attempts if item.shot_id == shot_id) == 2,
+        "追加的紀錄未正確寫入",
+    )
+
+    # 成功的嘗試必須帶檔名，否則之後無法對應候選
+    try:
+        attempts.append_attempt(path, shot_id, primary.target_id, "success")
+    except ValueError as error:
+        check("檔名" in str(error), f"錯誤訊息應說明缺少檔名: {error}")
+    else:
+        raise AssertionError("成功但未填檔名應被拒絕")
+
+    for bad_target, bad_shot, bad_status in (
+        ("no_such_target", shot_id, "failed"),
+        (primary.target_id, "no_such_shot", "failed"),
+        (primary.target_id, shot_id, "not_a_status"),
+    ):
+        try:
+            attempts.append_attempt(path, bad_shot, bad_target, bad_status)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"無效輸入應被拒絕: {bad_target}/{bad_shot}/{bad_status}"
+            )
+
+
+def verify_ui_routes() -> None:
+    """Benchmark 相關頁面必須可開啟，且不依賴 CLI 才能操作。"""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        for path in (
+            "/",
+            "/benchmark",
+            "/benchmark/attempts",
+            "/benchmark/results",
+        ):
+            response = client.get(path)
+            check(
+                response.status_code == 200,
+                f"{path} 應回傳 200，實際 {response.status_code}",
+            )
+
+        home = client.get("/").text
+        check('href="/benchmark"' in home, "導航應提供 Benchmark 入口")
+
+        console = client.get("/benchmark").text
+        for label in ("準備參考素材", "確認平台版本", "建立派工", "生成與匯入"):
+            check(label in console, f"控制台缺少步驟: {label}")
+        check("待確認" in console, "應標示尚未確認版本的比較對象")
+
+        results = client.get("/benchmark/results").text
+        check("統計公式版本" in results, "結果頁應標示統計公式版本")
+        check("不產生總冠軍" in results, "結果頁應說明不產生跨情境總冠軍")
+
+        form = client.get("/benchmark/attempts").text
+        check("記錄生成嘗試" in form, "應提供嘗試記錄表單")
+        check("cancelled" in form, "表單應可記錄取消的嘗試")
 
 
 def main() -> int:
@@ -847,9 +1329,15 @@ def main() -> int:
     verify_prompt_parity_and_target_identity()
     verify_reference_swap_changes_identity()
     verify_sheets_and_applicability()
+    verify_only_model_id_enforced()
+    verify_attribution_requires_lineage()
+    verify_benchmark_selection_independent()
+    verify_sync_preserves_user_input()
     verify_attempt_ledger_keeps_failures()
+    verify_attempt_append()
     verify_continuity_pair_guard()
     verify_aggregation_is_deterministic()
+    verify_ui_routes()
 
     registry = target.targets()
     print(

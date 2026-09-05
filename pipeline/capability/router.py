@@ -70,6 +70,7 @@ async def dispatch_capability(
     preferred_provider: str | None = None,
     policy: RoutingPolicy | None = None,
     only_provider: str | None = None,
+    only_model_id: str | None = None,
 ) -> CapabilityResult:
     active_policy = policy or routing_policy()
     decision = active_policy.resolve(
@@ -78,6 +79,7 @@ async def dispatch_capability(
         scenario_type=scenario_type,
         preferred_provider=preferred_provider,
         only_provider=only_provider,
+        only_model_id=only_model_id,
     )
 
     attempts: list[AttemptRecord] = []
