@@ -83,6 +83,10 @@ def _control_button(
             f'<button class="{cls}" type="button" disabled {attrs} '
             f'title="{escape(reason)}">{escape(control.label)}</button>'
             f'<span class="disabled-why">{escape(reason)}</span>'
+            f'<a href="#" class="ask-ai" '
+            f'data-ask-control="{escape(control.control_id)}" '
+            f'data-ask-ai="「{escape(control.label)}」為什麼不能按？">'
+            "Ask AI</a>"
         )
     return body
 
@@ -660,12 +664,26 @@ async def benchmark_build(settings: Settings = Depends(settings_dep)):
     from pipeline.project_store import save_project
 
     await run_in_threadpool(save_project, settings, artifact)
+
+    # 只在缺檔時建立空白表。這些寫入函式以 "w" 開檔，會整份截斷：
+    # 第二次按「重新產生」就會把已記錄的嘗試與已填的分數全部清空，
+    # 而且不會有任何提示。既有檔案改由 sync 補列並保留人工填寫的欄位。
     directory = sheets_dir(settings)
-    await run_in_threadpool(score_sheet.write_variant_sheet, directory, None, None)
-    await run_in_threadpool(score_sheet.write_continuity_sheet, directory, None)
-    await run_in_threadpool(attempts.write_blank_ledger, directory, None, None)
+    await run_in_threadpool(_ensure_sheets, directory)
+    await run_in_threadpool(score_sheet.sync_variant_sheet, directory, PROJECT_ID)
+    await run_in_threadpool(score_sheet.sync_continuity_sheet, directory, PROJECT_ID)
 
     return RedirectResponse(url="/benchmark", status_code=303)
+
+
+def _ensure_sheets(directory: Path) -> None:
+    """建立尚不存在的評分表與嘗試紀錄。已存在者一律不動。"""
+    if not (directory / score_sheet.VARIANT_SHEET).exists():
+        score_sheet.write_variant_sheet(directory, None, None)
+    if not (directory / score_sheet.CONTINUITY_SHEET).exists():
+        score_sheet.write_continuity_sheet(directory, None)
+    if not (directory / attempts.ATTEMPTS_SHEET).exists():
+        attempts.write_blank_ledger(directory, None, None)
 
 
 # --------------------------------------------------------------------------
@@ -1077,6 +1095,9 @@ async def job_record_attempt(
             generation_seconds.strip() or None,
             credits_used.strip() or None,
             failure_reason.strip() or None,
+            # 身份取自這份派工的快照，不取 catalog 現值：使用者剛剛在
+            # 平台上跑的是這份派工的模型，不是之後可能被改過的那個。
+            view.identity,
         )
         ok, message = "1", f"已記錄第 {attempt_no} 次嘗試"
     except ValueError as error:
@@ -1364,13 +1385,23 @@ def continuity_index(settings: Settings = Depends(settings_dep)) -> str:
         logger.warning("continuity pairs failed: %s", error)
         pairs = []
 
+    def status_cell(item) -> str:
+        if item.scored:
+            return "已評分"
+        if not item.ready:
+            return "缺代表作"
+        # 換過代表作：舊分數比的是別的影片，不能沿用
+        if item.stale_scores:
+            return "需重評（代表作已更換）"
+        return "可評分"
+
     rows = "".join(
         f"<tr>"
         f"<td class='mono'>{escape(item.target_id)}</td>"
         f"<td class='mono'>{escape(item.shot_id)} ↔ {escape(item.ref_shot_id)}</td>"
         f"<td>{escape(item.scenario)}</td>"
-        f"<td>{'已評分' if item.scored else ('可評分' if item.ready else '缺代表作')}</td>"
-        f"<td>{escape('；'.join(item.missing) or '—')}</td>"
+        f"<td>{status_cell(item)}</td>"
+        f"<td>{escape('；'.join(item.missing) or ('舊評分 ' + str(item.stale_scores) + ' 筆保留為歷史' if item.stale_scores else '—'))}</td>"
         f"<td>"
         + (
             f"<a class='ghost-button' href='/benchmark/continuity/"
@@ -1634,13 +1665,40 @@ async def continuity_save(
     return RedirectResponse(url="/benchmark/continuity", status_code=303)
 
 
+def _continuity_qc_id(project_id: str, pair) -> str:
+    """連戲評分的主鍵，涵蓋實際被比較的那兩支影片。
+
+    原本只用 project + target + shot，換一次代表作就會覆寫掉前一次的
+    評分——那筆分數是比另外兩支片得到的，覆寫等於銷毀證據。
+    納入兩個 variant_id 後，換代表作會產生新的一列，舊的留著可追溯。
+    以雜湊固定長度，避免 variant_id 串接後超出主鍵長度。
+    """
+    import hashlib
+
+    raw = "|".join(
+        [
+            project_id,
+            pair.target_id,
+            pair.shot_id,
+            pair.ref_shot_id,
+            pair.variant_id or "",
+            pair.ref_variant_id or "",
+        ]
+    )
+    return "cqc_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
+
+
 def _persist_continuity(
     project_id: str, pair, values: dict, notes: str | None
 ) -> None:
-    """寫入或更新連戲評分。同一組配對只留一列，重評即覆寫。"""
+    """寫入或更新連戲評分。
+
+    同一組「兩支影片」重評時覆寫該列；換過代表作則是另一組配對，
+    會新增一列，舊列保留為歷史。
+    """
     from pipeline.models.qc import ContinuityQC, ContinuityScope
 
-    qc_id = f"cqc_{project_id}_{pair.target_id}_{pair.shot_id}"[:120]
+    qc_id = _continuity_qc_id(project_id, pair)
     with Session(engine) as session:
         row = session.get(ContinuityQC, qc_id)
         if row is None:
@@ -1692,6 +1750,8 @@ def benchmark_results(settings: Settings = Depends(settings_dep)) -> str:
         variant_records.append(
             {
                 "target_id": item.target_id,
+                # 派工當下的身份。報表據此判斷這支影片屬於哪一輪。
+                "identity_key": item.identity_key,
                 "shot_id": item.shot_id,
                 "weighted_score": qc.weighted_score(aggregation.BENCHMARK_WEIGHTS),
                 "usable": bool(qc.usable_without_repair),
@@ -1712,9 +1772,26 @@ def benchmark_results(settings: Settings = Depends(settings_dep)) -> str:
         entry = index.by_variant_id(row.variant_id) if row.variant_id else None
         if entry is None:
             continue
+        # 連戲評的是兩支影片的關係，兩支都必須屬於目前這一輪。
+        # 只看主影片的話，換過代表作的舊分數會被留下來。
+        reference = (
+            index.by_variant_id(row.ref_variant_id) if row.ref_variant_id else None
+        )
+        if reference is None or reference.identity_key != entry.identity_key:
+            continuity_records.append(
+                {
+                    "target_id": entry.target_id,
+                    "identity_key": None,
+                    "shot_id": row.shot_id,
+                    "weighted_score": None,
+                    "cross_shot_identity": None,
+                }
+            )
+            continue
         continuity_records.append(
             {
                 "target_id": entry.target_id,
+                "identity_key": entry.identity_key,
                 "shot_id": row.shot_id,
                 "weighted_score": row.weighted_score(aggregation.BENCHMARK_WEIGHTS),
                 "cross_shot_identity": row.cross_shot_identity,
@@ -1773,6 +1850,30 @@ def benchmark_results(settings: Settings = Depends(settings_dep)) -> str:
         warnings += (
             f'<p class="bm-warn">{len(report.unattributed_variants)} 支候選沒有'
             "派工來源，未計入統計。</p>"
+        )
+    if report.has_excluded:
+        identities = escape(", ".join(report.excluded_identities[:6])) or "—"
+        warnings += (
+            '<div class="bm-warn" data-error-code="identity_drift">'
+            "<p><strong>以下資料屬於舊版本，未計入本表：</strong>"
+            f"{report.excluded_variants} 支候選、"
+            f"{report.excluded_attempts} 次嘗試、"
+            f"{report.excluded_continuity} 組連戲。</p>"
+            f'<p class="mono">{identities}</p>'
+            "<p>這些紀錄仍完整保留，只是它們是用不同版本生成的，"
+            "與目前確認的版本放在一起比較會得到不對應任何模型的數字。"
+            "若要重新納入，請把該對象的版本改回當時的值，"
+            "或為新版本重新跑一輪。"
+            '<a href="#" class="ask-ai" data-ask-ai="為什麼有資料沒有計入這份報表？">'
+            "Ask AI</a></p></div>"
+        )
+    if report.identity_warnings:
+        rows = "".join(
+            f"<li>{escape(item)}</li>" for item in report.identity_warnings[:5]
+        )
+        warnings += (
+            '<div class="bm-warn"><p>部分嘗試紀錄缺少記錄當下的版本資訊，'
+            f"未計入本表：</p><ul>{rows}</ul></div>"
         )
 
     return page(

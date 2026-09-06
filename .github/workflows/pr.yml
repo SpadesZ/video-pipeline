@@ -77,6 +77,10 @@ jobs:
       - name: Benchmark web and assistant smoke (no API keys)
         run: python scripts/smoke_benchmark_web_v1c.py
 
+      # 同一個 target 換版本後，兩輪資料不得互相污染
+      - name: Benchmark version drift smoke
+        run: python scripts/smoke_benchmark_version_drift.py
+
       # 此腳本自行覆寫 DATA_DIR 與清空金鑰，不需外部環境變數
       - name: LAVA settings smoke (no API keys)
         run: python scripts/smoke_lava_settings.py

@@ -1184,11 +1184,14 @@ def assistant_widget() -> str:
         });
       });
 
-      // 錯誤橫幅上的 Ask AI，帶著該則錯誤的 code 進來
+      // 錯誤橫幅或按鈕旁的 Ask AI。data-ask-control 指名問的是哪一顆，
+      // 否則助手只知道這一頁有哪些按鈕，不知道使用者指的是哪一個。
+      var focusedControl = '';
       document.querySelectorAll('[data-ask-ai]').forEach(function (link) {
         link.addEventListener('click', function (e) {
           e.preventDefault();
           open();
+          focusedControl = link.dataset.askControl || '';
           input.value = link.dataset.askAi || '這個錯誤是什麼意思？';
           form.dispatchEvent(new Event('submit', { cancelable: true }));
         });
@@ -1204,6 +1207,8 @@ def assistant_widget() -> str:
 
         var payload = pageContext();
         payload.question = question;
+        payload.control_id = focusedControl;
+        focusedControl = '';
 
         fetch('/assistant/ask', {
           method: 'POST',

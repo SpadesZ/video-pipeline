@@ -668,9 +668,9 @@ def verify_assistant_knows_disabled_controls(client: TestClient) -> None:
         json={"route": "/benchmark", "question": "為什麼這個按鈕不能按？"},
     ).json()["context"]
 
-    controls = {item["control_id"]: item for item in context["controls"]}
-    check("benchmark.build" in controls, "應帶入 Build 控制項")
-    for item in context["controls"]:
+    visible = {item["control_id"]: item for item in context["page_visible_controls"]}
+    check("benchmark.build" in visible, "控制台應帶入 Build 控制項")
+    for item in context["page_visible_controls"]:
         check(item["label"], "每個控制項都要有標籤")
         check(item["action"], "每個控制項都要說明按下去會發生什麼")
         check(
@@ -680,6 +680,84 @@ def verify_assistant_knows_disabled_controls(client: TestClient) -> None:
 
     prompt_blob = json.dumps(context, ensure_ascii=False)
     check("danger_level" in prompt_blob, "應帶出危險等級，供回答是否會覆蓋")
+
+
+def verify_assistant_controls_are_page_scoped(client: TestClient) -> None:
+    """眼前的控制項只能是這一頁的，不得混入別頁的按鈕。"""
+    view = job_view.list_jobs(PROJECT_ID)[0]
+    pair = next(item for item in workflow.continuity_pairs(PROJECT_ID) if item.ready)
+
+    cases = {
+        f"/benchmark/jobs/{view.job_id}": {
+            "expected": {"copy_prompt", "record_attempt", "import_result"},
+            "forbidden": {"benchmark.build", "save_next"},
+        },
+        f"/benchmark/continuity/{pair.target_id}/{pair.shot_id}": {
+            "expected": {"save_next"},
+            "forbidden": {"benchmark.build", "copy_prompt", "import_result"},
+        },
+        "/benchmark/assets": {
+            "expected": {"upload"},
+            "forbidden": {"benchmark.build", "save_next"},
+        },
+    }
+    for route, spec in cases.items():
+        context = client.post(
+            "/assistant/context", json={"route": route, "question": "這個按鈕是什麼"}
+        ).json()["context"]
+        visible = {item["control_id"] for item in context["page_visible_controls"]}
+        missing = spec["expected"] - visible
+        leaked = spec["forbidden"] & visible
+        check(not missing, f"{route} 缺少頁面控制項 {missing}")
+        check(not leaked, f"{route} 混入了別頁的控制項 {leaked}")
+        # 流程動作仍要在，只是分開放，供回答「下一步去哪裡」
+        check(
+            context["workflow_actions"],
+            f"{route} 應仍帶有流程層級的動作",
+        )
+
+    # 控制台本身就是把六步流程畫在同一頁，那裡看得到全部
+    console = client.post(
+        "/assistant/context", json={"route": "/benchmark", "question": "有哪些操作"}
+    ).json()["context"]
+    console_visible = {
+        item["control_id"] for item in console["page_visible_controls"]
+    }
+    check(
+        "benchmark.build" in console_visible and "benchmark.sync" in console_visible,
+        "控制台應看得到六步流程的控制項",
+    )
+
+
+def verify_assistant_control_focus(client: TestClient) -> None:
+    """從某顆按鈕旁按 Ask AI 時，助手要知道問的是哪一顆。"""
+    context = client.post(
+        "/assistant/context",
+        json={
+            "route": "/benchmark",
+            "question": "為什麼不能按？",
+            "control_id": "benchmark.build",
+        },
+    ).json()["context"]
+
+    check(context["focused_control_id"] == "benchmark.build", "應記錄聚焦的控制項")
+    focused = [
+        item for item in context["page_visible_controls"] if item["focused"]
+    ]
+    check(len(focused) == 1, f"應剛好聚焦一顆控制項，實際 {len(focused)}")
+    check(focused[0]["control_id"] == "benchmark.build", "聚焦的控制項不正確")
+
+    # 未指名時不得亂標
+    plain = client.post(
+        "/assistant/context", json={"route": "/benchmark", "question": "hi"}
+    ).json()["context"]
+    check(
+        not any(item["focused"] for item in plain["page_visible_controls"]),
+        "沒有指名控制項時不應標記聚焦",
+    )
+
+    console = client.get("/benchmark").text
+    check("data-ask-control=" in console, "停用的按鈕旁應可指名該控制項發問")
 
 
 def verify_assistant_error_context(client: TestClient) -> None:
@@ -919,7 +997,8 @@ def verify_assistant_contract_with_mock_adapter() -> None:
     check(system["role"] == "system", "第一則應為系統提示")
     check("唯讀" in system["content"] or "只能讀取" in system["content"], "應宣告唯讀")
     check("目前流程狀態" in user["content"], "應附帶流程狀態")
-    check("這一頁的操作" in user["content"], "應附帶控制項與停用原因")
+    check("看得到的操作" in user["content"], "應附帶這一頁的控制項與停用原因")
+    check("整個流程的步驟動作" in user["content"], "應分開附帶流程層級動作")
     check("下一步要做什麼？" in user["content"], "應包含使用者的問題")
 
     # 模型失敗時降級，不拋例外
@@ -1005,6 +1084,8 @@ def main() -> int:
         verify_assistant_route_context(client)
         verify_assistant_entity_context(client)
         verify_assistant_knows_disabled_controls(client)
+        verify_assistant_controls_are_page_scoped(client)
+        verify_assistant_control_focus(client)
         verify_assistant_error_context(client)
         verify_assistant_retrieval(client)
         verify_assistant_never_leaks_secrets(client)

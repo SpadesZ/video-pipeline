@@ -27,7 +27,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
-from pipeline.benchmark import v1_pack
+from pipeline.benchmark import identity, v1_pack
 from pipeline.benchmark.attempts import AttemptLedger
 from pipeline.benchmark.target import BenchmarkTarget, targets
 from pipeline.models.production_profile import QCWeights
@@ -311,6 +311,22 @@ class BenchmarkReport(BaseModel):
     provisional_targets: list[str] = Field(default_factory=list)
     unattributed_variants: list[str] = Field(default_factory=list)
 
+    # 身份與目前 catalog 不符而未計入的資料。保留計數與說明，
+    # 讓報表能明說「這裡少算了什麼」，而不是靜靜地少算。
+    excluded_attempts: int = 0
+    excluded_variants: int = 0
+    excluded_continuity: int = 0
+    excluded_identities: list[str] = Field(default_factory=list)
+    identity_warnings: list[str] = Field(default_factory=list)
+
+    @property
+    def has_excluded(self) -> bool:
+        return bool(
+            self.excluded_attempts
+            or self.excluded_variants
+            or self.excluded_continuity
+        )
+
     def by_target(self, target_id: str) -> TargetAggregate | None:
         return next(
             (item for item in self.aggregates if item.target_id == target_id), None
@@ -360,9 +376,13 @@ def build_report(
     """依預先註冊的公式產生報表。
 
     variant_records 每筆需含 target_id、shot_id、weighted_score、
-    usable、human_minutes 與各維度分數。
-    continuity_records 每筆需含 target_id、shot_id、weighted_score
-    與 cross_shot_identity；shot_id 用於判定該筆屬於哪個情境。
+    usable、human_minutes 與各維度分數，以及 identity_key。
+    continuity_records 每筆需含 target_id、shot_id、weighted_score、
+    cross_shot_identity 與 identity_key；shot_id 用於判定所屬情境。
+
+    只有 identity_key 等於該 target 目前身份的資料會進入報表。
+    target_id 相同但版本不同的舊資料會被排除並計數：把 v1 與 v2 的
+    成績加在一起，得到的數字不對應任何真實存在的模型。
     """
     registry = targets()
     report = BenchmarkReport(ledger_errors=list(ledger.errors))
@@ -370,6 +390,27 @@ def build_report(
         item.target_id for item in registry.provisional_targets
     ]
     report.unattributed_variants = list(unattributed or [])
+    report.identity_warnings = list(getattr(ledger, "identity_warnings", []))
+
+    current = identity.current_identities()
+    current_keys = {item.key for item in current.values()}
+    excluded_keys: list[str] = []
+
+    def accepted(target_id: str, identity_key: str | None) -> bool:
+        """這筆資料是否屬於目前這一輪。"""
+        expected = current.get(target_id)
+        if expected is None:
+            return False
+        if identity_key is None:
+            # 呼叫端沒帶身份，無法確認版本。不猜，一律排除。
+            if expected.key not in excluded_keys:
+                excluded_keys.append(f"{target_id}（未提供身份）")
+            return False
+        if identity_key == expected.key:
+            return True
+        if identity_key not in excluded_keys:
+            excluded_keys.append(identity_key)
+        return False
 
     all_shots = [shot.shot_id for shot in v1_pack.shots()]
     by_scenario: dict[str, list[str]] = {}
@@ -401,10 +442,18 @@ def build_report(
             result.append(aggregate.scenarios[scenario_id])
         return result
 
-    # 嘗試紀錄是重試、耗時與成本的唯一來源
+    # 嘗試紀錄是重試、耗時與成本的唯一來源。身份取自寫入當下的欄位，
+    # 版本不符者不計入：舊版本的重試次數不是新版本的重試次數。
     for attempt in ledger.attempts:
         target = registry.by_id(attempt.target_id)
         if target is None:
+            continue
+        if attempt.unresolved_identity or not attempt.is_current(current_keys):
+            report.excluded_attempts += 1
+            if not attempt.unresolved_identity:
+                key = attempt.identity.key
+                if key not in excluded_keys:
+                    excluded_keys.append(key)
             continue
         aggregate = ensure(target)
         for scoped in scopes_for(aggregate, attempt.shot_id):
@@ -427,6 +476,9 @@ def build_report(
     for record in variant_records:
         target = registry.by_id(record["target_id"])
         if target is None:
+            continue
+        if not accepted(record["target_id"], record.get("identity_key")):
+            report.excluded_variants += 1
             continue
         aggregate = ensure(target)
         for scoped in scopes_for(aggregate, record["shot_id"]):
@@ -451,6 +503,9 @@ def build_report(
         target = registry.by_id(record["target_id"])
         if target is None:
             continue
+        if not accepted(record["target_id"], record.get("identity_key")):
+            report.excluded_continuity += 1
+            continue
         aggregate = ensure(target)
         # 連戲屬於主鏡頭所在的情境
         for scoped in scopes_for(aggregate, record.get("shot_id", "")):
@@ -462,6 +517,7 @@ def build_report(
                 )
 
     report.aggregates = [aggregates[key] for key in sorted(aggregates)]
+    report.excluded_identities = excluded_keys
 
     # 各情境獨立評選，刻意不產生跨情境總冠軍
     for award, criteria in AWARD_CRITERIA.items():

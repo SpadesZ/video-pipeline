@@ -512,10 +512,30 @@ class ContinuityPair(BaseModel):
     ref_variant_id: str | None = None
     scored: bool = False
     qc_id: str | None = None
+    # 這組鏡頭曾經評過，但當時比的是別的代表作
+    stale_scores: int = 0
 
     @property
     def key(self) -> str:
+        """頁面路由用的鍵。一組鏡頭配對在一個 target 下只有一個位置。"""
         return f"{self.target_id}|{self.shot_id}|{self.ref_shot_id}"
+
+    @property
+    def identity(self) -> str:
+        """這組評分對應的兩支實際影片。
+
+        少了 ref_variant_id 的話，換掉參照那一端的代表作之後，
+        系統會拿舊分數當成新配對的分數——而那個分數是比另外兩支片得到的。
+        """
+        return "|".join(
+            [
+                self.target_id,
+                self.shot_id,
+                self.ref_shot_id,
+                self.variant_id or "",
+                self.ref_variant_id or "",
+            ]
+        )
 
     @property
     def ready(self) -> bool:
@@ -552,29 +572,51 @@ def continuity_pairs(project_id: str = PROJECT_ID) -> list[ContinuityPair]:
         rows = session.exec(
             select(ContinuityQC).where(ContinuityQC.project_id == project_id)
         ).all()
-    scored = {
-        (row.shot_id, row.ref_shot_id or "", row.variant_id or ""): row
-        for row in rows
-    }
+
+    # 以「哪兩支影片被比過」索引，而不是以鏡頭位置索引。
+    owner = {item.variant_id: item.target_id for item in index.items}
+    scored: dict[str, ContinuityQC] = {}
+    by_position: dict[tuple[str, str, str], list[ContinuityQC]] = {}
+    for row in rows:
+        target_id = owner.get(row.variant_id or "", "")
+        key = "|".join(
+            [
+                target_id,
+                row.shot_id,
+                row.ref_shot_id or "",
+                row.variant_id or "",
+                row.ref_variant_id or "",
+            ]
+        )
+        scored[key] = row
+        by_position.setdefault(
+            (target_id, row.shot_id, row.ref_shot_id or ""), []
+        ).append(row)
 
     pairs: list[ContinuityPair] = []
     for item in target.targets().targets:
         for shot_id, ref_shot_id in v1_pack.CONTINUITY_PAIRS:
-            variant_id = selected.get((item.target_id, shot_id))
-            ref_variant_id = selected.get((item.target_id, ref_shot_id))
-            existing = scored.get((shot_id, ref_shot_id, variant_id or ""))
-            pairs.append(
-                ContinuityPair(
-                    target_id=item.target_id,
-                    shot_id=shot_id,
-                    ref_shot_id=ref_shot_id,
-                    scenario=v1_pack.SHOT_SCENARIOS.get(shot_id, ""),
-                    variant_id=variant_id,
-                    ref_variant_id=ref_variant_id,
-                    scored=existing is not None,
-                    qc_id=existing.qc_id if existing else None,
-                )
+            pair = ContinuityPair(
+                target_id=item.target_id,
+                shot_id=shot_id,
+                ref_shot_id=ref_shot_id,
+                scenario=v1_pack.SHOT_SCENARIOS.get(shot_id, ""),
+                variant_id=selected.get((item.target_id, shot_id)),
+                ref_variant_id=selected.get((item.target_id, ref_shot_id)),
             )
+            existing = scored.get(pair.identity) if pair.ready else None
+            pair.scored = existing is not None
+            pair.qc_id = existing.qc_id if existing else None
+            # 同一組鏡頭下比過但配對不同的舊評分，保留但不沿用
+            history = by_position.get(
+                (item.target_id, shot_id, ref_shot_id), []
+            )
+            pair.stale_scores = sum(
+                1
+                for row in history
+                if existing is None or row.qc_id != existing.qc_id
+            )
+            pairs.append(pair)
     return pairs
 
 

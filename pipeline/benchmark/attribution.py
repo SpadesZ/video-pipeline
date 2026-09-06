@@ -18,10 +18,11 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
+from pipeline.benchmark import identity
 from pipeline.benchmark.target import BenchmarkTarget, targets
 from pipeline.models.variant import AssetVariant, CapabilityJob
 
-TARGET_PARAMETER_KEY = "_bm_target_id"
+TARGET_PARAMETER_KEY = identity.TARGET_ID_KEY
 
 
 class AmbiguousAttribution(ValueError):
@@ -67,8 +68,15 @@ class AttributedVariant(BaseModel):
     # 不可與新版的結果放在一起比較。
     version_drift: bool = False
     current_model_version: str | None = None
+    # 派工當下的完整身份。歷史資料的真相，不隨 catalog 改變。
+    identity_key: str = ""
 
     model_config = {"protected_namespaces": ()}
+
+    @property
+    def is_current(self) -> bool:
+        """屬於目前這一輪。version_drift 為 True 者一律不是。"""
+        return not self.version_drift
 
 
 class AttributionIndex(BaseModel):
@@ -80,6 +88,16 @@ class AttributionIndex(BaseModel):
 
     def for_target(self, target_id: str) -> list[AttributedVariant]:
         return [item for item in self.items if item.target_id == target_id]
+
+    @property
+    def current(self) -> list[AttributedVariant]:
+        """派工身份與 catalog 現值相符的候選。只有這些可進正式報表。"""
+        return [item for item in self.items if item.is_current]
+
+    @property
+    def historical(self) -> list[AttributedVariant]:
+        """舊版本產物。保留可追溯，但不計入目前這一輪的統計。"""
+        return [item for item in self.items if not item.is_current]
 
     def for_shot(self, target_id: str, shot_id: str) -> list[AttributedVariant]:
         return [
@@ -158,22 +176,23 @@ def build_index(project_id: str) -> AttributionIndex:
         # 身份取自派工當下的快照，不取 catalog 現值。使用者之後在
         # /benchmark/targets 修正版本字串時，舊影片必須仍顯示它實際
         # 生成時的版本，否則舊資料會被冒充成新版本的成績。
-        snapshot_version = parameters.get("_bm_model_version") or None
-        dispatched_version = job.model_version or snapshot_version
-        current_version = target.model_version
+        dispatched = identity.from_job(job)
+        if dispatched is None:  # pragma: no cover - 上面已確認有 target 標記
+            index.unattributed.append(variant.variant_id)
+            continue
+        current = identity.from_target(target)
 
         index.items.append(
             AttributedVariant(
                 variant_id=variant.variant_id,
                 shot_id=variant.shot_id,
-                target_id=target.target_id,
-                provider=job.provider or target.provider,
-                model_id=job.model_id or target.model_id,
-                model_version=dispatched_version,
-                current_model_version=current_version,
-                version_drift=bool(
-                    (dispatched_version or "") != (current_version or "")
-                ),
+                target_id=dispatched.target_id,
+                provider=dispatched.provider,
+                model_id=dispatched.model_id,
+                model_version=dispatched.model_version,
+                current_model_version=current.model_version,
+                identity_key=dispatched.key,
+                version_drift=not dispatched.matches(current),
                 local_path=variant.local_path,
                 # 匯入時檔案會被改名為 var_<uuid>，但人工在 ledger 記的是
                 # 平台下載的原始檔名。拿內部檔名去對，永遠對不上。

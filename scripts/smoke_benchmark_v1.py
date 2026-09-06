@@ -1166,11 +1166,19 @@ def verify_aggregation_is_deterministic() -> None:
         add(strong.target_id, shot.shot_id, ["success"])
         add(weak.target_id, shot.shot_id, ["failed", "failed", "success"])
 
+    # 報表只納入身份與 catalog 現值相符的資料，因此 fixture 必須表明
+    # 每一筆屬於哪個版本，否則會被當成舊版資料排除。
+    from pipeline.benchmark import identity as identity_module
+
+    strong_key = identity_module.from_target(strong).key
+    weak_key = identity_module.from_target(weak).key
+
     variant_records = []
     for shot in shots:
         variant_records.append(
             {
                 "target_id": strong.target_id,
+                "identity_key": strong_key,
                 "shot_id": shot.shot_id,
                 "weighted_score": 85.0,
                 "usable": True,
@@ -1188,6 +1196,7 @@ def verify_aggregation_is_deterministic() -> None:
         variant_records.append(
             {
                 "target_id": weak.target_id,
+                "identity_key": weak_key,
                 "shot_id": shot.shot_id,
                 "weighted_score": 55.0,
                 "usable": False,
@@ -1207,12 +1216,14 @@ def verify_aggregation_is_deterministic() -> None:
     continuity_records = [
         {
             "target_id": strong.target_id,
+            "identity_key": strong_key,
             "shot_id": dialogue_shot,
             "weighted_score": 88.0,
             "cross_shot_identity": 92.0,
         },
         {
             "target_id": weak.target_id,
+            "identity_key": weak_key,
             "shot_id": dialogue_shot,
             "weighted_score": 40.0,
             "cross_shot_identity": 38.0,

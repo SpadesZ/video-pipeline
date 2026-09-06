@@ -59,6 +59,9 @@ NA_VALUES = {"", "n/a", "na", "-", "none", "null"}
 class Attempt(BaseModel):
     scenario: str
     shot_id: str
+    # 以下四欄構成這次嘗試的身份，一律取自 CSV 寫入當下的值。
+    # 絕不可用目前的 catalog 覆寫：昨天用 v1 試了十次，今天把 target
+    # 改成 v2，那十次不會因此變成 v2 的重試次數。
     target_id: str
     provider: str
     model_id: str
@@ -72,15 +75,44 @@ class Attempt(BaseModel):
     failure_reason: str | None = None
     notes: str | None = None
 
+    # catalog 已無此 target，或身份欄位不全，無法判定屬於哪一輪
+    unresolved_identity: bool = False
+
+    model_config = {"protected_namespaces": ()}
+
     @property
     def succeeded(self) -> bool:
         return self.status == AttemptStatus.SUCCESS
+
+    @property
+    def identity(self):
+        from pipeline.benchmark import identity as identity_module
+
+        return identity_module.from_row(
+            self.target_id, self.provider, self.model_id, self.model_version
+        )
+
+    def is_current(self, current_keys: set[str]) -> bool:
+        """屬於目前這一輪。身份不全者一律不算，不猜。"""
+        if self.unresolved_identity:
+            return False
+        return self.identity.key in current_keys
 
 
 class AttemptLedger(BaseModel):
     path: str
     attempts: list[Attempt] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    # 身份不全、無法判定版本的列。不是錯誤，但不能計入目前這一輪。
+    identity_warnings: list[str] = Field(default_factory=list)
+
+    def current(self, current_keys: set[str]) -> list[Attempt]:
+        """屬於目前這一輪的嘗試。"""
+        return [item for item in self.attempts if item.is_current(current_keys)]
+
+    def historical(self, current_keys: set[str]) -> list[Attempt]:
+        """舊版本或身份不明的嘗試。保留可追溯，不計入統計。"""
+        return [item for item in self.attempts if not item.is_current(current_keys)]
 
     def for_target(self, target_id: str) -> list[Attempt]:
         return [item for item in self.attempts if item.target_id == target_id]
@@ -99,6 +131,12 @@ class AttemptLedger(BaseModel):
             if item.target_id not in seen:
                 seen.append(item.target_id)
         return seen
+
+
+def _identity_from_target(target):
+    from pipeline.benchmark import identity as identity_module
+
+    return identity_module.from_target(target)
 
 
 def _number(raw: str | None) -> float | None:
@@ -156,14 +194,27 @@ def write_blank_ledger(
 
 
 def read_ledger(path: Path) -> AttemptLedger:
-    """讀取 ledger。未填 status 的列視為尚未執行，直接略過。"""
+    """讀取 ledger。未填 status 的列視為尚未執行，直接略過。
+
+    身份欄位（provider / model_id / model_version）一律以 CSV 內容為準。
+    catalog 只用來判斷該 target 是否仍存在，不得回頭改寫已寫入的身份：
+    那會讓昨天用舊版本跑出來的失敗次數，today 變成新版本的失敗次數。
+
+    舊檔缺身份欄位時標記 unresolved_identity，寧可排除也不猜版本。
+    """
     ledger = AttemptLedger(path=str(path))
     if not Path(path).exists():
         return ledger
 
     registry = targets()
     with Path(path).open(encoding="utf-8-sig", newline="") as handle:
-        for line_no, row in enumerate(csv.DictReader(handle), start=2):
+        reader = csv.DictReader(handle)
+        columns = set(reader.fieldnames or ())
+        # 舊版 ledger 可能沒有身份欄位。缺欄位不是錯誤，但那些列
+        # 無法判定版本，一律視為 unresolved 而非歸給目前的版本。
+        has_identity_columns = {"provider", "model_id"} <= columns
+
+        for line_no, row in enumerate(reader, start=2):
             status = (row.get("status") or "").strip().lower()
             if not status:
                 continue
@@ -193,15 +244,26 @@ def read_ledger(path: Path) -> AttemptLedger:
                 ledger.errors.append(f"line {line_no}: attempt_no 非數字")
                 continue
 
+            recorded_provider = (row.get("provider") or "").strip()
+            recorded_model = (row.get("model_id") or "").strip()
+            unresolved = not has_identity_columns or not (
+                recorded_provider and recorded_model
+            )
+            if unresolved:
+                ledger.identity_warnings.append(
+                    f"line {line_no}: {target_id}/{shot_id} 缺少記錄當下的"
+                    "平台或模型，無法判定屬於哪一個版本，不計入目前這一輪"
+                )
+
             try:
                 ledger.attempts.append(
                     Attempt(
                         scenario=v1_pack.SHOT_SCENARIOS[shot_id],
                         shot_id=shot_id,
                         target_id=target_id,
-                        provider=target.provider,
-                        model_id=target.model_id,
-                        model_version=target.model_version,
+                        provider=recorded_provider,
+                        model_id=recorded_model,
+                        model_version=_text(row.get("model_version")),
                         attempt_no=attempt_no,
                         status=status,
                         generation_seconds=_number(row.get("generation_seconds")),
@@ -210,6 +272,7 @@ def read_ledger(path: Path) -> AttemptLedger:
                         variant_id=_text(row.get("variant_id")),
                         failure_reason=_text(row.get("failure_reason")),
                         notes=_text(row.get("notes")),
+                        unresolved_identity=unresolved,
                     )
                 )
             except ValueError as error:
@@ -227,16 +290,26 @@ def append_attempt(
     generation_seconds: str | None = None,
     credits_used: str | None = None,
     failure_reason: str | None = None,
+    identity=None,
 ) -> int:
     """追加一筆嘗試紀錄，回傳該組合的第幾次嘗試。
 
     以追加而非覆寫的方式寫入：實際重試次數常多於預留列數，
     而每一次嘗試都必須留下痕跡。
+
+    identity 應由呼叫端從派工快照取得。從 Job Workbench 記錄時，
+    使用者眼前那份派工才是他剛剛在平台上跑的東西；catalog 可能在
+    派工之後被改過，拿它來填就會把這次嘗試記成別的版本。
+    未提供時退回 catalog 現值，僅適用於沒有派工脈絡的手動補記。
     """
     registry = targets()
     target = registry.by_id(target_id)
     if target is None:
         raise ValueError(f"未登錄的比較對象: {target_id}")
+    if identity is not None and identity.target_id != target_id:
+        raise ValueError(
+            f"派工身份的 target {identity.target_id} 與指定的 {target_id} 不符"
+        )
     if shot_id not in v1_pack.SHOT_SCENARIOS:
         raise ValueError(f"未知的鏡頭: {shot_id}")
     normalised = (status or "").strip().lower()
@@ -274,13 +347,14 @@ def append_attempt(
         ),
         None,
     )
+    recorded = identity if identity is not None else _identity_from_target(target)
     payload = {
         "scenario": v1_pack.SHOT_SCENARIOS[shot_id],
         "shot_id": shot_id,
         "target_id": target_id,
-        "provider": target.provider,
-        "model_id": target.model_id,
-        "model_version": target.model_version or "",
+        "provider": recorded.provider,
+        "model_id": recorded.model_id,
+        "model_version": recorded.model_version or "",
         "attempt_no": attempt_no,
         "status": normalised,
         "generation_seconds": (generation_seconds or "").strip(),

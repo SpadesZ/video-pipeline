@@ -51,9 +51,11 @@ class ControlContext(BaseModel):
     control_id: str
     label: str
     action: str
-    enabled: bool
+    enabled: bool = True
     disabled_reason: str | None = None
     danger_level: str = "safe"
+    # 使用者是從這顆按鈕旁邊按 Ask AI 進來的
+    focused: bool = False
 
 
 class ErrorContext(BaseModel):
@@ -87,7 +89,11 @@ class AssistantContext(BaseModel):
     entity_id: str = ""
     entity: dict = Field(default_factory=dict)
     workflow: WorkflowContext | None = None
-    controls: list[ControlContext] = Field(default_factory=list)
+    # 使用者眼前這一頁真的看得到的操作
+    page_visible_controls: list[ControlContext] = Field(default_factory=list)
+    # 整個流程的動作，可能在別的頁面上。用來回答「接下來要去哪裡做什麼」
+    workflow_actions: list[ControlContext] = Field(default_factory=list)
+    focused_control_id: str = ""
     errors: list[ErrorContext] = Field(default_factory=list)
     retrieved: list[knowledge.KnowledgeCard] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
@@ -126,17 +132,29 @@ class AssistantContext(BaseModel):
             )
             blocks.append(f"目前檢視的 {self.entity_type}：\n{fields}")
 
-        if self.controls:
+        def describe(items: list[ControlContext]) -> str:
             lines = []
-            for item in self.controls:
+            for item in items:
                 status = (
                     "可按" if item.enabled else f"停用（{item.disabled_reason}）"
                 )
+                mark = " ← 使用者問的是這一顆" if item.focused else ""
                 lines.append(
                     f"  「{item.label}」[{item.control_id}] {status}"
-                    f" — {item.action}"
+                    f" — {item.action}{mark}"
                 )
-            blocks.append("這一頁的操作：\n" + "\n".join(lines))
+            return "\n".join(lines)
+
+        if self.page_visible_controls:
+            blocks.append(
+                "使用者這一頁看得到的操作：\n"
+                + describe(self.page_visible_controls)
+            )
+        if self.workflow_actions:
+            blocks.append(
+                "整個流程的步驟動作（不一定在這一頁，回答時要說明要去哪一頁）：\n"
+                + describe(self.workflow_actions)
+            )
 
         if self.errors:
             lines = []
@@ -201,6 +219,42 @@ def _continuity_entity(entity_id: str, project_id: str) -> dict:
     }
 
 
+# 控制台把六個步驟的操作全部畫在同一頁，所以那一頁的「眼前控制項」
+# 就是整組 workflow controls。其他頁面各自只顯示自己的操作。
+WORKFLOW_CONTROL_ROUTES = ("/benchmark",)
+
+
+def _page_controls(
+    route: str, page, runtime: dict[str, ControlContext]
+) -> list[ControlContext]:
+    """這一頁實際看得到的操作。
+
+    來源是 pages.yaml 宣告的頁面控制項，而不是整個 workflow：
+    使用者在 Job Workbench 問「這個按鈕是什麼」，指的不可能是
+    連戲評分頁上的按鈕。有對應的 workflow 控制項時併入執行期狀態，
+    這樣停用原因不會有兩個版本。
+    """
+    if route.rstrip("/") in WORKFLOW_CONTROL_ROUTES:
+        return list(runtime.values())
+    if page is None:
+        return []
+    controls = []
+    for item in page.controls:
+        existing = runtime.get(item.id)
+        if existing is not None:
+            controls.append(existing.model_copy())
+            continue
+        controls.append(
+            ControlContext(
+                control_id=item.id,
+                label=item.label,
+                action=item.effect,
+                enabled=True,
+            )
+        )
+    return controls
+
+
 def build(
     settings: Settings,
     route: str,
@@ -209,12 +263,16 @@ def build(
     entity_id: str = "",
     error_code: str = "",
     error_message: str = "",
+    control_id: str = "",
 ) -> AssistantContext:
     """組出脈絡。任何一層失敗都降級為缺少那一層，不讓助手整個壞掉。"""
     from pipeline.benchmark import workflow as bm_workflow
 
     context = AssistantContext(
-        route=route or "/", entity_type=entity_type, entity_id=entity_id
+        route=route or "/",
+        entity_type=entity_type,
+        entity_id=entity_id,
+        focused_control_id=control_id or "",
     )
 
     page = knowledge.page_for_route(context.route)
@@ -257,7 +315,7 @@ def build(
                 ),
                 provisional_target_ids=list(state.provisional_target_ids),
             )
-            context.controls = [
+            context.workflow_actions = [
                 ControlContext(
                     control_id=item.control_id,
                     label=item.label,
@@ -307,6 +365,28 @@ def build(
                 next_route=doc.next if doc else "",
             ),
         )
+
+    # 眼前的控制項與流程動作分開。合在一起的話，使用者在派工頁問
+    # 「為什麼不能按」，助手可能拿連戲頁的按鈕來回答。
+    runtime = {item.control_id: item for item in context.workflow_actions}
+    context.page_visible_controls = _page_controls(context.route, page, runtime)
+
+    if control_id:
+        found = False
+        for item in context.page_visible_controls:
+            if item.control_id == control_id:
+                item.focused = True
+                found = True
+        if not found:
+            # 頁面沒宣告這顆控制項，但使用者確實是從它旁邊問的
+            existing = runtime.get(control_id)
+            if existing is not None:
+                focused = existing.model_copy(update={"focused": True})
+                context.page_visible_controls.append(focused)
+            else:
+                context.notes.append(
+                    f"使用者問的控制項 {control_id} 不在這一頁的宣告中"
+                )
 
     # 只有問到系統概念時才檢索，一般的操作問題由上面的狀態回答
     if question:

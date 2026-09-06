@@ -75,6 +75,19 @@ class JobView(BaseModel):
         return f"{self.model_id or '—'}@{self.model_version or '版本未確認'}"
 
     @property
+    def identity(self):
+        """這份派工當下的身份。記錄嘗試與判定歸屬時的真相來源。"""
+        from pipeline.benchmark import identity as identity_module
+
+        return identity_module.from_row(
+            self.target_id or "",
+            self.provider,
+            self.model_id or "",
+            self.model_version,
+            self.ui_label,
+        )
+
+    @property
     def complete(self) -> bool:
         return self.variants_imported > 0
 

@@ -40,6 +40,8 @@ class AskRequest(BaseModel):
     entity_id: str = ""
     error_code: str = ""
     error_message: str = ""
+    # 使用者從某顆按鈕旁邊按 Ask AI 時帶入，讓助手知道問的是哪一顆
+    control_id: str = ""
 
 
 def _build(payload: AskRequest, settings: Settings):
@@ -51,6 +53,7 @@ def _build(payload: AskRequest, settings: Settings):
         entity_id=payload.entity_id,
         error_code=payload.error_code,
         error_message=payload.error_message,
+        control_id=payload.control_id,
     )
 
 
