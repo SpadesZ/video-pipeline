@@ -263,12 +263,16 @@ def auto_select_benchmark_candidates(project_id: str) -> int:
     確定性規則：取該組合中最早匯入的候選。人工可再手動改選，
     但至少保證每個組合都有一支可供連戲比較，不會因為漏選而缺資料。
     回傳新選定的組合數。
+
+    只考慮目前這一輪的候選。換版本之後，舊版本的代表作仍掛著選定旗標，
+    若以「這組已經有人選了」為由跳過，新版本就永遠不會有代表作，
+    連戲評分會全部落在舊版本的影片上而不自知。
     """
     from pipeline.db import engine
 
     index = build_index(project_id)
     groups: dict[tuple[str, str], list[AttributedVariant]] = {}
-    for item in index.items:
+    for item in index.current:
         groups.setdefault((item.target_id, item.shot_id), []).append(item)
 
     selected = 0

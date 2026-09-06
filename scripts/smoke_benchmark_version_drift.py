@@ -444,6 +444,29 @@ def main() -> int:
             "H. 目前這一輪的嘗試紀錄應全為 v2",
         )
 
+        # 自動選片必須挑當輪的候選。沿用舊版本的代表作，會讓連戲評分
+        # 全部落在舊影片上，而畫面上看起來一切正常。
+        auto = attribution.auto_select_benchmark_candidates(PROJECT_ID)
+        after_auto = attribution.build_index(PROJECT_ID)
+        stale_reps = [
+            item.variant_id
+            for item in after_auto.historical
+            if item.benchmark_selected
+        ]
+        check(
+            not stale_reps,
+            f"自動選片後不得有舊版本仍是代表作: {stale_reps}",
+        )
+        current_reps = {
+            item.shot_id
+            for item in after_auto.current
+            if item.target_id == primary and item.benchmark_selected
+        }
+        check(
+            len(current_reps) == len(v1_pack.shots()),
+            f"每顆鏡頭都應有當輪代表作，實際 {len(current_reps)}（新選 {auto} 組）",
+        )
+
         # 報表頁必須說出少算了什麼，而不是靜靜地少算
         results = client.get("/benchmark/results")
         check(results.status_code == 200, "結果頁應可開啟")
