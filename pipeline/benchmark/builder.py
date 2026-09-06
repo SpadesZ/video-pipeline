@@ -113,6 +113,25 @@ def check_assets(settings: Settings) -> AssetReport:
     return report
 
 
+def asset_label(description: str) -> str:
+    """素材說明的短標題。
+
+    直接截斷長說明會切在句子中間，變成「角色 A 的視覺設定圖。短髮、
+    深色長風衣的女性，：尚未上傳」這種讀不通的句子。改成取第一個
+    句號或冒號之前的部分，那正好是這批說明的自然標題。
+    """
+    text = (description or "").strip()
+    # 兩種寫法都有：「角色 A 的視覺設定圖。短髮…」以句號分隔，
+    # 「A1 首幀：角色 A 站在…」以冒號分隔。取最短的那個開頭，
+    # 才不會在冒號式的說明上切出整句話。
+    heads = [
+        head
+        for separator in ("。", "：")
+        if (head := text.split(separator, 1)[0]) != text and head
+    ]
+    return (min(heads, key=len) if heads else text)[:30]
+
+
 def required_asset(asset_id: str):
     """依 asset_id 取得素材規格。未登錄的 id 一律拒絕。"""
     found = next(
@@ -230,9 +249,8 @@ def evaluate_build_gate(
                 BuildBlocker(
                     code="asset_not_ready",
                     message=(
-                        f"{item.description[:24]}：{'; '.join(item.problems)}"
-                        if item.problems
-                        else f"{item.description[:24]}：尚未上傳"
+                        f"{asset_label(item.description)}："
+                        + ("; ".join(item.problems) if item.problems else "尚未上傳")
                     ),
                     fix_link="/benchmark/assets",
                 )

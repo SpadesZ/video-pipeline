@@ -237,14 +237,25 @@ def home(settings: Settings = Depends(settings_dep)) -> str:
         title="Video Pipeline",
         active_nav="projects",
         body=f"""
-        <section class="app-shell">
+        <section class="app-shell" data-route="/" data-entity-type="home">
           <header class="topbar">
             <div>
               <p class="eyebrow">Local production desk</p>
               <h1>Video Pipeline Dashboard</h1>
             </div>
           </header>
- 
+
+          <section class="panel benchmark-entry">
+            <div>
+              <strong>要比較各平台的生成品質？</strong>
+              <p class="muted">
+                V1 Benchmark 把四個平台在六顆固定鏡頭上的表現走成六個步驟，
+                從上傳參考素材開始。真實生成在各平台手動完成。
+              </p>
+            </div>
+            <a class="button-link primary" href="/benchmark">開始 V1 Benchmark</a>
+          </section>
+
           <section class="overview-grid">
             {stat_card("Projects", str(len(projects)), "built locally")}
             {stat_card("Upload Ready", str(ready_count), "final approved")}
@@ -406,7 +417,10 @@ def project_detail(project_id: str, settings: Settings = Depends(settings_dep)) 
         title=artifact.title,
         active_nav="projects",
         body=f"""
-        <section class="app-shell detail-page">
+        <section class="app-shell detail-page"
+                 data-route="/projects/{escape(artifact.project_id)}/view"
+                 data-entity-type="project"
+                 data-entity-id="{escape(artifact.project_id)}">
           <header class="project-hero">
             <div>
               <h1>{escape(artifact.title)}</h1>
@@ -872,6 +886,38 @@ def project_file(project_id: str, filename: str, settings: Settings = Depends(se
     return FileResponse(path)
 
 
+@router.get("/projects/{project_id}/variants/{variant_id}/video")
+def variant_video(
+    project_id: str, variant_id: str, settings: Settings = Depends(settings_dep)
+) -> FileResponse:
+    """播放已匯入的候選。
+
+    評分需要看得到影片。路徑由 variant_id 查表取得，並確認該候選確實
+    屬於這個專案，不接受任意檔名。
+    """
+    from sqlmodel import Session
+
+    from pipeline.db import engine
+    from pipeline.models.variant import AssetVariant
+
+    with Session(engine) as session:
+        variant = session.get(AssetVariant, variant_id)
+    back = f"/projects/{project_id}/view#variants"
+    if variant is None or variant.project_id != project_id:
+        raise WebException(
+            detail=f"專案 {project_id} 中找不到候選 {variant_id}",
+            status_code=404,
+            back_link=back,
+        )
+    if not variant.local_path or not Path(variant.local_path).exists():
+        raise WebException(
+            detail=f"候選 {variant_id} 的影片檔不存在",
+            status_code=404,
+            back_link=back,
+        )
+    return FileResponse(Path(variant.local_path), media_type="video/mp4")
+
+
 def next_status_for_action(artifact: ProductionArtifact, action: str) -> ReviewStatus:
     current = artifact.review_status
     if action == "approve_cues":
@@ -1016,6 +1062,13 @@ def assistant_widget() -> str:
         max-height: min(560px, calc(100vh - 90px));
         display: flex; flex-direction: column;
         background: #131a26; border: 1px solid #2a3344; border-radius: 10px;
+      }
+      /* display: flex 會蓋掉 [hidden] 的 UA 樣式，少了這一條，
+         聊天視窗會在每一頁載入時都是展開的，擋住右下角。 */
+      .ai-panel[hidden] { display: none; }
+      .benchmark-entry {
+        display: flex; justify-content: space-between; align-items: center;
+        gap: 16px; flex-wrap: wrap; margin-bottom: 16px;
       }
       .ai-head {
         display: flex; justify-content: space-between; align-items: center;
@@ -1664,10 +1717,22 @@ def variant_panel(artifact: ProductionArtifact) -> str:
                     '<button class="ghost-button" type="submit">設為代表作</button>'
                     "</form>"
                 )
+            # 沒有播放器就無法評分：temporal_stability、motion_quality、
+            # artifact_severity 都得看過影片才填得出來。原本這裡只有
+            # metadata 與一排輸入框，等於要人憑印象打分。
+            preview = (
+                f'<details class="variant-preview"><summary>播放</summary>'
+                f'<video controls preload="none" '
+                f'src="/projects/{escape(project_id)}/variants/'
+                f'{escape(variant.variant_id)}/video">'
+                f"</video></details>"
+                if variant.local_path
+                else '<span class="muted">無檔案</span>'
+            )
             rows.append(
                 f"""
             <tr class="variant-row{selected}">
-              <td class="mono">{escape(variant.variant_id[-16:])}</td>
+              <td class="mono">{escape(variant.variant_id[-16:])}{preview}</td>
               <td>{origin}</td>
               <td class="mono">{escape(duration)}</td>
               <td class="mono">{escape(variant.resolution or "?")}</td>

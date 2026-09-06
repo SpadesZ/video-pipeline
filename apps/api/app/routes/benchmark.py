@@ -270,9 +270,10 @@ def _asset_slot(status: builder.AssetStatus, flash: dict | None) -> str:
     return f"""
     <div class="asset-slot" id="{escape(status.asset_id)}">
       <div class="slot-head">
-        <strong>{escape(status.description[:34])}</strong>
+        <strong>{escape(builder.asset_label(status.description))}</strong>
         {badge}
       </div>
+      <p class="slot-desc">{escape(status.description)}</p>
       {preview}
       <div class="slot-specs">{spec_rows}</div>
       {problems}
@@ -351,6 +352,8 @@ def assets_page(
           .slot-preview.empty {{ display: flex; align-items: center;
                                  justify-content: center; color: #55607a;
                                  font-size: 12px; }}
+          .slot-desc {{ font-size: 11px; color: #8a94a6; line-height: 1.5;
+                        margin: 0 0 8px; }}
           .slot-specs {{ display: grid; gap: 2px; margin: 8px 0; font-size: 12px; }}
           .slot-specs div {{ display: flex; justify-content: space-between; gap: 8px; }}
           .slot-problems {{ margin: 6px 0; padding-left: 16px; color: #e88;
@@ -1232,7 +1235,8 @@ def attempts_form(settings: Settings = Depends(settings_dep)) -> str:
         title="記錄生成嘗試",
         active_nav="benchmark",
         body=f"""
-        <section class="app-shell">
+        <section class="app-shell" data-route="/benchmark/attempts"
+                 data-step="4" data-entity-type="benchmark_attempts">
           <header class="project-hero">
             <div>
               <h1>記錄生成嘗試</h1>
@@ -1344,23 +1348,9 @@ async def record_attempt(
 # Step 5: 連戲評分
 # --------------------------------------------------------------------------
 
-@router.get("/benchmark/variants/{variant_id}/video")
-def variant_video(variant_id: str, settings: Settings = Depends(settings_dep)):
-    """播放候選影片。只服務本 benchmark 專案內的候選。"""
-    from app.routes.web import WebException
-
-    with Session(engine) as session:
-        variant = session.get(AssetVariant, variant_id)
-    if variant is None or variant.project_id != PROJECT_ID:
-        raise WebException(
-            detail=f"找不到候選 {variant_id}", back_link="/benchmark/continuity"
-        )
-    if not variant.local_path or not Path(variant.local_path).exists():
-        raise WebException(
-            detail=f"候選 {variant_id} 的影片檔不存在",
-            back_link="/benchmark/continuity",
-        )
-    return FileResponse(Path(variant.local_path), media_type="video/mp4")
+def variant_video_url(variant_id: str) -> str:
+    """候選影片的播放路徑。與專案頁的播放器共用同一個端點。"""
+    return f"/projects/{PROJECT_ID}/variants/{variant_id}/video"
 
 
 @router.get("/benchmark/continuity", response_class=HTMLResponse)
@@ -1521,13 +1511,13 @@ def continuity_form(
               <div>
                 <strong class="mono">{escape(pair.shot_id)}</strong>
                 <video controls preload="metadata"
-                       src="/benchmark/variants/{escape(pair.variant_id)}/video"></video>
+                       src="{escape(variant_video_url(pair.variant_id))}"></video>
                 <p class="mono muted">{escape(pair.variant_id)}</p>
               </div>
               <div>
                 <strong class="mono">{escape(pair.ref_shot_id)}</strong>
                 <video controls preload="metadata"
-                       src="/benchmark/variants/{escape(pair.ref_variant_id)}/video"></video>
+                       src="{escape(variant_video_url(pair.ref_variant_id))}"></video>
                 <p class="mono muted">{escape(pair.ref_variant_id)}</p>
               </div>
             </div>
@@ -1789,7 +1779,8 @@ def benchmark_results(settings: Settings = Depends(settings_dep)) -> str:
         title="Benchmark 結果",
         active_nav="benchmark",
         body=f"""
-        <section class="app-shell">
+        <section class="app-shell" data-route="/benchmark/results"
+                 data-step="6" data-entity-type="benchmark_results">
           <header class="project-hero">
             <div>
               <h1>Benchmark 結果</h1>

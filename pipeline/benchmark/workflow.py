@@ -389,11 +389,8 @@ def collect(settings: Settings) -> WorkflowState:
             report.invalid
         )
         state.asset_problems = [
-            (
-                f"{item.description[:28]}：{'; '.join(item.problems)}"
-                if item.problems
-                else f"{item.description[:28]}：尚未上傳"
-            )
+            f"{builder.asset_label(item.description)}："
+            + ("; ".join(item.problems) if item.problems else "尚未上傳")
             for item in [*report.missing, *report.invalid]
         ]
     except Exception as error:  # noqa: BLE001

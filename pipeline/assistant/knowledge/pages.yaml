@@ -82,6 +82,14 @@ pages:
         label: 儲存並下一組
         effect: 寫入或覆寫這組配對的評分，然後跳到下一組尚未評分的配對。
 
+  - route: /benchmark/attempts
+    title: 記錄生成嘗試
+    purpose: 手動補記一次平台生成，不論成功或失敗。
+    detail: >
+      正常情況下從 Job Workbench 記錄即可，那裡已經知道是哪顆鏡頭與哪個對象。
+      這一頁是補記用的：忘了記、或在別的機器上生成完才回來補。
+      失敗與取消都要記，只統計成功的候選會嚴重高估平台表現。
+
   - route: /benchmark/results
     title: Benchmark 結果
     purpose: 依情境呈現各比較對象的可用率、重試次數與人工修補成本。

@@ -496,8 +496,14 @@ def verify_continuity_web_flow(client: TestClient) -> None:
     check(form.status_code == 200, "評分頁應可開啟")
     check(form.text.count("<video controls") == 2, "應並排顯示兩支影片")
 
-    video = client.get(f"/benchmark/variants/{pair.variant_id}/video")
+    video = client.get(f"/projects/{PROJECT_ID}/variants/{pair.variant_id}/video")
     check(video.status_code == 200, "候選影片應可播放")
+    check(
+        f"/projects/{PROJECT_ID}/variants/{pair.variant_id}/video" in form.text,
+        "評分頁應指向共用的播放端點",
+    )
+    foreign = client.get(f"/projects/other_project/variants/{pair.variant_id}/video")
+    check(foreign.status_code == 404, "不得跨專案播放候選")
 
     saved = client.post(
         f"/benchmark/continuity/{pair.target_id}/{pair.shot_id}",
