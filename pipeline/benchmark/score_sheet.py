@@ -248,19 +248,28 @@ def sync_continuity_sheet(output_dir: Path, project_id: str) -> tuple[Path, int]
 
     使用 benchmark_selected 而非 production 的 status=selected：
     後者每顆鏡頭全域只能有一支，四個比較對象就無法各自成對。
+
+    代表作只取當輪候選。舊版本的候選即使還留著選定旗標也不算數，
+    否則同一組會有兩支代表作，寫進表裡的是哪一支取決於排序。
     """
     from pipeline.benchmark.attribution import build_index
 
     attribution = build_index(project_id)
     selection = {
         (item.target_id, item.shot_id): item.variant_id
-        for item in attribution.items
+        for item in attribution.current
         if item.benchmark_selected
     }
 
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / CONTINUITY_SHEET
-    previous = _load_existing(path, ("target_id", "shot_id", "ref_shot_id"))
+    # 保留人工填寫的分數時，鍵必須含兩支 variant_id。只用鏡頭位置當鍵，
+    # 換過代表作之後，上一組配對的分數會被原樣搬到新的配對上，
+    # 而那個分數是比另外兩支影片得到的。
+    previous = _load_existing(
+        path,
+        ("target_id", "shot_id", "ref_shot_id", "variant_id", "ref_variant_id"),
+    )
     rows = 0
 
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
@@ -283,7 +292,15 @@ def sync_continuity_sheet(output_dir: Path, project_id: str) -> tuple[Path, int]
                 row["lip_sync_quality"] = _lip_sync_cell()
                 _preserve(
                     row,
-                    previous.get((target.target_id, shot_id, ref_shot_id)),
+                    previous.get(
+                        (
+                            target.target_id,
+                            shot_id,
+                            ref_shot_id,
+                            row["variant_id"],
+                            row["ref_variant_id"],
+                        )
+                    ),
                     CONTINUITY_USER_COLUMNS,
                 )
                 writer.writerow(row)

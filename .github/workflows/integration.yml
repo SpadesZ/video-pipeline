@@ -73,6 +73,9 @@ jobs:
       - name: smoke_benchmark_version_drift (api)
         run: docker compose run --rm api python scripts/smoke_benchmark_version_drift.py
 
+      - name: smoke_benchmark_continuity_identity (api)
+        run: docker compose run --rm api python scripts/smoke_benchmark_continuity_identity.py
+
       - name: smoke_project_store (worker)
         run: docker compose run --rm worker python scripts/smoke_project_store.py
 

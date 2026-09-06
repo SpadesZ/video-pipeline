@@ -234,6 +234,16 @@ def select_benchmark_candidate(
         )
 
     index = build_index(project_id)
+    chosen = index.by_variant_id(variant_id)
+    if chosen is not None and not chosen.is_current:
+        # 舊版本的影片不能代表目前這一輪。允許選下去的話，選定會成功，
+        # 但配對只讀當輪候選，畫面上那顆鏡頭仍會顯示沒有代表作。
+        raise ValueError(
+            f"候選 {variant_id} 是 {chosen.model_version or '未確認版本'} 的產物，"
+            f"與目前確認的 {chosen.current_model_version or '未確認版本'} 不同，"
+            "不能作為這一輪的代表作"
+        )
+
     siblings = [
         item
         for item in index.for_shot(target_id, variant.shot_id)
@@ -267,6 +277,11 @@ def auto_select_benchmark_candidates(project_id: str) -> int:
     只考慮目前這一輪的候選。換版本之後，舊版本的代表作仍掛著選定旗標，
     若以「這組已經有人選了」為由跳過，新版本就永遠不會有代表作，
     連戲評分會全部落在舊版本的影片上而不自知。
+
+    同時清掉所有舊版本候選的選定旗標。benchmark_selected 的語義是
+    「目前這一輪由誰代表這顆鏡頭」，舊版本的影片不可能是那個人。
+    留著它，同一組 (target, shot) 會同時有兩支被標為代表作，
+    之後任何一處若不小心讀了全部候選，就會挑到舊的那支。
     """
     from pipeline.db import engine
 
@@ -275,8 +290,16 @@ def auto_select_benchmark_candidates(project_id: str) -> int:
     for item in index.current:
         groups.setdefault((item.target_id, item.shot_id), []).append(item)
 
+    stale = [item for item in index.historical if item.benchmark_selected]
+
     selected = 0
     with Session(engine) as session:
+        for item in stale:
+            row = session.get(AssetVariant, item.variant_id)
+            if row is not None and row.benchmark_selected:
+                row.benchmark_selected = False
+                session.add(row)
+
         for items in groups.values():
             if any(item.benchmark_selected for item in items):
                 continue

@@ -81,6 +81,10 @@ jobs:
       - name: Benchmark version drift smoke
         run: python scripts/smoke_benchmark_version_drift.py
 
+      # 舊代表作與舊連戲評分不得進入目前這一輪
+      - name: Benchmark continuity identity smoke
+        run: python scripts/smoke_benchmark_continuity_identity.py
+
       # 此腳本自行覆寫 DATA_DIR 與清空金鑰，不需外部環境變數
       - name: LAVA settings smoke (no API keys)
         run: python scripts/smoke_lava_settings.py

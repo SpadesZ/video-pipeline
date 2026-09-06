@@ -372,7 +372,7 @@ def collect(settings: Settings) -> WorkflowState:
     from sqlmodel import Session, select
 
     from pipeline.db import engine
-    from pipeline.models.qc import ContinuityQC, VariantQC
+    from pipeline.models.qc import VariantQC
     from pipeline.models.variant import CapabilityJob
     from pipeline.project_store import load_project
 
@@ -431,19 +431,19 @@ def collect(settings: Settings) -> WorkflowState:
                     select(VariantQC).where(VariantQC.project_id == PROJECT_ID)
                 ).all()
             )
-            state.continuity_scored = len(
-                session.exec(
-                    select(ContinuityQC).where(
-                        ContinuityQC.project_id == PROJECT_ID
-                    )
-                ).all()
-            )
+        # 只算目前這一組配對。連同歷史列一起數的話，換過幾次代表作之後
+        # 進度會顯示成已完成，實際上當輪的配對一組都還沒評。
+        state.continuity_scored = sum(
+            1 for item in continuity_pairs(PROJECT_ID) if item.ready and item.scored
+        )
 
         index = attribution.build_index(PROJECT_ID)
         state.variants_imported = len(index.items)
         state.variants_unattributed = len(index.unattributed)
+        # 只算當輪的代表作。舊版本若殘留旗標，這個數字會虛報，
+        # 連戲的入口也會在實際上還沒有代表作時就被打開。
         state.benchmark_selected = sum(
-            1 for item in index.items if item.benchmark_selected
+            1 for item in index.current if item.benchmark_selected
         )
         for item in index.items:
             variant_counts[item.target_id] = variant_counts.get(item.target_id, 0) + 1
@@ -556,6 +556,10 @@ def continuity_pairs(project_id: str = PROJECT_ID) -> list[ContinuityPair]:
 
     配對只由 benchmark_selected 的代表作組成。若允許任意兩支候選配對，
     分數會落在使用者當下隨手挑的組合上，換一次選片結論就變了。
+
+    代表作只從當輪候選中取。舊版本的候選就算還殘留著選定旗標也不算數：
+    這裡是用 (target, shot) 當字典鍵，同組有兩支被標為代表作時，
+    誰勝出取決於排序，等於讓 variant_id 的字典序決定要比哪一支影片。
     """
     from sqlmodel import Session, select
 
@@ -564,7 +568,7 @@ def continuity_pairs(project_id: str = PROJECT_ID) -> list[ContinuityPair]:
 
     index = attribution.build_index(project_id)
     selected: dict[tuple[str, str], str] = {}
-    for item in index.items:
+    for item in index.current:
         if item.benchmark_selected:
             selected[(item.target_id, item.shot_id)] = item.variant_id
 
@@ -618,6 +622,37 @@ def continuity_pairs(project_id: str = PROJECT_ID) -> list[ContinuityPair]:
             )
             pairs.append(pair)
     return pairs
+
+
+def continuity_row_identity(row, owner: dict[str, str]) -> str:
+    """已寫入的連戲評分對應到哪一組配對。
+
+    owner 是 variant_id -> target_id 的對照，取自歸屬索引。
+    格式與 ContinuityPair.identity 一致，兩者才能直接比對。
+    """
+    return "|".join(
+        [
+            owner.get(row.variant_id or "", ""),
+            row.shot_id,
+            row.ref_shot_id or "",
+            row.variant_id or "",
+            row.ref_variant_id or "",
+        ]
+    )
+
+
+def current_pair_identities(project_id: str = PROJECT_ID) -> set[str]:
+    """目前這一輪真正在比的那些配對。
+
+    正式報表只認這一組。光看兩支影片同屬一個 model/version 是不夠的：
+    同一個版本內換過代表作之後，A↔B 與 A↔C 兩筆評分都符合版本條件，
+    但只有後者是現在的配對，兩筆都算等於把同一顆鏡頭計了兩次。
+    """
+    return {
+        item.identity
+        for item in continuity_pairs(project_id)
+        if item.ready and item.scored
+    }
 
 
 def find_continuity_pair(

@@ -84,64 +84,13 @@ def ledger_path() -> Path:
 
 
 def build_report():
-    """以與 /benchmark/results 相同的方式產生報表。"""
-    ledger = attempts.read_ledger(ledger_path())
-    index = attribution.build_index(PROJECT_ID)
+    """走與 /benchmark/results 完全相同的路徑。
 
-    with Session(engine) as session:
-        qc_rows = {
-            row.variant_id: row
-            for row in session.exec(
-                select(VariantQC).where(VariantQC.project_id == PROJECT_ID)
-            ).all()
-        }
-        continuity_rows = session.exec(
-            select(ContinuityQC).where(ContinuityQC.project_id == PROJECT_ID)
-        ).all()
+    測試不自備一份組裝邏輯，否則路由改壞了這裡也不會紅。
+    """
+    from pipeline.benchmark import report as report_module
 
-    variant_records = []
-    for item in index.items:
-        qc = qc_rows.get(item.variant_id)
-        if qc is None:
-            continue
-        variant_records.append(
-            {
-                "target_id": item.target_id,
-                "identity_key": item.identity_key,
-                "shot_id": item.shot_id,
-                "weighted_score": qc.weighted_score(aggregation.BENCHMARK_WEIGHTS),
-                "usable": bool(qc.usable_without_repair),
-                "human_minutes": qc.human_correction_minutes,
-                "dimensions": {"identity_consistency": qc.identity_consistency},
-            }
-        )
-
-    continuity_records = []
-    for row in continuity_rows:
-        entry = index.by_variant_id(row.variant_id) if row.variant_id else None
-        if entry is None:
-            continue
-        reference = (
-            index.by_variant_id(row.ref_variant_id) if row.ref_variant_id else None
-        )
-        matched = reference is not None and reference.identity_key == entry.identity_key
-        continuity_records.append(
-            {
-                "target_id": entry.target_id,
-                "identity_key": entry.identity_key if matched else None,
-                "shot_id": row.shot_id,
-                "weighted_score": (
-                    row.weighted_score(aggregation.BENCHMARK_WEIGHTS)
-                    if matched
-                    else None
-                ),
-                "cross_shot_identity": row.cross_shot_identity if matched else None,
-            }
-        )
-
-    return aggregation.build_report(
-        ledger, variant_records, continuity_records, index.unattributed
-    )
+    return report_module.build_current_report(get_settings(), PROJECT_ID)
 
 
 def confirm_all(client: TestClient, version: str) -> None:

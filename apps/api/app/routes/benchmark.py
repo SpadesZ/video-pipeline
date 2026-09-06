@@ -1725,82 +1725,10 @@ def _persist_continuity(
 def benchmark_results(settings: Settings = Depends(settings_dep)) -> str:
     """依情境呈現結果。刻意不產生跨情境總冠軍。"""
     from app.routes.web import page
-    from pipeline.benchmark import aggregation
+    from pipeline.benchmark import report as report_module
 
-    ledger = attempts.read_ledger(sheets_dir(settings) / attempts.ATTEMPTS_SHEET)
-    index = attribution.build_index(PROJECT_ID)
-
-    variant_records = []
-    continuity_records = []
-    with Session(engine) as session:
-        qc_rows = {
-            row.variant_id: row
-            for row in session.exec(
-                select(VariantQC).where(VariantQC.project_id == PROJECT_ID)
-            ).all()
-        }
-        continuity_rows = session.exec(
-            select(ContinuityQC).where(ContinuityQC.project_id == PROJECT_ID)
-        ).all()
-
-    for item in index.items:
-        qc = qc_rows.get(item.variant_id)
-        if qc is None:
-            continue
-        variant_records.append(
-            {
-                "target_id": item.target_id,
-                # 派工當下的身份。報表據此判斷這支影片屬於哪一輪。
-                "identity_key": item.identity_key,
-                "shot_id": item.shot_id,
-                "weighted_score": qc.weighted_score(aggregation.BENCHMARK_WEIGHTS),
-                "usable": bool(qc.usable_without_repair),
-                "human_minutes": qc.human_correction_minutes,
-                "dimensions": {
-                    "identity_consistency": qc.identity_consistency,
-                    "temporal_stability": qc.temporal_stability,
-                    "prompt_adherence": qc.prompt_adherence,
-                    "motion_quality": qc.motion_quality,
-                    "camera_control": qc.camera_control,
-                    "facial_acting": qc.facial_acting,
-                    "artifact_severity": qc.artifact_severity,
-                },
-            }
-        )
-
-    for row in continuity_rows:
-        entry = index.by_variant_id(row.variant_id) if row.variant_id else None
-        if entry is None:
-            continue
-        # 連戲評的是兩支影片的關係，兩支都必須屬於目前這一輪。
-        # 只看主影片的話，換過代表作的舊分數會被留下來。
-        reference = (
-            index.by_variant_id(row.ref_variant_id) if row.ref_variant_id else None
-        )
-        if reference is None or reference.identity_key != entry.identity_key:
-            continuity_records.append(
-                {
-                    "target_id": entry.target_id,
-                    "identity_key": None,
-                    "shot_id": row.shot_id,
-                    "weighted_score": None,
-                    "cross_shot_identity": None,
-                }
-            )
-            continue
-        continuity_records.append(
-            {
-                "target_id": entry.target_id,
-                "identity_key": entry.identity_key,
-                "shot_id": row.shot_id,
-                "weighted_score": row.weighted_score(aggregation.BENCHMARK_WEIGHTS),
-                "cross_shot_identity": row.cross_shot_identity,
-            }
-        )
-
-    report = aggregation.build_report(
-        ledger, variant_records, continuity_records, index.unattributed
-    )
+    # 「哪些資料算數」的判斷在 pipeline 層，路由只負責畫。
+    report = report_module.build_current_report(settings, PROJECT_ID)
 
     def fmt(value, suffix: str = "") -> str:
         if value is None:

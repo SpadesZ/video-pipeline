@@ -402,9 +402,11 @@ def build_report(
         if expected is None:
             return False
         if identity_key is None:
-            # 呼叫端沒帶身份，無法確認版本。不猜，一律排除。
-            if expected.key not in excluded_keys:
-                excluded_keys.append(f"{target_id}（未提供身份）")
+            # 呼叫端已判定這筆不屬於目前這一輪：版本不符，或連戲評的
+            # 不是現在的代表作配對。不猜，一律排除。
+            label = f"{target_id}（非目前這一輪）"
+            if label not in excluded_keys:
+                excluded_keys.append(label)
             return False
         if identity_key == expected.key:
             return True
