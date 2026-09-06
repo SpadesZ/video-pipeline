@@ -484,12 +484,18 @@ def regression_b(client: TestClient, primary: str) -> None:
     results = client.get("/benchmark/results")
     check(results.status_code == 200, "B7. 結果頁應可開啟")
     check(
-        "屬於舊版本，未計入本表" in results.text,
+        "未計入本表" in results.text,
         "B7. 結果頁應說明有連戲資料未計入",
     )
     check(
         f"{report.excluded_continuity} 組連戲" in results.text,
         "B7. 結果頁應顯示被排除的連戲組數",
+    )
+    # 排除的原因是換過代表作，不是版本不同。說成版本問題會把使用者
+    # 導去改 catalog，那不會解決任何事。
+    check(
+        any("代表作" in item for item in report.excluded_identities),
+        f"B7. 應說明是代表作配對變了，實際 {report.excluded_identities}",
     )
 
     # B8 重複組裝結果必須一致

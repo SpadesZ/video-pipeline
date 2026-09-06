@@ -752,6 +752,10 @@ async def score_project_variant(
     motion_quality: str = Form(""),
     camera_control: str = Form(""),
     artifact_severity: str = Form(""),
+    # 身份一致性是 benchmark 權重最高的維度（3.0），表情演技則決定
+    # 對話情境的評選。兩者原本沒有輸入欄位，網頁上根本填不進去。
+    identity_consistency: str = Form(""),
+    facial_acting: str = Form(""),
     usable: str = Form(""),
     correction_minutes: str = Form(""),
     notes: str = Form(""),
@@ -767,6 +771,8 @@ async def score_project_variant(
             "motion_quality": _optional_int(motion_quality),
             "camera_control": _optional_int(camera_control),
             "artifact_severity": _optional_int(artifact_severity),
+            "identity_consistency": _optional_int(identity_consistency),
+            "facial_acting": _optional_int(facial_acting),
         }
         await run_in_threadpool(
             record_variant_qc,
@@ -1049,6 +1055,9 @@ def assistant_widget() -> str:
       <p class="ai-note">助手只能讀取與說明，不會替你修改資料或執行操作。</p>
     </div>
     <style>
+      /* 表格最後一欄的操作按鈕會落在右下角，窄視窗時 Bubble 會壓到它。
+         給頁面尾端留出 Bubble 的高度，捲到底時按鈕就不會被蓋住。 */
+      body { padding-bottom: 76px; }
       .ai-bubble {
         position: fixed; right: 18px; bottom: 18px; z-index: 60;
         background: #1f3a4d; color: #7ec8e2; border: 1px solid #2f5670;
@@ -1643,6 +1652,44 @@ def shot_dispatch_panel(artifact: ProductionArtifact) -> str:
     """
 
 
+def _score_input(
+    name: str, label: str, variant_id: str, hint: str = "", maximum: int | None = 100
+) -> str:
+    """一個評分欄位。
+
+    原本只有 placeholder 當標籤（prompt / stable / motion…），四個字元
+    看不出是哪個維度，也看不出範圍。評分是 V1 的主要產出，欄位必須寫清楚。
+    """
+    field_id = f"{name}_{variant_id[-8:]}"
+    bounds = f'min="0" max="{maximum}" ' if maximum is not None else 'min="0" '
+    note = f'<span class="score-hint">{escape(hint)}</span>' if hint else ""
+    return (
+        f'<div class="score-field">'
+        f'<label for="{escape(field_id)}">{escape(label)}{note}</label>'
+        f'<input id="{escape(field_id)}" name="{escape(name)}" type="number" '
+        f'{bounds}step="1" placeholder="—" />'
+        f"</div>"
+    )
+
+
+def _facial_acting_input(variant) -> str:
+    """表情演技。看不清臉的鏡頭一律 N/A，欄位停用而非留給人猜。"""
+    from pipeline.benchmark import v1_pack
+
+    try:
+        applicable = v1_pack.evaluates_facial_acting(variant.shot_id)
+    except Exception:  # noqa: BLE001 - 非 benchmark 專案沒有這張表
+        applicable = True
+    if applicable:
+        return _score_input("facial_acting", "表情演技", variant.variant_id)
+    return (
+        '<div class="score-field disabled">'
+        '<label>表情演技<span class="score-hint">此鏡頭看不清臉</span></label>'
+        '<input value="N/A" disabled />'
+        "</div>"
+    )
+
+
 def variant_panel(artifact: ProductionArtifact) -> str:
     """候選管理面板：匯入人工生成的影片、評分、選片。"""
     project_id = artifact.project_id
@@ -1722,56 +1769,77 @@ def variant_panel(artifact: ProductionArtifact) -> str:
                     '<button class="ghost-button" type="submit">設為代表作</button>'
                     "</form>"
                 )
-            # 沒有播放器就無法評分：temporal_stability、motion_quality、
-            # artifact_severity 都得看過影片才填得出來。原本這裡只有
-            # metadata 與一排輸入框，等於要人憑印象打分。
+            # 影片必須看得見才評得出分。原本播放器被塞在表格欄位裡，
+            # 實際渲染只有 82-104px 寬，評 temporal_stability 或
+            # artifact_severity 等於憑印象打分。改成左右並排：
+            # 左邊播放，右邊填分，兩者同時在畫面上。
             preview = (
-                f'<details class="variant-preview"><summary>播放</summary>'
-                f'<video controls preload="none" '
+                f'<video class="variant-video" controls preload="metadata" '
                 f'src="/projects/{escape(project_id)}/variants/'
-                f'{escape(variant.variant_id)}/video">'
-                f"</video></details>"
+                f'{escape(variant.variant_id)}/video"></video>'
                 if variant.local_path
-                else '<span class="muted">無檔案</span>'
+                else '<div class="variant-video empty">無影片檔</div>'
             )
             rows.append(
                 f"""
-            <tr class="variant-row{selected}">
-              <td class="mono">{escape(variant.variant_id[-16:])}{preview}</td>
-              <td>{origin}</td>
-              <td class="mono">{escape(duration)}</td>
-              <td class="mono">{escape(variant.resolution or "?")}</td>
-              <td>{escape(variant.status)}</td>
-              <td>
-                {bench_cta}
-                <form method="post" action="/projects/{escape(project_id)}/variants/{escape(variant.variant_id)}/select" class="inline-form">
-                  <input name="reason" placeholder="reason" />
-                  <button class="ghost-button" type="submit">Select</button>
-                </form>
-              </td>
-              <td>
-                <form method="post" action="/projects/{escape(project_id)}/variants/{escape(variant.variant_id)}/qc" class="inline-form">
-                  <input name="prompt_adherence" placeholder="prompt" size="4" />
-                  <input name="temporal_stability" placeholder="stable" size="4" />
-                  <input name="motion_quality" placeholder="motion" size="4" />
-                  <input name="camera_control" placeholder="camera" size="4" />
-                  <input name="artifact_severity" placeholder="artifact" size="4" />
-                  <label><input type="checkbox" name="usable" value="1" /> usable</label>
-                  <input name="correction_minutes" placeholder="min" size="4" />
-                  <button class="ghost-button" type="submit">Score</button>
-                </form>
-              </td>
-            </tr>
+            <article class="variant-card{selected}">
+              <div class="variant-clip">
+                {preview}
+                <div class="variant-facts">
+                  <div><span class="muted">來源</span>{origin}</div>
+                  <div><span class="muted">片長</span><b class="mono">{escape(duration)}</b></div>
+                  <div><span class="muted">解析度</span><b class="mono">{escape(variant.resolution or "?")}</b></div>
+                  <div><span class="muted">狀態</span><b>{escape(variant.status)}</b></div>
+                  <div><span class="muted">候選</span><b class="mono">{escape(variant.variant_id[-12:])}</b></div>
+                </div>
+              </div>
+
+              <form class="variant-score" method="post"
+                    action="/projects/{escape(project_id)}/variants/{escape(variant.variant_id)}/qc">
+                <div class="score-head">
+                  <strong>單支品質評分</strong>
+                  <span class="muted">0-100，留白代表此鏡頭不適用（N/A）</span>
+                </div>
+                <div class="score-grid">
+                  {_score_input("identity_consistency", "身份一致性", variant.variant_id, hint="權重最高")}
+                  {_score_input("temporal_stability", "時間穩定性", variant.variant_id)}
+                  {_score_input("prompt_adherence", "提示詞貼合", variant.variant_id)}
+                  {_score_input("motion_quality", "動態品質", variant.variant_id)}
+                  {_score_input("camera_control", "運鏡控制", variant.variant_id)}
+                  {_score_input("artifact_severity", "瑕疵嚴重度", variant.variant_id, hint="越高越糟")}
+                  {_facial_acting_input(variant)}
+                  {_score_input("correction_minutes", "人工修補（分鐘）", variant.variant_id, maximum=None)}
+                </div>
+                <label class="usable-line">
+                  <input type="checkbox" name="usable" value="1" />
+                  <span>不需修補即可使用</span>
+                </label>
+                <button class="primary" type="submit">儲存評分</button>
+              </form>
+
+              <div class="variant-actions">
+                <div class="action-block">
+                  <strong>Benchmark 代表作</strong>
+                  <p class="muted">這個比較對象在這顆鏡頭的代表，用於連戲比較。</p>
+                  {bench_cta}
+                </div>
+                <div class="action-block">
+                  <strong>成片選用</strong>
+                  <p class="muted">這顆鏡頭最後要剪進成片的那一支。與代表作是兩回事。</p>
+                  <form method="post" action="/projects/{escape(project_id)}/variants/{escape(variant.variant_id)}/select" class="inline-form">
+                    <input name="reason" placeholder="選用理由" />
+                    <button class="ghost-button" type="submit">選為成片</button>
+                  </form>
+                </div>
+              </div>
+            </article>
             """
             )
         cards.append(
             f"""
         <div class="variant-group">
-          <strong class="mono">{escape(shot.shot_id)}</strong>
-          <table class="data-table">
-            <thead><tr><th>Variant</th><th>Target / Model</th><th>Actual</th><th>Res</th><th>Status</th><th>選定</th><th>QC (0-100, blank = N/A)</th></tr></thead>
-            <tbody>{"".join(rows)}</tbody>
-          </table>
+          <strong class="mono shot-heading">{escape(shot.shot_id)}</strong>
+          {"".join(rows)}
         </div>
         """
         )
@@ -2711,8 +2779,64 @@ def format_ms(ms: int) -> str:
     return f"{minutes:02d}:{seconds:02d}"
 
 
+VARIANT_STYLES = """
+    /* 候選評分：影片與評分欄位並排，評分時看得到影片。 */
+    .shot-heading { display: block; margin: 18px 0 8px; font-size: 13px; }
+    .variant-card {
+      display: grid; gap: 16px; align-items: start;
+      grid-template-columns: minmax(220px, 300px) minmax(280px, 1fr) minmax(200px, 260px);
+      border: 1px solid var(--line); border-radius: 8px;
+      padding: 14px; margin-bottom: 12px; background: var(--panel-2);
+    }
+    .variant-card.selected { border-color: #4c7a52; }
+    .variant-video {
+      width: 100%; max-height: 300px; border-radius: 6px;
+      background: #0d1219; display: block;
+    }
+    .variant-video.empty {
+      height: 160px; display: flex; align-items: center;
+      justify-content: center; color: var(--muted); font-size: 12px;
+    }
+    .variant-facts { display: grid; gap: 2px; margin-top: 8px; font-size: 12px; }
+    .variant-facts > div {
+      display: flex; justify-content: space-between; gap: 8px;
+      padding: 2px 0; border-bottom: 1px solid var(--line);
+    }
+    .score-head { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
+    .score-head .muted { font-size: 11px; }
+    .score-grid {
+      display: grid; gap: 8px;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    }
+    .score-field { display: flex; flex-direction: column; gap: 3px; }
+    .score-field label { font-size: 12px; display: flex; gap: 6px; align-items: baseline; }
+    .score-field input { width: 100%; }
+    .score-hint { color: var(--muted); font-size: 10px; }
+    .usable-line {
+      display: flex; align-items: center; gap: 8px;
+      margin: 10px 0; font-size: 13px;
+    }
+    .usable-line input { width: auto; }
+    .variant-actions { display: grid; gap: 10px; }
+    .action-block {
+      border: 1px solid var(--line); border-radius: 6px; padding: 10px;
+    }
+    .action-block strong { font-size: 12px; display: block; margin-bottom: 2px; }
+    .action-block p { font-size: 11px; margin: 0 0 8px; line-height: 1.5; }
+    .action-block input { font-size: 12px; }
+    @media (max-width: 1100px) {
+      .variant-card { grid-template-columns: minmax(200px, 260px) 1fr; }
+      .variant-actions { grid-column: 1 / -1; grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 720px) {
+      .variant-card { grid-template-columns: 1fr; }
+      .variant-actions { grid-template-columns: 1fr; }
+    }
+"""
+
+
 def styles() -> str:
-    return """
+    return VARIANT_STYLES + """
     :root {
       color-scheme: dark;
       --bg: #121311;

@@ -19,6 +19,7 @@ data/lava_settings.json
 data/benchmark/*
 # 本機 UI 稽核時起服務用的暫存資料庫與素材
 data/audit/*
+data/visual_audit/*
 !data/projects/.gitkeep
 !data/assets/.gitkeep
 !data/temp/.gitkeep

@@ -374,9 +374,15 @@ def main() -> int:
             all(item.version_drift for item in index.historical),
             "G. 歷史候選應標記 version_drift",
         )
+        # 報表面向使用者，列的是看得懂的描述而非內部鍵，但必須指名
+        # 是哪一個版本被排除，否則使用者無從判斷少算的是什麼。
         check(
-            v1_identity.key in report_v2.excluded_identities,
-            f"G. 報表應列出被排除的身份，實際 {report_v2.excluded_identities}",
+            any(V1 in item for item in report_v2.excluded_identities),
+            f"G. 報表應指出被排除的是 {V1}，實際 {report_v2.excluded_identities}",
+        )
+        check(
+            not any("|" in item for item in report_v2.excluded_identities),
+            f"G. 不得直接顯示內部鍵: {report_v2.excluded_identities}",
         )
 
         # H. v2 報表只含 v2 身份
@@ -420,8 +426,8 @@ def main() -> int:
         results = client.get("/benchmark/results")
         check(results.status_code == 200, "結果頁應可開啟")
         check(
-            "屬於舊版本，未計入本表" in results.text,
-            "報表頁必須明示有資料因版本不符而未計入",
+            "未計入本表" in results.text,
+            "報表頁必須明示有資料未計入",
         )
         check(
             f"{report_v2.excluded_variants} 支候選" in results.text,

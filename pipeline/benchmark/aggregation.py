@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 from pipeline.benchmark import identity, v1_pack
 from pipeline.benchmark.attempts import AttemptLedger
 from pipeline.benchmark.target import BenchmarkTarget, targets
+from pipeline.capability.provider_spec import get_provider
 from pipeline.models.production_profile import QCWeights
 
 AGGREGATION_VERSION = "v2.0"
@@ -395,6 +396,16 @@ def build_report(
     current = identity.current_identities()
     current_keys = {item.key for item in current.values()}
     excluded_keys: list[str] = []
+    provider_labels = {
+        item.provider: (get_provider(item.provider).label if get_provider(item.provider) else item.provider)
+        for item in registry.targets
+    }
+
+    def describe(item: identity.BenchmarkIdentity) -> str:
+        """人看得懂的身份描述。報表上不該出現以 | 相接的內部鍵。"""
+        platform = provider_labels.get(item.provider, item.provider)
+        version = (item.model_version or "").strip() or "版本未確認"
+        return f"{platform} · {item.model_id} · {version}"
 
     def accepted(target_id: str, identity_key: str | None) -> bool:
         """這筆資料是否屬於目前這一輪。"""
@@ -404,14 +415,15 @@ def build_report(
         if identity_key is None:
             # 呼叫端已判定這筆不屬於目前這一輪：版本不符，或連戲評的
             # 不是現在的代表作配對。不猜，一律排除。
-            label = f"{target_id}（非目前這一輪）"
+            label = f"{describe(expected)}：不是目前的代表作配對"
             if label not in excluded_keys:
                 excluded_keys.append(label)
             return False
         if identity_key == expected.key:
             return True
-        if identity_key not in excluded_keys:
-            excluded_keys.append(identity_key)
+        label = f"{target_id}：以較舊的版本生成"
+        if label not in excluded_keys:
+            excluded_keys.append(label)
         return False
 
     all_shots = [shot.shot_id for shot in v1_pack.shots()]
@@ -453,9 +465,9 @@ def build_report(
         if attempt.unresolved_identity or not attempt.is_current(current_keys):
             report.excluded_attempts += 1
             if not attempt.unresolved_identity:
-                key = attempt.identity.key
-                if key not in excluded_keys:
-                    excluded_keys.append(key)
+                label = f"{describe(attempt.identity)}：以較舊的版本生成"
+                if label not in excluded_keys:
+                    excluded_keys.append(label)
             continue
         aggregate = ensure(target)
         for scoped in scopes_for(aggregate, attempt.shot_id):

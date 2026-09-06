@@ -98,7 +98,7 @@ CONTROL_ACTIONS = {
 }
 
 
-def _step_block(step: workflow.StepState) -> str:
+def _step_block(step: workflow.StepState, current_step: int = 0) -> str:
     icons = {"done": "✓", "active": "→", "todo": "○", "blocked": "!"}
     blockers = ""
     if step.blockers:
@@ -112,11 +112,28 @@ def _step_block(step: workflow.StepState) -> str:
         )
         blockers = f"<ul class='bm-list'>{items}</ul>{ask}"
 
+    # 強調色只給目前這一步的第一個可用操作。原本固定給 Build，於是
+    # 步驟 3 完成後，整頁最醒目的按鈕仍是「重新建立派工」，
+    # 而使用者該做的其實是下一步。最大的按鈕要指向下一步。
+    highlight = ""
+    if step.number == current_step:
+        highlight = next(
+            (
+                item.control_id
+                for item in step.controls
+                if item.enabled and not item.href
+            ),
+            next(
+                (item.control_id for item in step.controls if item.enabled),
+                "",
+            ),
+        )
+
     buttons = "".join(
         _control_button(
             control,
             CONTROL_ACTIONS.get(control.control_id, ""),
-            primary=control.control_id == "benchmark.build",
+            primary=bool(highlight) and control.control_id == highlight,
         )
         for control in step.controls
     )
@@ -164,7 +181,9 @@ def benchmark_console(settings: Settings = Depends(settings_dep)) -> str:
         f'<div class="bm-warn">載入部分資料時發生問題：{escape(item)}</div>'
         for item in state.degraded
     )
-    steps = "".join(_step_block(step) for step in state.steps)
+    steps = "".join(
+        _step_block(step, state.current_step) for step in state.steps
+    )
 
     return page(
         title="V1 Benchmark",
@@ -231,7 +250,13 @@ def benchmark_console(settings: Settings = Depends(settings_dep)) -> str:
 
 def _asset_slot(status: builder.AssetStatus, flash: dict | None) -> str:
     """一格素材。預覽、規格、驗證結果與上傳表單都在同一格內。"""
-    if status.valid:
+    rejected = bool(flash and flash.get("asset_id") == status.asset_id
+                    and not flash.get("ok"))
+    if rejected:
+        # 上傳被退回時，儲存的仍是先前那張合格的圖。若照舊顯示
+        # 「已通過驗證」，使用者會以為剛才那張成功了。
+        badge = '<span class="slot-badge bad">剛才的上傳被退回</span>'
+    elif status.valid:
         badge = '<span class="slot-badge ok">已通過驗證</span>'
     elif status.present:
         badge = '<span class="slot-badge bad">未通過驗證</span>'
@@ -245,18 +270,22 @@ def _asset_slot(status: builder.AssetStatus, flash: dict | None) -> str:
         else '<div class="slot-preview empty">尚無圖片</div>'
     )
 
+    # 使用者要看的是解析度與比例。SHA256 是內容識別用的內部欄位，
+    # 放在同一組規格裡會和真正要判斷的資訊搶注意力。
     spec_rows = "".join(
         f"<div><span class='muted'>{escape(label)}</span><b>{escape(value)}</b></div>"
         for label, value in (
             ("解析度", status.dimensions or "—"),
             ("比例", status.ratio or "—"),
             ("要求", "9:16 直式" if status.require_vertical else "不限比例"),
-            (
-                "SHA256",
-                (status.file_hash[:16] + "…") if status.file_hash else "—",
-            ),
         )
     )
+    if status.file_hash:
+        spec_rows += (
+            "<details class='slot-advanced'><summary>進階：內容識別</summary>"
+            f"<span class='mono'>SHA256 {escape(status.file_hash[:24])}…</span>"
+            "</details>"
+        )
 
     problems = ""
     if status.problems:
@@ -492,20 +521,32 @@ def _target_card(
           <div class="field">
             <label for="model_{escape(item.target_id)}">Catalog model</label>
             <select id="model_{escape(item.target_id)}" name="model_id">{options}</select>
+            <p class="field-help">本系統內部的模型代號，不是平台上的名稱。</p>
           </div>
         </div>
+        <p class="field-help section-help">
+          下面兩欄請照抄平台畫面上的字，不要自己translate或簡寫。
+          日後要回答「當時用的是哪一版」，靠的就是這兩欄。
+        </p>
         <div class="split">
           <div class="field">
             <label for="label_{escape(item.target_id)}">平台實際顯示名稱（UI label）</label>
             <input id="label_{escape(item.target_id)}" name="ui_label"
                    value="{escape(item.ui_label or '')}"
-                   placeholder="平台介面上那個選項叫什麼" />
+                   placeholder="例如 Kling 1.6 Standard" />
+            <p class="field-help">
+              在平台選模型的那個下拉選單或卡片上，這個選項寫的是什麼。
+            </p>
           </div>
           <div class="field">
             <label for="ver_{escape(item.target_id)}">Model version</label>
             <input id="ver_{escape(item.target_id)}" name="model_version"
                    value="{escape(item.model_version or '')}"
-                   placeholder="平台顯示的版本字串" />
+                   placeholder="例如 1.6" />
+            <p class="field-help">
+              平台標示的版本字串。找不到獨立的版本欄位時，
+              填選項名稱裡的版本部分即可。
+            </p>
           </div>
         </div>
         <label class="checkline">
@@ -584,6 +625,9 @@ def targets_page(
         </section>
         <style>
           .target-card {{ margin-top: 14px; }}
+          .field-help {{ font-size: 11px; color: #8a94a6; margin: 4px 0 0;
+                         line-height: 1.5; }}
+          .section-help {{ margin: 12px 0 0; }}
           .checkline {{ display: flex; align-items: center; gap: 8px;
                         margin: 10px 0; font-size: 14px; }}
           .checkline input {{ width: auto; }}
@@ -708,18 +752,23 @@ def jobs_page(settings: Settings = Depends(settings_dep)) -> str:
             "</td></tr>"
         )
     else:
+        # 待生成的排在前面，並且視覺上要看得出來。24 列全部一樣重時，
+        # 「我現在該開哪一份」只能靠逐列讀狀態欄。
+        ordered = sorted(views, key=lambda item: (item.complete, item.target_id))
         rows = "".join(
-            f"<tr>"
+            f"<tr class='{'job-done' if item.complete else 'job-todo'}'>"
+            f"<td>{'✓ 已完成' if item.complete else '待生成'}</td>"
             f"<td class='mono'>{escape(item.target_id or '—')}</td>"
             f"<td class='mono'>{escape(item.shot_id)}</td>"
             f"<td>{escape(item.scenario)}</td>"
+            f"<td class='mono'>{escape(item.provider)}</td>"
             f"<td class='mono'>{escape(item.model_display)}</td>"
-            f"<td>{escape(item.status)}</td>"
             f"<td>{item.variants_imported}</td>"
-            f"<td><a class='ghost-button' "
-            f"href='/benchmark/jobs/{escape(item.job_id)}'>開啟</a></td>"
+            f"<td><a class='{'ghost-button' if item.complete else 'primary'}' "
+            f"href='/benchmark/jobs/{escape(item.job_id)}'>"
+            f"{'查看' if item.complete else '開始生成'}</a></td>"
             f"</tr>"
-            for item in views
+            for item in ordered
         )
 
     done = sum(1 for item in views if item.complete)
@@ -744,12 +793,16 @@ def jobs_page(settings: Settings = Depends(settings_dep)) -> str:
           </header>
           <section class="panel">
             <table class="data-table">
-              <thead><tr><th>Target</th><th>Shot</th><th>情境</th>
-              <th>Model</th><th>狀態</th><th>已匯入</th><th></th></tr></thead>
+              <thead><tr><th>狀態</th><th>Target</th><th>Shot</th><th>情境</th>
+              <th>平台</th><th>模型 / 版本</th><th>已匯入</th><th></th></tr></thead>
               <tbody>{rows}</tbody>
             </table>
           </section>
         </section>
+        <style>
+          .job-done td {{ opacity: 0.55; }}
+          .job-todo td:first-child {{ color: #7ec8e2; }}
+        </style>
         """,
     )
 
@@ -1578,7 +1631,10 @@ def continuity_form(
         <style>
           .pair-grid {{ display: grid; gap: 16px;
                         grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }}
-          .pair-grid video {{ width: 100%; border-radius: 6px;
+          /* 限制高度，讓兩支影片與評分欄位能同時出現在一個畫面裡。
+             不限制的話 9:16 會撐到 520px 高，評分欄位被推到摺線以下，
+             變成看完影片要往下捲、填分時又看不到影片。 */
+          .pair-grid video {{ width: 100%; max-height: 320px; border-radius: 6px;
                               background: #0d1219; margin-top: 6px; }}
           .bm-warn {{ color: #e8b; margin: 8px 0; }}
           .bm-ok {{ color: #7ee2a8; margin: 8px 0; }}
@@ -1721,6 +1777,30 @@ def _persist_continuity(
         session.commit()
 
 
+# 排序依據的中文名稱。報表面向的是判斷要用哪個平台的人，
+# 不是讀 aggregation 原始碼的人。
+CRITERIA_LABELS = {
+    "continuity_identity": "跨鏡頭身份一致",
+    "identity_consistency": "單鏡頭身份穩定",
+    "facial_acting": "表情演技",
+    "usable_shot_rate": "可用鏡頭比例",
+    "camera_control": "運鏡控制",
+    "temporal_stability": "時間穩定性",
+    "motion_quality": "動態品質",
+    "artifact_cleanliness": "畫面乾淨度",
+    "retries_per_usable": "每支可用所需重試",
+    "human_minutes_per_usable": "每支可用的人工分鐘",
+}
+
+
+def _readable_criteria(reason: str) -> str:
+    return " → ".join(
+        CRITERIA_LABELS.get(part.strip(), part.strip())
+        for part in reason.split(">")
+        if part.strip()
+    )
+
+
 @router.get("/benchmark/results", response_class=HTMLResponse)
 def benchmark_results(settings: Settings = Depends(settings_dep)) -> str:
     """依情境呈現結果。刻意不產生跨情境總冠軍。"""
@@ -1745,7 +1825,7 @@ def benchmark_results(settings: Settings = Depends(settings_dep)) -> str:
             <span class="muted">{escape(item.scope)}</span>
           </div>
           <p><strong>{escape(item.winner or '資料不足')}</strong></p>
-          <p class="muted">排序依據：{escape(item.reason)}</p>
+          <p class="muted">排序依據：{escape(_readable_criteria(item.reason))}</p>
           <p class="muted">{escape(item.note)}</p>
           <p class="mono muted">{escape(' > '.join(item.ranking)) or '—'}</p>
         </div>
@@ -1780,18 +1860,25 @@ def benchmark_results(settings: Settings = Depends(settings_dep)) -> str:
             "派工來源，未計入統計。</p>"
         )
     if report.has_excluded:
-        identities = escape(", ".join(report.excluded_identities[:6])) or "—"
+        reasons = "".join(
+            f"<li>{escape(item)}</li>" for item in report.excluded_identities[:6]
+        )
+        counted = "、".join(
+            part
+            for part in (
+                f"{report.excluded_variants} 支候選" if report.excluded_variants else "",
+                f"{report.excluded_attempts} 次嘗試" if report.excluded_attempts else "",
+                f"{report.excluded_continuity} 組連戲" if report.excluded_continuity else "",
+            )
+            if part
+        )
         warnings += (
             '<div class="bm-warn" data-error-code="identity_drift">'
-            "<p><strong>以下資料屬於舊版本，未計入本表：</strong>"
-            f"{report.excluded_variants} 支候選、"
-            f"{report.excluded_attempts} 次嘗試、"
-            f"{report.excluded_continuity} 組連戲。</p>"
-            f'<p class="mono">{identities}</p>'
-            "<p>這些紀錄仍完整保留，只是它們是用不同版本生成的，"
-            "與目前確認的版本放在一起比較會得到不對應任何模型的數字。"
-            "若要重新納入，請把該對象的版本改回當時的值，"
-            "或為新版本重新跑一輪。"
+            f"<p><strong>有 {escape(counted)} 未計入本表。</strong></p>"
+            f"<ul class='bm-list'>{reasons}</ul>"
+            "<p>這些紀錄都完整保留，只是它們不屬於目前這一輪："
+            "可能是用較舊的版本生成的，或是連戲評分比的不是現在的代表作。"
+            "把它們和目前的成績加在一起，得到的數字不對應任何一次實際的比較。"
             '<a href="#" class="ask-ai" data-ask-ai="為什麼有資料沒有計入這份報表？">'
             "Ask AI</a></p></div>"
         )
