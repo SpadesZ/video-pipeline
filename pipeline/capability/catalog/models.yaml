@@ -1,0 +1,71 @@
+# 模型登錄表
+#
+# model 與 provider 刻意解耦：hosted_by 表達「這個模型可由哪些平台取得」。
+# 一個平台託管多個模型，同一模型也可能出現在多個平台，因此不可將兩者綁死。
+#
+# benchmark_stats 留空，由 E6 依 scenario 回填。在累積真實資料前，
+# RoutingPolicy 只能依 catalog 的靜態限制選型。
+#
+# 影音模型的片長與比例為保守預設，尚未經實測確認，必須於 V1 校正。
+
+models:
+  # ---- 文字推理（既有 LAVA 路徑）----
+  - model_id: openai/gpt-4o-mini
+    label: GPT-4o mini
+    capabilities: [text_reasoning]
+    input_modalities: [text]
+    hosted_by: [openrouter]
+    benchmark_stats: {}
+
+  - model_id: gemini-2.0-flash
+    label: Gemini 2.0 Flash
+    capabilities: [text_reasoning, vision_analysis]
+    input_modalities: [text, image]
+    hosted_by: [google]
+    benchmark_stats: {}
+    notes: 2026-09-04 於 v1beta 回傳 404，代號需更新。
+
+  # ---- 影片生成（第一階段以 manual transport 驗證）----
+  - model_id: kling-video
+    label: Kling Video
+    capabilities: [video_t2v, video_i2v]
+    input_modalities: [text, image]
+    hosted_by: [kling]
+    min_duration_ms: 5000
+    max_duration_ms: 10000
+    max_reference_assets: 4
+    aspect_ratios: ["9:16", "16:9", "1:1"]
+    benchmark_stats: {}
+
+  - model_id: runway-gen3
+    label: Runway Gen-3
+    capabilities: [video_t2v, video_i2v]
+    input_modalities: [text, image]
+    hosted_by: [runway]
+    min_duration_ms: 5000
+    max_duration_ms: 10000
+    max_reference_assets: 1
+    aspect_ratios: ["16:9", "9:16"]
+    benchmark_stats: {}
+
+  - model_id: veo-video
+    label: Veo
+    capabilities: [video_t2v, video_i2v]
+    input_modalities: [text, image]
+    hosted_by: [veo]
+    min_duration_ms: 4000
+    max_duration_ms: 8000
+    max_reference_assets: 1
+    aspect_ratios: ["16:9", "9:16"]
+    benchmark_stats: {}
+
+  - model_id: seedance-video
+    label: Seedance
+    capabilities: [video_t2v, video_i2v, video_reference]
+    input_modalities: [text, image, video]
+    hosted_by: [seedance]
+    min_duration_ms: 5000
+    max_duration_ms: 10000
+    max_reference_assets: 4
+    aspect_ratios: ["9:16", "16:9", "1:1"]
+    benchmark_stats: {}

@@ -10,9 +10,13 @@ from pipeline.models.asset_manifest import AssetManifest
 from pipeline.models.compliance import ComplianceReport
 from pipeline.models.cue_ledger import CueLedger
 from pipeline.models.metrics import MetricsDecision
+from pipeline.models.narrative import NarrativeIR
 from pipeline.models.production_artifact import ProductionArtifact
+from pipeline.models.production_profile import ProductionProfile
 from pipeline.models.review import DecisionLogEntry, ReviewStatus
 from pipeline.models.shorts_manifest import ShortsManifest
+from pipeline.models.shot import CharacterIdentityPack, ShotPlan
+from pipeline.models.timeline import EditDecision
 from pipeline.settings import Settings
 from pipeline.stages.compliance_checker import check_compliance
 from pipeline.models.transcript import TranscriptImport
@@ -30,6 +34,11 @@ JSON_FIELDS = (
     "compliance_report",
     "metrics_decision",
     "shorts_manifest",
+    "production_profile",
+    "narrative_ir",
+    "character_packs",
+    "shot_plans",
+    "edit_decisions",
     "video_packaging",
     "decision_log",
 )
@@ -43,6 +52,16 @@ MODEL_FIELDS = {
     "compliance_report": ComplianceReport,
     "metrics_decision": MetricsDecision,
     "shorts_manifest": ShortsManifest,
+    "production_profile": ProductionProfile,
+    "narrative_ir": NarrativeIR,
+}
+
+# 以列表保存的巢狀模型欄位，載入時需逐項還原
+LIST_MODEL_FIELDS = {
+    "character_packs": CharacterIdentityPack,
+    "shot_plans": ShotPlan,
+    "edit_decisions": EditDecision,
+    "decision_log": DecisionLogEntry,
 }
 
 
@@ -62,17 +81,23 @@ def normalize_project_artifact(artifact: ProductionArtifact) -> ProductionArtifa
         if isinstance(value, dict):
             setattr(artifact, field_name, model_type.model_validate(value))
 
+    for field_name, model_type in LIST_MODEL_FIELDS.items():
+        value = getattr(artifact, field_name, None)
+        if isinstance(value, list):
+            setattr(
+                artifact,
+                field_name,
+                [
+                    item if isinstance(item, model_type) else model_type.model_validate(item)
+                    for item in value
+                ],
+            )
+
     if isinstance(artifact.review_status, str):
         artifact.review_status = ReviewStatus(artifact.review_status)
 
     artifact.created_at = _parse_datetime(artifact.created_at)
     artifact.updated_at = _parse_datetime(artifact.updated_at)
-
-    if isinstance(artifact.decision_log, list):
-        artifact.decision_log = [
-            item if isinstance(item, DecisionLogEntry) else DecisionLogEntry.model_validate(item)
-            for item in artifact.decision_log
-        ]
 
     return artifact
 
@@ -91,6 +116,25 @@ def write_project_files(settings: Settings, artifact: ProductionArtifact) -> Pat
     write_json(project_dir / "visual_contract.json", artifact.visual_contract or {})
     write_json(project_dir / "visual_qc_report.json", artifact.visual_qc_report or {})
     write_json(project_dir / "compliance_report.json", artifact.compliance_report or {})
+    if artifact.production_profile:
+        write_json(project_dir / "production_profile.json", artifact.production_profile)
+    if artifact.narrative_ir:
+        write_json(project_dir / "narrative_ir.json", artifact.narrative_ir)
+    if artifact.character_packs:
+        write_json(
+            project_dir / "character_packs.json",
+            [pack.model_dump(mode="json") for pack in artifact.character_packs],
+        )
+    if artifact.shot_plans:
+        write_json(
+            project_dir / "shot_plans.json",
+            [plan.model_dump(mode="json") for plan in artifact.shot_plans],
+        )
+    if artifact.edit_decisions:
+        write_json(
+            project_dir / "edit_decisions.json",
+            [item.model_dump(mode="json") for item in artifact.edit_decisions],
+        )
     write_json(project_dir / ARTIFACT_FILENAME, artifact)
     return project_dir
 

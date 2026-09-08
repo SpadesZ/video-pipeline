@@ -1,0 +1,175 @@
+# AI 助手的系統知識庫：資料模型。
+#
+# 這裡是 UX 層級的說明，不是 schema 傾印。助手要能回答
+# 「這是什麼」「為什麼要分兩個」「我該看哪一個」，
+# 而不是背出欄位名稱。
+#
+# 維護方式：模型語義改變時更新這裡。加欄位不需要動，
+# 除非那個欄位會出現在使用者眼前並需要解釋。
+
+entities:
+  - key: project
+    name: Project / ProductionArtifact
+    summary: 一支影片的完整製作狀態，從腳本到成片都掛在同一個 project_id 下。
+    detail: >
+      ProductionArtifact 是存在磁碟上的 JSON，包含敘事、分鏡、角色、
+      剪輯決策與審核紀錄。資料庫存的是派工與候選這類會大量增長的東西，
+      兩者以 project_id 關聯。
+
+  - key: narrative_ir
+    name: NarrativeIR
+    summary: 故事真相。角色想要什麼、發生了什麼、情緒怎麼走。
+    detail: >
+      NarrativeIR 只描述故事本身，不描述怎麼拍。它是 story truth：
+      鏡頭可以重拍、模型可以換，故事不因此改變。改動鏡頭不應該回頭改它。
+
+  - key: scene_beat_shot
+    name: Scene / Beat / ShotPlan
+    summary: Scene 是場，Beat 是場裡的一個節拍，ShotPlan 是一顆實際要生成的鏡頭。
+    detail: >
+      ShotPlan 是 director intent：提示詞、運鏡、片長、首幀、參考素材。
+      它描述「想要拍成什麼樣」，不是「實際生出來什麼」。實際產物是 AssetVariant。
+
+  - key: character_identity_pack
+    name: CharacterIdentityPack
+    summary: 一個角色的視覺身份，讓同一個人在不同鏡頭裡看起來還是同一個人。
+    detail: >
+      V1 的身份主要靠首幀傳遞，canonical_face_ref 刻意留空。
+      跨鏡頭像不像同一個人，由 ContinuityQC 的 cross_shot_identity 評分。
+
+  - key: reference_asset
+    name: ReferenceAsset
+    summary: 上傳給平台的參考圖，包含首幀與角色參考。
+    detail: >
+      每張都記 SHA256。換圖後雜湊改變，請求識別也跟著改變，
+      因此舊的 job manifest 不會被誤認為與新圖是同一次請求。
+      rights 欄位記錄授權狀態，未核准的素材不得進入正式流程。
+
+  - key: capability_job
+    name: CapabilityJob
+    summary: 一次派工。記錄「當時實際送出去的是什麼」，是所有血緣的根。
+    detail: >
+      request_snapshot 是派工當下的完整請求快照。分鏡在派工後可能被改，
+      所以血緣只能讀快照，不能回推目前的 ShotPlan——否則記錄下來的
+      會是從未真正送出去的內容。benchmark 的歸屬也只認這條血緣。
+      manual transport 的工作會停在 pending_manual，等待真人到平台生成。
+
+  - key: asset_variant
+    name: AssetVariant
+    summary: 一支實際生成出來的影片。generated artifact。
+    detail: >
+      匯入時檔案會被改名為 var_<uuid>.mp4，但 original_filename 保留
+      平台下載時的原始檔名。記錄嘗試時填的是平台那個檔名，不是內部檔名。
+      job_id 是它的血緣；沒有 job_id 的候選無法歸屬到任何比較對象，
+      不會計入 benchmark 統計。
+
+  - key: variant_qc
+    name: VariantQC
+    summary: 單一 clip 自己的品質。一支影片好不好看。
+    detail: >
+      評的是這支片自身的性質：時間穩定性、提示詞貼合、運鏡、瑕疵、
+      單鏡頭內的身份漂移、表情演技。全部 0-100，越高越好，
+      只有 artifact_severity 相反。留白代表 N/A，不是 0 分。
+
+  - key: continuity_qc
+    name: ContinuityQC
+    summary: 兩顆鏡頭之間的關係品質。A 和 B 看起來像不像同一場戲。
+    detail: >
+      和 VariantQC 分開是因為語義不同：temporal_stability 是一支片
+      自己的性質，cross_shot_identity 是 shot A 對 shot B 的關係。
+      混在一起的話，「Shot 8 的一致性」到底是對照 Shot 7 還是 Shot 1
+      就無法回答。所以 ContinuityQC 帶 ref_shot_id。
+
+  - key: benchmark_target
+    name: BenchmarkTarget
+    summary: 一個明確的比較對象。platform + 精確模型 + 版本，不只是平台名稱。
+    detail: >
+      只記「這是 Kling 生的」是不夠的：同一個平台會同時提供多個版本，
+      介面上的選項名稱也未必等於 catalog 的 model_id。日後無從得知
+      當時選的是哪一版，跨輪次比較就會失效。
+      provisional=true 代表版本還沒有真人在平台上確認過，
+      這種狀態下不得建立正式派工。
+
+  - key: benchmark_selected
+    name: benchmark_selected 與 production SELECTED
+    summary: 兩種「選片」，用途完全不同，刻意分開存。
+    detail: >
+      production 的 SELECTED 是「這顆鏡頭最後要用哪一支進成片」，
+      一顆鏡頭只會有一支。benchmark_selected 是「這個比較對象在這顆
+      鏡頭的代表作」，同一顆鏡頭四個比較對象各有一支——這正是比較所需。
+      互斥範圍是 (target, shot)，不是 shot。連戲配對只用代表作組成。
+
+  - key: edit_decision
+    name: EditDecision
+    summary: 剪輯真相。哪一段、從第幾毫秒到第幾毫秒、接什麼轉場。
+    detail: >
+      EditDecision 是 edit truth，與 ShotPlan 的 director intent 分開：
+      導演想要 5 秒，實際生成 5.4 秒，剪進去用 4.8 秒，這是三個不同的數字，
+      各自記在各自的地方。
+
+  - key: timeline
+    name: Timeline
+    summary: 由 EditDecision 組成的時間軸，是實際送去算圖的排列。
+
+  - key: cue_ledger
+    name: CueLedger
+    summary: 字幕、音效、轉場這類時間點事件的帳本。
+
+  - key: production_profile
+    name: ProductionProfile
+    summary: 一支片的製作規格與評分權重，例如鏡頭長度政策與畫面比例。
+    detail: >
+      QC 的加權分數依 profile 的權重計算。換 profile 會改變加權結果，
+      因此跨 profile 的分數不能直接比較。
+
+  - key: lava_router
+    name: LAVA Capability Router
+    summary: 依「需要什麼能力」挑模型與平台的路由器，不是單純的 API 轉發。
+    detail: >
+      呼叫端說的是「我要 image-to-video、9:16、5 秒」，不是「呼叫 Kling」。
+      Router 根據 ModelRegistry 與 ProviderSpec 決定誰能做，
+      再依 profile 與政策排序。這樣換平台不需要改呼叫端，
+      也才有辦法在同一組請求上比較不同平台。
+      only_model_id 會嚴格限制路由，指定的模型不存在時直接拒絕，
+      不會偷偷退回同平台的其他模型。
+
+  - key: model_registry
+    name: ModelRegistry
+    summary: 有哪些模型、由誰託管、支援什麼能力的目錄。
+    detail: >
+      BenchmarkTarget 的 model_id 必須登錄在這裡，而且必須由該 provider
+      託管、支援該能力，否則派工前的 validate_target 會擋下來。
+
+  - key: provider_adapter
+    name: ProviderAdapter / Manual Transport
+    summary: 平台的轉接層。V1 全部走 manual transport，不接影片 API。
+    detail: >
+      manual transport 會產出 job package（提示詞、參考圖、操作說明），
+      由真人到平台生成再把影片匯入。系統目前不呼叫任何影片生成 API。
+
+  - key: benchmark_v1_flow
+    name: Benchmark V1 六步流程
+    summary: 準備素材 → 確認版本 → 建立派工 → 生成與匯入 → 評分與選片 → 查看結果。
+    detail: >
+      1 準備參考素材：8 張圖，首幀需 9:16、短邊至少 512px。
+      2 確認平台版本：登入各平台，填入實際的模型版本與選項名稱。
+      3 建立派工：素材與版本都就緒後才能建立正式 job packages。
+      4 生成與匯入：到平台生成，每按一次 Generate 就記一列，再把影片匯入。
+      5 評分與選定代表作：逐支評分，每個比較對象每顆鏡頭選一支代表作，再評連戲。
+      6 查看結果：依情境分別評選，刻意不產生跨情境總冠軍。
+
+  - key: request_hash
+    name: request_hash
+    summary: 一份派工的冪等鍵，用來確認匯入的影片對應到哪一次請求。
+    detail: >
+      正常操作不需要看到它。從 Job Workbench 匯入時，後端已經從派工
+      脈絡知道是哪一份工作，會自動帶入。它只出現在進階區塊供除錯。
+      手動貼錯 hash 會把影片掛到別的派工上，而且不會有錯誤訊息。
+
+  - key: usable_shot_rate
+    name: 可用率與重試指標
+    summary: 不需要修補就能用的鏡頭比例，以及平均要重試幾次才得到一支可用。
+    detail: >
+      只統計成功匯入的候選會嚴重高估平台表現：一個試十次才成功兩次的
+      平台，若只看那兩支成品，會看起來和一次就中的平台一樣好。
+      因此失敗、取消、逾時都必須記錄。

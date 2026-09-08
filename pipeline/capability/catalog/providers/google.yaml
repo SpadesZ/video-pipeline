@@ -1,0 +1,24 @@
+# 平台規格：Google Generative Language
+# 既有 LLM 路徑。
+provider_id: google
+label: Google Gemini
+transport: api
+
+supported_capabilities:
+  - text_reasoning
+  - vision_analysis
+
+api_key_env: GOOGLE_API_KEY
+
+required_fields:
+  - messages
+
+parameter_mapping:
+  max_tokens: maxOutputTokens
+  temperature: temperature
+
+human_instructions: |
+  以 API 呼叫，無需人工操作。
+
+notes: |
+  2026-09-04 實測 gemini-2.0-flash 於 v1beta 回傳 404，模型代號需更新。
