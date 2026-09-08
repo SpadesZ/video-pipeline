@@ -196,10 +196,10 @@ def _dispatch_step(state: WorkflowState) -> StepState:
     controls = [
         ControlState(
             control_id="benchmark.build",
-            label="建立正式 Job Packages",
+            label="建立各鏡頭的生成工單",
             action=(
-                "以目前確認的比較對象對六顆鏡頭各建立一份派工，"
-                "並產生空白的評分表與嘗試紀錄"
+                "為每個比較對象的六顆鏡頭各建立一份生成工單，"
+                "並產生空白的評分表與生成紀錄"
             ),
             enabled=state.build_ok,
             disabled_reason=disabled_reason,
@@ -208,31 +208,31 @@ def _dispatch_step(state: WorkflowState) -> StepState:
         ),
         ControlState(
             control_id="benchmark.jobs.open",
-            label="查看 Job Workbench",
-            action="逐一開啟每份派工，複製提示詞、下載參考圖、記錄與匯入結果",
+            label="查看生成工單",
+            action="逐一開啟每份工單，複製提示詞、下載參考圖、記錄與匯入結果",
             href="/benchmark/jobs",
             enabled=state.jobs_total > 0,
-            disabled_reason=None if state.jobs_total else "尚未建立任何派工",
+            disabled_reason=None if state.jobs_total else "還沒有生成工單",
             help_key="benchmark.workbench",
         ),
     ]
 
     if not state.build_ok:
         return StepState(
-            number=3, key="dispatch", title="建立派工", state=STEP_BLOCKED,
-            summary="尚未滿足正式派工條件",
+            number=3, key="dispatch", title="建立生成工單", state=STEP_BLOCKED,
+            summary="還不能建立工單",
             blockers=[item.message for item in state.build_blockers[:8]],
             controls=controls,
         )
     if state.jobs_total == 0:
         return StepState(
-            number=3, key="dispatch", title="建立派工", state=STEP_ACTIVE,
-            summary="條件已滿足，可以建立正式 job packages",
+            number=3, key="dispatch", title="建立生成工單", state=STEP_ACTIVE,
+            summary="條件已滿足，可以建立每顆鏡頭的生成工單",
             controls=controls,
         )
     return StepState(
-        number=3, key="dispatch", title="建立派工", state=STEP_DONE,
-        summary=f"{state.jobs_total} 份 job package 已建立",
+        number=3, key="dispatch", title="建立生成工單", state=STEP_DONE,
+        summary=f"已建立 {state.jobs_total} 份生成工單",
         controls=controls,
     )
 
@@ -241,8 +241,8 @@ def _generation_step(state: WorkflowState) -> StepState:
     controls = [
         ControlState(
             control_id="benchmark.jobs.open.generate",
-            label="開啟 Job Workbench",
-            action="從派工頁複製提示詞到平台生成，回來記錄嘗試並匯入影片",
+            label="開啟生成工單",
+            action="從工單頁複製提示詞到平台生成，回來記錄結果並匯入影片",
             href="/benchmark/jobs",
             enabled=state.jobs_total > 0,
             disabled_reason=None if state.jobs_total else "尚未建立任何派工",
@@ -252,27 +252,27 @@ def _generation_step(state: WorkflowState) -> StepState:
     blockers: list[str] = []
     if state.variants_unattributed:
         blockers.append(
-            f"{state.variants_unattributed} 支候選沒有派工來源，不會計入統計"
+            f"{state.variants_unattributed} 支影片找不到對應的工單，不會計入統計"
         )
 
     summary = (
-        f"已記錄 {state.attempts_recorded} 次嘗試"
-        f"（未成功 {state.attempts_failed} 次）、"
-        f"已匯入 {state.variants_imported} 支候選"
+        f"已記錄 {state.attempts_recorded} 次生成"
+        f"（其中 {state.attempts_failed} 次沒有成功）、"
+        f"已匯入 {state.variants_imported} 支影片"
     )
     if state.jobs_total == 0:
         return StepState(
-            number=4, key="generation", title="生成與匯入", state=STEP_TODO,
-            summary="尚未建立派工", controls=controls,
+            number=4, key="generation", title="到平台生成並匯入", state=STEP_TODO,
+            summary="還沒有生成工單", controls=controls,
         )
     if state.variants_imported == 0:
         return StepState(
-            number=4, key="generation", title="生成與匯入", state=STEP_ACTIVE,
+            number=4, key="generation", title="到平台生成並匯入", state=STEP_ACTIVE,
             summary=summary, blockers=blockers, controls=controls,
         )
     step_state = STEP_DONE if not blockers else STEP_ACTIVE
     return StepState(
-        number=4, key="generation", title="生成與匯入", state=step_state,
+        number=4, key="generation", title="到平台生成並匯入", state=step_state,
         summary=summary, blockers=blockers, controls=controls,
     )
 
@@ -286,7 +286,7 @@ def _scoring_step(state: WorkflowState) -> StepState:
             href=f"/projects/{PROJECT_ID}/view#variants",
             enabled=state.variants_imported > 0,
             disabled_reason=(
-                None if state.variants_imported else "尚無候選可評分"
+                None if state.variants_imported else "還沒有影片可以評分"
             ),
             help_key="benchmark.qc",
         ),
@@ -314,18 +314,18 @@ def _scoring_step(state: WorkflowState) -> StepState:
     ]
     if not state.variants_imported:
         return StepState(
-            number=5, key="scoring", title="評分與選定代表作", state=STEP_TODO,
-            summary="尚無候選可評分", controls=controls,
+            number=5, key="scoring", title="評分與挑代表作", state=STEP_TODO,
+            summary="還沒有影片可以評分", controls=controls,
         )
     summary = (
-        f"已評分 {state.variants_scored}/{state.variants_imported} 支候選、"
+        f"已評分 {state.variants_scored}/{state.variants_imported} 支影片、"
         f"已選定 {state.benchmark_selected} 組代表作、"
         f"已完成 {state.continuity_scored}/{state.continuity_expected} 組連戲評分"
     )
     blockers: list[str] = []
     if state.variants_scored < state.variants_imported:
         blockers.append(
-            f"還有 {state.variants_imported - state.variants_scored} 支候選未評分"
+            f"還有 {state.variants_imported - state.variants_scored} 支影片還沒評分"
         )
     if state.continuity_scored < state.continuity_expected:
         blockers.append(
@@ -334,7 +334,7 @@ def _scoring_step(state: WorkflowState) -> StepState:
         )
     done = not blockers and state.benchmark_selected > 0
     return StepState(
-        number=5, key="scoring", title="評分與選定代表作",
+        number=5, key="scoring", title="評分與挑代表作",
         state=STEP_DONE if done else STEP_ACTIVE,
         summary=summary, blockers=blockers, controls=controls,
     )
@@ -354,11 +354,11 @@ def _result_step(state: WorkflowState) -> StepState:
     ]
     if not state.variants_scored:
         return StepState(
-            number=6, key="results", title="查看情境結果", state=STEP_TODO,
+            number=6, key="results", title="看比較結果", state=STEP_TODO,
             summary="尚無評分資料", controls=controls,
         )
     return StepState(
-        number=6, key="results", title="查看情境結果", state=STEP_ACTIVE,
+        number=6, key="results", title="看比較結果", state=STEP_ACTIVE,
         summary="依情境分別評選，不產生跨情境總冠軍", controls=controls,
     )
 

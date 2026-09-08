@@ -67,6 +67,13 @@ from pipeline.stages.variant_importer import (
     list_variants,
     select_variant,
 )
+from app.labels import (
+    action_name,
+    capability_name,
+    provider_name,
+    shot_name,
+    status_name,
+)
 from pipeline.utils.files import ensure_project_dir
 from pipeline.stages.llm_executors import run_topic_research, run_script_outline, run_packaging
 from pipeline.stages.script_splitter import split_script_into_shorts
@@ -162,7 +169,7 @@ def home(settings: Settings = Depends(settings_dep)) -> str:
     projects = list_projects(settings)
     rows = "\n".join(project_row(item) for item in projects)
     if not rows:
-        rows = '<tr><td colspan="5" class="muted empty">No projects yet</td></tr>'
+        rows = '<tr><td colspan="5" class="muted empty">還沒有專案，從左邊建立第一個</td></tr>'
 
     total_assets = sum(len(p.asset_manifest.assets) for p in projects if p.asset_manifest)
     approved_assets = sum(
@@ -206,24 +213,24 @@ def home(settings: Settings = Depends(settings_dep)) -> str:
         </tr>
         """
     if not perf_rows:
-        perf_rows = '<tr><td colspan="7" class="muted empty" style="text-align:center; padding:15px;">No performance index data yet</td></tr>'
+        perf_rows = '<tr><td colspan="7" class="muted empty" style="text-align:center; padding:15px;">還沒有成效資料。影片上架並回填數據後才會出現</td></tr>'
         
     perf_dashboard_html = f"""
     <div class="workspace-card" style="margin-top: 30px; border: 1px solid var(--line); border-radius: 8px; padding: 20px; background: var(--panel);">
       <div class="section-head" style="margin-bottom: 15px; display:flex; justify-content:space-between; align-items:center;">
-        <h2 style="margin:0; font-size:18px;">Topic Performance Index</h2>
-        <span class="pill" style="background:#1f6feb; color:white; border:none;">Closed Loop Feedback</span>
+        <h2 style="margin:0; font-size:18px;">主題成效統計</h2>
+        <span class="pill" style="background:#1f6feb; color:white; border:none;">依上架後的實際數據回饋</span>
       </div>
       <table style="width: 100%; border-collapse: collapse; font-size:14px;">
         <thead>
           <tr style="text-align: left; border-bottom: 1px solid var(--line); font-size: 13px; color: var(--muted); height:35px;">
-            <th style="padding: 8px;">Genre</th>
-            <th style="padding: 8px;">Count</th>
-            <th style="padding: 8px;">Avg CTR</th>
-            <th style="padding: 8px;">Avg AVD</th>
-            <th style="padding: 8px;">Avg RPM</th>
-            <th style="padding: 8px;">Dominant Action</th>
-            <th style="padding: 8px;">Trend</th>
+            <th style="padding: 8px;">類型</th>
+            <th style="padding: 8px;">支數</th>
+            <th style="padding: 8px;">平均點閱率</th>
+            <th style="padding: 8px;">平均觀看時長</th>
+            <th style="padding: 8px;">平均千次收益</th>
+            <th style="padding: 8px;">建議動作</th>
+            <th style="padding: 8px;">趨勢</th>
           </tr>
         </thead>
         <tbody>
@@ -240,8 +247,8 @@ def home(settings: Settings = Depends(settings_dep)) -> str:
         <section class="app-shell" data-route="/" data-entity-type="home">
           <header class="topbar">
             <div>
-              <p class="eyebrow">Local production desk</p>
-              <h1>Video Pipeline Dashboard</h1>
+              <p class="eyebrow">全部在本機執行</p>
+              <h1>AI 製片工作台</h1>
             </div>
           </header>
 
@@ -257,62 +264,62 @@ def home(settings: Settings = Depends(settings_dep)) -> str:
           </section>
 
           <section class="overview-grid">
-            {stat_card("Projects", str(len(projects)), "built locally")}
-            {stat_card("Upload Ready", str(ready_count), "final approved")}
-            {stat_card("Asset Rights", f"{approved_assets}/{total_assets}", "approved")}
+            {stat_card("專案數", str(len(projects)), "已在本機建立")}
+            {stat_card("可上架", str(ready_count), "已通過最終審核")}
+            {stat_card("素材授權", f"{approved_assets}/{total_assets}", "已確認可用")}
           </section>
  
           <section class="workspace">
             <div class="create-pane">
               <div class="section-head">
-                <h2>New Project</h2>
-                <span class="pill">CPU-first</span>
+                <h2>建立新專案</h2>
+                <span class="pill">不需顯示卡</span>
               </div>
               <form action="/" method="post" class="project-form">
                 <div class="field">
-                  <label for="project-title">Title</label>
+                  <label for="project-title">影片標題</label>
                   <input id="project-title" name="title" required value="CPU First Video Pipeline MVP" />
                 </div>
                 <div class="split">
                   <div class="field">
-                    <label for="project-language">Language</label>
+                    <label for="project-language">語言</label>
                     <input id="project-language" name="language" value="en" />
                   </div>
                   <div class="field">
-                    <label for="project-persona">Persona</label>
+                    <label for="project-persona">敘事口吻</label>
                     <input id="project-persona" name="persona" value="operator" />
                   </div>
                 </div>
                 <div class="field">
-                  <label for="project-script">Script</label>
+                  <label for="project-script">腳本</label>
                   <textarea id="project-script" name="script_markdown" required>{escape(SAMPLE_SCRIPT)}</textarea>
                 </div>
-                <button type="submit" class="primary">Build Project</button>
+                <button type="submit" class="primary">建立專案</button>
               </form>
               <div class="section-head" style="margin-top: 25px; border-top: 1px solid var(--line); padding-top: 20px;">
-                <h2>AI Niche Research</h2>
-                <span class="pill">LAVA Brain</span>
+                <h2>AI 選題研究</h2>
+                <span class="pill">由 AI 模型分析</span>
               </div>
               <form action="/projects/trend-research" method="post" class="project-form">
                 <div class="field">
-                  <label for="research-topic">Keyword / Topic</label>
+                  <label for="research-topic">想做的主題或關鍵字</label>
                   <input id="research-topic" name="topic_prompt" required value="AI SaaS變現" />
                 </div>
-                <button type="submit" class="primary">Research Trends</button>
+                <button type="submit" class="primary">分析這個主題</button>
               </form>
             </div>
             <div class="list-pane">
               <div class="section-head">
-                <h2>Recent Projects</h2>
+                <h2>最近的專案</h2>
                 <span class="muted">{len(projects)} total</span>
               </div>
               <table>
                 <thead>
                   <tr>
-                    <th>Project</th>
-                    <th>Title</th>
-                    <th>Cues</th>
-                    <th>Status</th>
+                    <th>代號</th>
+                    <th>標題</th>
+                    <th>分鏡數</th>
+                    <th>進度</th>
                     <th></th>
                   </tr>
                 </thead>
@@ -411,7 +418,7 @@ def project_detail(project_id: str, settings: Settings = Depends(settings_dep)) 
     cue_strip = cue_strip_panel(artifact)
     cue_rows = "\n".join(cue_row(cue) for cue in (artifact.cue_ledger.cues if artifact.cue_ledger else []))
     if not cue_rows:
-        cue_rows = '<tr><td colspan="5" class="muted empty">No cues</td></tr>'
+        cue_rows = '<tr><td colspan="5" class="muted empty">還沒有分鏡</td></tr>'
 
     return page(
         title=artifact.title,
@@ -454,11 +461,11 @@ def project_detail(project_id: str, settings: Settings = Depends(settings_dep)) 
               {visual_quality_panel(artifact)}
               <section class="panel">
                 <div class="section-head">
-                  <h2>Cue Ledger</h2>
+                  <h2>分鏡清單</h2>
                   {file_link(project_id, "cue_ledger.json", "Download JSON")}
                 </div>
                 <table>
-                  <thead><tr><th>Cue</th><th>Time</th><th>Voice</th><th>Visual</th><th>Short</th></tr></thead>
+                  <thead><tr><th>分鏡</th><th>時間</th><th>配音</th><th>畫面</th><th>短片</th></tr></thead>
                   <tbody>{cue_rows}</tbody>
                 </table>
               </section>
@@ -995,13 +1002,13 @@ def approved_assets_count(artifact: ProductionArtifact) -> int:
 
 def page(title: str, body: str, active_nav: str = "") -> str:
     nav_html = f"""
-    <nav class="global-nav" aria-label="Primary navigation">
-      <a class="nav-brand" href="/">Video Pipeline MVP</a>
+    <nav class="global-nav" aria-label="主導覽">
+      <a class="nav-brand" href="/">AI 製片工作台</a>
       <div class="nav-links">
-        <a href="/" class="{'active' if active_nav == 'projects' else ''}">Projects</a>
-        <a href="/benchmark" class="{'active' if active_nav == 'benchmark' else ''}">Benchmark</a>
-        <a href="/settings/lava" class="{'active' if active_nav == 'lava' else ''}">LAVA Settings</a>
-        <a href="/docs">API Docs</a>
+        <a href="/" class="{'active' if active_nav == 'projects' else ''}">我的專案</a>
+        <a href="/benchmark" class="{'active' if active_nav == 'benchmark' else ''}">平台比較</a>
+        <a href="/settings/lava" class="{'active' if active_nav == 'lava' else ''}">AI 模型設定</a>
+        <a href="/docs" class="nav-secondary" title="開發者用的介面文件">開發者文件</a>
       </div>
     </nav>
     """
@@ -1260,7 +1267,7 @@ def lava_settings_view(settings: Settings, verification_result: dict | None = No
         verification_html = f"""
         <section class="panel" style="border-color: {'var(--accent)' if ok else 'var(--amber)'};">
           <div class="section-head">
-            <h2>Verification Result</h2>
+            <h2>連線測試結果</h2>
             <span class="status {cls}">{'ok' if ok else 'needs attention'}</span>
           </div>
           <p class="muted">{escape(str(summary))}</p>
@@ -1271,7 +1278,7 @@ def lava_settings_view(settings: Settings, verification_result: dict | None = No
     connection_options = []
     for connection in status.connections:
         configured = connection.api_key_env in configured_envs
-        key_badge = '<span class="status ok">configured</span>' if configured else '<span class="status warn">missing key</span>'
+        key_badge = '<span class="status ok">已設定</span>' if configured else '<span class="status warn">缺少金鑰</span>'
         active_badge = '<span class="status ok">active</span>' if connection.is_active else '<span class="status warn">inactive</span>'
         connection_options.append(
             f'<option value="{escape(connection.connection_id)}">{escape(connection.label)}</option>'
@@ -1288,7 +1295,7 @@ def lava_settings_view(settings: Settings, verification_result: dict | None = No
                 <form method="post" action="/settings/lava/verify">
                   <input type="hidden" name="connection_id" value="{escape(connection.connection_id)}" />
                   <input type="hidden" name="capability" value="chat" />
-                  <button class="ghost-button" type="submit">Verify</button>
+                  <button class="ghost-button" type="submit">測試連線</button>
                 </form>
               </td>
             </tr>
@@ -1326,9 +1333,9 @@ def lava_settings_view(settings: Settings, verification_result: dict | None = No
                   <input type="hidden" name="task_id" value="{escape(task.task_id)}" />
                   <select name="connection_id">{''.join(selected_options) or option_html}</select>
                   <input name="model_id" value="{escape(model_value)}" placeholder="{escape(bound_connection.model_id if bound_connection else 'optional model override')}" />
-                  <button class="ghost-button" type="submit">Save</button>
+                  <button class="ghost-button" type="submit">儲存</button>
                 </form>
-                <span class="muted">key: {escape(key_status)}</span>
+                <span class="muted">金鑰：{escape(key_status)}</span>
               </td>
               <td class="muted">{escape(task.fallback_behavior)}</td>
             </tr>
@@ -1344,28 +1351,28 @@ def lava_settings_view(settings: Settings, verification_result: dict | None = No
             <div>
               <p class="eyebrow">LLM control plane</p>
               <h1>LAVA Settings</h1>
-              <p class="muted mono">binding source: {escape(status.binding_source)} | config: {escape(status.config_path or '-')}</p>
+              <p class="muted mono">設定來源：{escape(status.binding_source)}　設定檔：{escape(status.config_path or '尚未建立')}</p>
             </div>
-            <a class="ghost-button" href="/settings/lava/status">Status JSON</a>
+            <a class="ghost-button" href="/settings/lava/status">原始狀態資料</a>
           </header>
           {verification_html}
           <section class="panel">
             <div class="section-head">
-              <h2>Provider Connections</h2>
+              <h2>模型連線</h2>
               <span class="muted">{len(status.configured_env_keys)} configured env keys</span>
             </div>
             <table>
-              <thead><tr><th>Connection</th><th>Provider</th><th>Model</th><th>Key</th><th>State</th><th></th></tr></thead>
+              <thead><tr><th>連線</th><th>平台</th><th>模型</th><th>金鑰</th><th>狀態</th><th></th></tr></thead>
               <tbody>{''.join(connection_rows)}</tbody>
             </table>
           </section>
           <section class="panel">
             <div class="section-head">
-              <h2>Task Bindings</h2>
+              <h2>任務對應</h2>
               <span class="muted">{len(status.tasks)} registered tasks</span>
             </div>
             <table>
-              <thead><tr><th>Task</th><th>Stage</th><th>Binding</th><th>Fallback</th></tr></thead>
+              <thead><tr><th>任務</th><th>階段</th><th>對應</th><th>備援</th></tr></thead>
               <tbody>{''.join(task_rows)}</tbody>
             </table>
           </section>
@@ -1403,7 +1410,7 @@ def preview_panel(settings: Settings, artifact: ProductionArtifact) -> str:
     return f"""
     <section class="panel preview-panel">
       <div class="section-head">
-        <h2>Preview</h2>
+        <h2>預覽影片</h2>
         <a class="text-link" href="/projects/{escape(project_id)}/files/preview.mp4">Download</a>
       </div>
       <video controls preload="metadata" src="/projects/{escape(project_id)}/files/preview.mp4"></video>
@@ -1415,11 +1422,11 @@ def cue_strip_panel(artifact: ProductionArtifact) -> str:
     cues = artifact.cue_ledger.cues if artifact.cue_ledger else []
     blocks = "\n".join(cue_block(cue) for cue in cues)
     if not blocks:
-        blocks = '<div class="muted empty">No cue strip</div>'
+        blocks = '<div class="muted empty">還沒有分鏡</div>'
     return f"""
     <section class="panel">
       <div class="section-head">
-        <h2>Timeline Strip</h2>
+        <h2>時間軸</h2>
         <span class="muted">{len(cues)} cues</span>
       </div>
       <div class="cue-strip">{blocks}</div>
@@ -1455,7 +1462,7 @@ def review_panel(artifact: ProductionArtifact) -> str:
     return f"""
     <section class="panel command-panel">
       <div class="section-head">
-        <h2>Review Gate</h2>
+        <h2>人工審核</h2>
         {status_chip(artifact.review_status)}
       </div>
       <div class="gate-stack">
@@ -1486,38 +1493,38 @@ def transcript_panel(artifact: ProductionArtifact) -> str:
     return f"""
     <section id="transcript" class="panel">
       <div class="section-head">
-        <h2>Import Transcript</h2>
+        <h2>匯入字幕稿</h2>
         <span class="muted">{escape(summary)}</span>
       </div>
       <form method="post" action="/projects/{escape(artifact.project_id)}/transcript/import" class="transcript-form">
         <div class="split">
           <div class="field">
-            <label for="transcript-format">Format</label>
+            <label for="transcript-format">格式</label>
             <select id="transcript-format" name="transcript_format">{options}</select>
           </div>
           <div class="field">
-            <label for="transcript-source">Source</label>
+            <label for="transcript-source">來源</label>
             <input id="transcript-source" name="source_name" value="paste" />
           </div>
         </div>
         <input type="hidden" name="actor" value="local" />
         <div class="field">
-          <label for="transcript-content">SRT / VTT / JSON / Text</label>
+          <label for="transcript-content">字幕內容（SRT / VTT / JSON / 純文字）</label>
           <textarea id="transcript-content" name="transcript_content" required placeholder="Paste external ASR output here"></textarea>
         </div>
         <div class="split">
           <input name="note" placeholder="Import note" />
-          <button class="primary" type="submit">Rebuild Timeline</button>
+          <button class="primary" type="submit">重建時間軸</button>
         </div>
       </form>
       {warnings}
       <div class="asr-run-box">
         <div>
           <strong>Local CPU ASR</strong>
-          <span class="muted">Uses the optional Docker ASR worker and the project voiceover file.</span>
+          <span class="muted">使用本機的語音辨識服務，直接讀專案裡的配音檔，不會上傳到雲端。</span>
         </div>
         <form method="post" action="/projects/{escape(artifact.project_id)}/asr/run">
-          <button class="ghost-button" type="submit">Run CPU ASR</button>
+          <button class="ghost-button" type="submit">用本機轉字幕</button>
         </form>
       </div>
     </section>
@@ -1546,8 +1553,8 @@ def shot_dispatch_panel(artifact: ProductionArtifact) -> str:
         return f"""
     <section id="shots" class="panel">
       <div class="section-head">
-        <h2>Shot Dispatch</h2>
-        <span class="muted">No shot plans yet</span>
+        <h2>鏡頭派工</h2>
+        <span class="muted">還沒有鏡頭規劃</span>
       </div>
       <p class="muted empty">建立 ShotPlan 後即可產生 job package 交付人工生成。</p>
     </section>
@@ -1570,20 +1577,25 @@ def shot_dispatch_panel(artifact: ProductionArtifact) -> str:
         readiness = {}
 
     readiness_labels = {
-        ShotReadinessState.READY: "Ready",
-        ShotReadinessState.INCOMPLETE: "Incomplete",
-        ShotReadinessState.BLOCKED: "Blocked",
+        ShotReadinessState.READY: "可以派工",
+        ShotReadinessState.INCOMPLETE: "資料不齊",
+        ShotReadinessState.BLOCKED: "缺必要素材",
     }
 
     rows = []
     for shot in shots:
         shot_jobs = jobs.get(shot.shot_id, [])
         if shot_jobs:
-            state = ", ".join(
-                sorted({f"{job.provider}: {job.status}" for job in shot_jobs})
+            state = "、".join(
+                sorted(
+                    {
+                        f"{provider_name(job.provider)}：{status_name(job.status)}"
+                        for job in shot_jobs
+                    }
+                )
             )
         else:
-            state = "not dispatched"
+            state = "尚未派工"
 
         check = readiness.get(shot.shot_id)
         if check is None:
@@ -1597,8 +1609,9 @@ def shot_dispatch_panel(artifact: ProductionArtifact) -> str:
         rows.append(
             f"""
         <tr>
-          <td class="mono">{escape(shot.shot_id)}</td>
-          <td>{escape(shot.capability.value)}</td>
+          <td>{escape(shot_name(shot.shot_id))}<br />
+              <span class="muted mono">{escape(shot.shot_id)}</span></td>
+          <td>{escape(capability_name(shot.capability.value))}</td>
           <td>{escape(shot.camera.describe())}</td>
           <td class="mono">{shot.target_duration_ms / 1000:g}s</td>
           <td>{escape(shot.prompt[:70])}</td>
@@ -1621,22 +1634,22 @@ def shot_dispatch_panel(artifact: ProductionArtifact) -> str:
     return f"""
     <section id="shots" class="panel">
       <div class="section-head">
-        <h2>Shot Dispatch</h2>
+        <h2>鏡頭派工</h2>
         <span class="muted">{escape(summary)}</span>
       </div>
       <form method="post" action="/projects/{escape(project_id)}/shots/dispatch" class="split">
         <div class="field">
-          <label for="dispatch-provider">Provider</label>
+          <label for="dispatch-provider">平台</label>
           <select id="dispatch-provider" name="preferred_provider">
             <option value="">Auto (routing policy)</option>
             {provider_options}
           </select>
         </div>
-        <button class="primary" type="submit">Generate Job Packages</button>
+        <button class="primary" type="submit">產生派工包</button>
       </form>
       <table class="data-table">
         <thead>
-          <tr><th>Shot</th><th>Capability</th><th>Camera</th><th>Target</th><th>Prompt</th><th>Ready</th><th>Dispatch</th></tr>
+          <tr><th>鏡頭</th><th>能力</th><th>運鏡</th><th>比較對象</th><th>提示詞</th><th>就緒</th><th>派工</th></tr>
         </thead>
         <tbody>{"".join(rows)}</tbody>
       </table>
@@ -1734,8 +1747,8 @@ def variant_panel(artifact: ProductionArtifact) -> str:
         items = by_shot.get(shot.shot_id, [])
         if not items:
             cards.append(
-                f'<div class="variant-group"><strong class="mono">{escape(shot.shot_id)}</strong>'
-                f'<span class="muted"> no variants imported</span></div>'
+                f'<div class="variant-group"><strong>{escape(shot_name(shot.shot_id))}</strong>'
+                f'<span class="muted"> 尚未匯入任何影片</span></div>'
             )
             continue
 
@@ -1789,7 +1802,7 @@ def variant_panel(artifact: ProductionArtifact) -> str:
                   <div><span class="muted">來源</span>{origin}</div>
                   <div><span class="muted">片長</span><b class="mono">{escape(duration)}</b></div>
                   <div><span class="muted">解析度</span><b class="mono">{escape(variant.resolution or "?")}</b></div>
-                  <div><span class="muted">狀態</span><b>{escape(variant.status)}</b></div>
+                  <div><span class="muted">狀態</span><b>{escape(status_name(variant.status))}</b></div>
                   <div><span class="muted">候選</span><b class="mono">{escape(variant.variant_id[-12:])}</b></div>
                 </div>
               </div>
@@ -1838,7 +1851,8 @@ def variant_panel(artifact: ProductionArtifact) -> str:
         cards.append(
             f"""
         <div class="variant-group">
-          <strong class="mono shot-heading">{escape(shot.shot_id)}</strong>
+          <strong class="shot-heading">{escape(shot_name(shot.shot_id))}
+            <span class="muted mono">{escape(shot.shot_id)}</span></strong>
           {"".join(rows)}
         </div>
         """
@@ -1862,28 +1876,28 @@ def variant_panel(artifact: ProductionArtifact) -> str:
     return f"""
     <section id="variants" class="panel">
       <div class="section-head">
-        <h2>Variants</h2>
+        <h2>生成的影片</h2>
         <span class="muted">{escape(head)}</span>
       </div>
       <form method="post" action="/projects/{escape(project_id)}/variants/import"
             enctype="multipart/form-data" class="variant-import">
         <div class="split">
           <div class="field">
-            <label for="variant-shot">Shot</label>
+            <label for="variant-shot">鏡頭</label>
             <select id="variant-shot" name="shot_id">{shot_options}</select>
           </div>
           <div class="field">
-            <label for="variant-provider">Provider</label>
+            <label for="variant-provider">平台</label>
             <select id="variant-provider" name="provider">{provider_options}</select>
           </div>
         </div>
         <div class="field">
-          <label for="variant-files">Generated videos</label>
+          <label for="variant-files">生成好的影片</label>
           <input id="variant-files" type="file" name="files" multiple accept="video/*" required />
         </div>
         <div class="split">
           <input name="request_hash" placeholder="request_hash from job.json (optional)" />
-          <button class="primary" type="submit">Import Variants</button>
+          <button class="primary" type="submit">匯入影片</button>
         </div>
       </form>
       {"".join(cards)}
@@ -1903,11 +1917,11 @@ def visual_quality_panel(artifact: ProductionArtifact) -> str:
         for finding in report.findings
     )
     if not findings:
-        findings = '<li class="muted">No visual QC findings</li>'
+        findings = '<li class="muted">畫面檢查沒有發現問題</li>'
     return f"""
     <section class="panel">
       <div class="section-head">
-        <h2>Visual Quality Contract</h2>
+        <h2>畫面風格規範</h2>
         <div class="actions">
           <span class="status {'ok' if report.score >= 85 else 'warn'}">score {report.score}</span>
           {file_link(artifact.project_id, "visual_contract.json", "Contract")}
@@ -1941,7 +1955,7 @@ def llm_brain_panel(project_id: str, settings: Settings) -> str:
         provider = connection.provider if connection else "unbound"
         model = binding.model_id or connection.model_id if binding and connection else "-"
         configured = bool(connection and connection.api_key_env in status.configured_env_keys)
-        key_badge = '<span class="status ok">key ready</span>' if configured else '<span class="status warn">key missing</span>'
+        key_badge = '<span class="status ok">金鑰已就緒</span>' if configured else '<span class="status warn">缺少金鑰</span>'
         rows.append(
             f"<tr><td>{escape(task.label)}</td><td>{escape(provider)}</td><td>{escape(model)}</td>"
             f"<td>{key_badge}</td></tr>"
@@ -1950,7 +1964,7 @@ def llm_brain_panel(project_id: str, settings: Settings) -> str:
     trigger_btn = f"""
     <div style="margin-top: 15px; border-top: 1px solid #374151; padding-top: 15px;">
       <form method="post" action="/projects/{escape(project_id)}/lava/run">
-        <button class="primary" type="submit" style="width: 100%;">Run LAVA Brain Workflow</button>
+        <button class="primary" type="submit" style="width: 100%;">執行 AI 工作流</button>
       </form>
     </div>
     """
@@ -1958,11 +1972,11 @@ def llm_brain_panel(project_id: str, settings: Settings) -> str:
     return f"""
     <section class="panel">
       <div class="section-head">
-        <h2>LLM Brain</h2>
+        <h2>AI 模型工作流</h2>
         <a class="button-link" href="/settings/lava">Settings</a>
       </div>
       <table>
-        <thead><tr><th>Task</th><th>Provider</th><th>Model</th><th>Key</th></tr></thead>
+        <thead><tr><th>任務</th><th>平台</th><th>模型</th><th>金鑰</th></tr></thead>
         <tbody>{"".join(rows)}</tbody>
       </table>
       {trigger_btn}
@@ -1993,11 +2007,11 @@ def review_form(
 def asset_panel(artifact: ProductionArtifact) -> str:
     cards = "\n".join(asset_card(artifact, asset) for asset in (artifact.asset_manifest.assets if artifact.asset_manifest else []))
     if not cards:
-        cards = '<div class="muted empty">No assets needed</div>'
+        cards = '<div class="muted empty">這個專案不需要額外素材</div>'
     return f"""
     <section id="assets" class="panel">
       <div class="section-head">
-        <h2>Asset Rights</h2>
+        <h2>素材授權</h2>
         {file_link(artifact.project_id, "asset_manifest.json", "JSON")}
       </div>
       <div class="asset-grid">{cards}</div>
@@ -2023,7 +2037,7 @@ def asset_card(artifact: ProductionArtifact, asset) -> str:
           <input type="hidden" name="actor" value="local" />
           <select name="rights_status">{options}</select>
           <input name="note" placeholder="Rights note" />
-          <button type="submit">Save</button>
+          <button type="submit">儲存</button>
         </form>
       </div>
     </article>
@@ -2034,15 +2048,15 @@ def compliance_panel(artifact: ProductionArtifact) -> str:
     findings = artifact.compliance_report.findings if artifact.compliance_report else []
     rows = "\n".join(finding_row(finding) for finding in findings)
     if not rows:
-        rows = '<tr><td colspan="4" class="muted empty">No findings</td></tr>'
+        rows = '<tr><td colspan="4" class="muted empty">沒有發現問題</td></tr>'
     return f"""
     <section class="panel">
       <div class="section-head">
-        <h2>Compliance</h2>
+        <h2>合規檢查</h2>
         {file_link(artifact.project_id, "compliance_report.json", "JSON")}
       </div>
       <table>
-        <thead><tr><th>Severity</th><th>Code</th><th>Message</th><th>Cue</th></tr></thead>
+        <thead><tr><th>嚴重度</th><th>代碼</th><th>訊息</th><th>分鏡</th></tr></thead>
         <tbody>{rows}</tbody>
       </table>
     </section>
@@ -2053,15 +2067,15 @@ def decision_log_panel(artifact: ProductionArtifact) -> str:
     entries = list(reversed(artifact.decision_log[-8:]))
     rows = "\n".join(log_row(entry) for entry in entries)
     if not rows:
-        rows = '<tr><td colspan="4" class="muted empty">No decisions yet</td></tr>'
+        rows = '<tr><td colspan="4" class="muted empty">還沒有任何操作紀錄</td></tr>'
     return f"""
     <section class="panel">
       <div class="section-head">
-        <h2>Decision Log</h2>
+        <h2>操作紀錄</h2>
         <span class="muted">{len(artifact.decision_log)} entries</span>
       </div>
       <table>
-        <thead><tr><th>Time</th><th>Action</th><th>Status</th><th>Note</th></tr></thead>
+        <thead><tr><th>時間</th><th>動作</th><th>結果</th><th>說明</th></tr></thead>
         <tbody>{rows}</tbody>
       </table>
     </section>
@@ -2095,11 +2109,14 @@ def finding_row(finding) -> str:
 def log_row(entry: DecisionLogEntry) -> str:
     status = ""
     if entry.from_status or entry.to_status:
-        status = f"{entry.from_status or ''} -> {entry.to_status or ''}"
+        status = (
+            f"{status_name(entry.from_status) if entry.from_status else ''}"
+            f" → {status_name(entry.to_status) if entry.to_status else ''}"
+        )
     return f"""
     <tr>
       <td>{entry.created_at.strftime("%H:%M:%S")}</td>
-      <td class="mono">{escape(entry.action)}</td>
+      <td>{escape(action_name(entry.action))}</td>
       <td>{escape(status)}</td>
       <td>{escape(entry.note or "")}</td>
     </tr>
@@ -2251,13 +2268,13 @@ def status_flow_panel(artifact: ProductionArtifact) -> str:
     return f"""
     <section class="panel status-flow-panel">
       <div class="section-head">
-        <h2>Project Status Flow</h2>
+        <h2>專案進度</h2>
         <span class="status {'ok' if snapshot["upload_ready"] else 'warn'}">{escape(str(snapshot["review_status"]))}</span>
       </div>
       <div class="status-pipeline">{nodes}</div>
       <div class="action-box">
-        <p><strong>Next Recommended Action:</strong> {snapshot["next_action_html"]}</p>
-        <p class="muted"><strong>Missing Prerequisites:</strong> {escape(str(snapshot["missing"]))}</p>
+        <p><strong>建議的下一步：</strong> {snapshot["next_action_html"]}</p>
+        <p class="muted"><strong>還缺什麼：</strong> {escape(str(snapshot["missing"]))}</p>
       </div>
     </section>
     """
@@ -2297,7 +2314,8 @@ def status_chip(status: ReviewStatus, ready: bool = False) -> str:
 
 
 def status_label(status: ReviewStatus) -> str:
-    return status.value.replace("_", " ")
+    """審核狀態的中文說法。"""
+    return status_name(status.value)
 
 
 def rights_class(status: RightsStatus) -> str:
@@ -2322,7 +2340,7 @@ def packaging_panel(artifact: ProductionArtifact) -> str:
     return f"""
     <section class="panel">
       <div class="section-head">
-        <h2>Video Packaging & SEO</h2>
+        <h2>標題與封面文案</h2>
         <span class="pill">LAVA Brain</span>
       </div>
       <div style="display:grid; gap:8px; margin-bottom: 12px;">
@@ -2331,7 +2349,7 @@ def packaging_panel(artifact: ProductionArtifact) -> str:
         <div>{thumb_info}</div>
       </div>
       <form method="post" action="/projects/{escape(artifact.project_id)}/optimize-packaging">
-        <button class="primary" type="submit" style="width: 100%;">Optimize Packaging via LLM</button>
+        <button class="primary" type="submit" style="width: 100%;">讓 AI 優化標題文案</button>
       </form>
     </section>
     """
@@ -2345,14 +2363,14 @@ def shorts_panel(artifact: ProductionArtifact) -> str:
     return f"""
     <section class="panel">
       <div class="section-head">
-        <h2>Short-Video Splitting</h2>
+        <h2>短影音切分</h2>
         <span class="pill">Shorts Boundary</span>
       </div>
       <p style="margin-bottom: 12px; font-size: 12px; color: var(--muted);">
         Splits script by &lt;SHORT_BREAK&gt; into up to 10 subprojects.
       </p>
       <form method="post" action="/projects/{escape(artifact.project_id)}/split">
-        <button class="primary" type="submit" style="width: 100%;" {disabled}>Split Script to Shorts</button>
+        <button class="primary" type="submit" style="width: 100%;" {disabled}>切成短影音</button>
       </form>
     </section>
     """
@@ -2373,7 +2391,7 @@ def metrics_panel(artifact: ProductionArtifact) -> str:
     return f"""
     <section class="panel">
       <div class="section-head">
-        <h2>Metrics & Optimization</h2>
+        <h2>成效與優化</h2>
         <span class="pill">Feedback Loop</span>
       </div>
       {results_html}
@@ -2404,7 +2422,7 @@ def metrics_panel(artifact: ProductionArtifact) -> str:
             </select>
           </div>
         </div>
-        <button class="primary" type="submit" style="width: 100%;">Feedback Metrics</button>
+        <button class="primary" type="submit" style="width: 100%;">回填成效數據</button>
       </form>
 
       <div style="margin: 20px 0; border-top: 1px solid var(--line);"></div>
@@ -2415,7 +2433,7 @@ def metrics_panel(artifact: ProductionArtifact) -> str:
           <label for="metrics-youtube-id">YouTube Video ID</label>
           <input id="metrics-youtube-id" name="video_id" required placeholder="e.g. dQw4w9WgXcQ" />
         </div>
-        <button class="primary" type="submit" style="width: 100%;">Sync via OAuth</button>
+        <button class="primary" type="submit" style="width: 100%;">從 YouTube 同步</button>
       </form>
 
       <div style="margin: 20px 0; border-top: 1px solid var(--line);"></div>
@@ -2423,10 +2441,10 @@ def metrics_panel(artifact: ProductionArtifact) -> str:
       <h3 style="margin: 10px 0; font-size: 14px; color: var(--text);">Import from Local CSV</h3>
       <form method="post" action="/projects/{escape(artifact.project_id)}/metrics/csv" class="project-form">
         <div class="field">
-          <label for="metrics-csv-path">Local CSV Path</label>
+          <label for="metrics-csv-path">CSV 檔案路徑</label>
           <input id="metrics-csv-path" name="csv_path" required placeholder="e.g. C:/path/to/metrics.csv" />
         </div>
-        <button class="primary" type="submit" style="width: 100%;">Import CSV</button>
+        <button class="primary" type="submit" style="width: 100%;">從 CSV 匯入</button>
       </form>
     </section>
     """
@@ -2462,12 +2480,12 @@ async def trend_research_list(
           <div class="asset-thumb generated_image">Angle {idx+1}</div>
           <div class="asset-body">
             <h3 style="margin:0 0 5px 0; font-size:15px; color:var(--text);">{escape(angle)}</h3>
-            <p style="font-size:12px; margin-bottom:8px;"><strong>Keyword:</strong> {escape(report.get('primary_keyword'))} | <strong>CPM:</strong> {escape(report.get('cpm_tier'))}</p>
+            <p style="font-size:12px; margin-bottom:8px;"><strong>關鍵字：</strong> {escape(report.get('primary_keyword'))} | <strong>CPM:</strong> {escape(report.get('cpm_tier'))}</p>
             <form method="post" action="/projects/trend-research/create">
               <input type="hidden" name="title" value="{escape(angle)}" />
               <input type="hidden" name="primary_keyword" value="{escape(report.get('primary_keyword'))}" />
               <input type="hidden" name="angle" value="{escape(angle)}" />
-              <button class="primary" type="submit">Create Project & Draft Script via LLM</button>
+              <button class="primary" type="submit">建立專案並讓 AI 起草腳本</button>
             </form>
           </div>
         </div>
@@ -2480,21 +2498,21 @@ async def trend_research_list(
         <section class="app-shell">
           <header class="project-hero">
             <div>
-              <h1 style="margin-top:8px;">AI Niche Research: {escape(topic_prompt)}</h1>
-              <p class="muted">Primary Keyword: {escape(report.get('primary_keyword'))} | Search Intent: {escape(report.get('search_intent'))}</p>
+              <h1 style="margin-top:8px;">AI 選題研究：{escape(topic_prompt)}</h1>
+              <p class="muted">主要關鍵字：{escape(report.get('primary_keyword'))}　搜尋意圖：{escape(report.get('search_intent'))}</p>
             </div>
           </header>
           
           <section class="review-layout">
             <main class="main-col">
               <section class="panel">
-                <h2>Suggested Video Angles</h2>
+                <h2>建議的切入角度</h2>
                 <div style="margin-top: 15px;">{angles_html}</div>
               </section>
             </main>
             <aside class="side-col">
               <section class="panel">
-                <h2>Competitor Gaps & Pain points</h2>
+                <h2>對手沒做到的地方</h2>
                 <ul class="warning-list">
                   {"".join(f"<li>{escape(gap)}</li>" for gap in report.get('competitor_gaps', []))}
                 </ul>

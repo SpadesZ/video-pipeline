@@ -1427,7 +1427,12 @@ def verify_ui_routes() -> None:
         check('href="/benchmark"' in home, "導航應提供 Benchmark 入口")
 
         console = client.get("/benchmark").text
-        for label in ("準備參考素材", "確認平台版本", "建立派工", "生成與匯入"):
+        for label in (
+            "準備參考素材",
+            "確認平台版本",
+            "建立生成工單",
+            "到平台生成並匯入",
+        ):
             check(label in console, f"控制台缺少步驟: {label}")
         check("待確認" in console, "應標示尚未確認版本的比較對象")
 

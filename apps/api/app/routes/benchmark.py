@@ -24,6 +24,7 @@ from fastapi.concurrency import run_in_threadpool
 from sqlmodel import Session, select
 
 from app.deps import settings_dep
+from app.labels import award_name, scenario_name, shot_name, status_name
 from pipeline.benchmark import (
     attempts,
     attribution,
@@ -164,7 +165,7 @@ def _target_table(state: workflow.WorkflowState) -> str:
     )
     return (
         "<table class='data-table'><thead><tr>"
-        "<th>Target</th><th>Provider</th><th>Model</th><th>Version</th>"
+        "<th>比較對象</th><th>平台</th><th>模型</th><th>版本</th>"
         "<th>平台選項名稱</th><th>狀態</th><th>派工</th><th>候選</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
     )
@@ -186,7 +187,7 @@ def benchmark_console(settings: Settings = Depends(settings_dep)) -> str:
     )
 
     return page(
-        title="V1 Benchmark",
+        title="平台比較",
         active_nav="benchmark",
         body=f"""
         <section class="app-shell" data-route="/benchmark"
@@ -194,7 +195,7 @@ def benchmark_console(settings: Settings = Depends(settings_dep)) -> str:
                  data-entity-type="benchmark_console">
           <header class="project-hero">
             <div>
-              <h1>V1 Benchmark</h1>
+              <h1>平台比較</h1>
               <p class="muted">
                 比較 {len(state.targets)} 個對象在 {state.shots_total} 顆固定鏡頭上的表現。
                 真實生成需在各平台手動完成，本系統不呼叫任何影片 API。
@@ -346,7 +347,7 @@ def assets_page(
     )
 
     return page(
-        title="Benchmark 參考素材",
+        title="參考素材",
         active_nav="benchmark",
         body=f"""
         <section class="app-shell" data-route="/benchmark/assets"
@@ -361,7 +362,7 @@ def assets_page(
               </p>
             </div>
             <div class="actions">
-              <a class="ghost-button" href="/benchmark">返回 Benchmark</a>
+              <a class="ghost-button" href="/benchmark">返回總覽</a>
             </div>
           </header>
           {banner}
@@ -515,17 +516,17 @@ def _target_card(
       <form method="post" action="/benchmark/targets/{escape(item.target_id)}">
         <div class="split">
           <div class="field">
-            <label>Provider</label>
+            <label>平台</label>
             <input value="{escape(item.provider)}" disabled />
           </div>
           <div class="field">
-            <label for="model_{escape(item.target_id)}">Catalog model</label>
+            <label for="model_{escape(item.target_id)}">系統內的模型代號</label>
             <select id="model_{escape(item.target_id)}" name="model_id">{options}</select>
             <p class="field-help">本系統內部的模型代號，不是平台上的名稱。</p>
           </div>
         </div>
         <p class="field-help section-help">
-          下面兩欄請照抄平台畫面上的字，不要自己translate或簡寫。
+          下面兩欄請照抄平台畫面上的字，不要自己翻譯或簡寫。
           日後要回答「當時用的是哪一版」，靠的就是這兩欄。
         </p>
         <div class="split">
@@ -539,7 +540,7 @@ def _target_card(
             </p>
           </div>
           <div class="field">
-            <label for="ver_{escape(item.target_id)}">Model version</label>
+            <label for="ver_{escape(item.target_id)}">平台標示的版本</label>
             <input id="ver_{escape(item.target_id)}" name="model_version"
                    value="{escape(item.model_version or '')}"
                    placeholder="例如 1.6" />
@@ -603,7 +604,7 @@ def targets_page(
     )
 
     return page(
-        title="Benchmark 比較對象",
+        title="比較對象",
         active_nav="benchmark",
         body=f"""
         <section class="app-shell" data-route="/benchmark/targets"
@@ -617,7 +618,7 @@ def targets_page(
               </p>
             </div>
             <div class="actions">
-              <a class="ghost-button" href="/benchmark">返回 Benchmark</a>
+              <a class="ghost-button" href="/benchmark">返回總覽</a>
             </div>
           </header>
           {banner}
@@ -748,7 +749,7 @@ def jobs_page(settings: Settings = Depends(settings_dep)) -> str:
     if not views:
         rows = (
             '<tr><td colspan="7" class="muted empty">'
-            "尚未建立任何派工。請先完成步驟 1 與 2，再回到 Benchmark 按「建立正式 Job Packages」。"
+            "尚未建立任何派工。請先完成步驟 1 與 2，再回到 Benchmark 按「建立各鏡頭的生成工單」。"
             "</td></tr>"
         )
     else:
@@ -759,8 +760,9 @@ def jobs_page(settings: Settings = Depends(settings_dep)) -> str:
             f"<tr class='{'job-done' if item.complete else 'job-todo'}'>"
             f"<td>{'✓ 已完成' if item.complete else '待生成'}</td>"
             f"<td class='mono'>{escape(item.target_id or '—')}</td>"
-            f"<td class='mono'>{escape(item.shot_id)}</td>"
-            f"<td>{escape(item.scenario)}</td>"
+            f"<td>{escape(shot_name(item.shot_id))}"
+            f"<br /><span class='muted mono'>{escape(item.shot_id)}</span></td>"
+            f"<td>{escape(scenario_name(item.scenario))}</td>"
             f"<td class='mono'>{escape(item.provider)}</td>"
             f"<td class='mono'>{escape(item.model_display)}</td>"
             f"<td>{item.variants_imported}</td>"
@@ -773,14 +775,14 @@ def jobs_page(settings: Settings = Depends(settings_dep)) -> str:
 
     done = sum(1 for item in views if item.complete)
     return page(
-        title="Job Workbench",
+        title="逐鏡生成",
         active_nav="benchmark",
         body=f"""
         <section class="app-shell" data-route="/benchmark/jobs"
                  data-step="4" data-entity-type="benchmark_jobs">
           <header class="project-hero">
             <div>
-              <h1>Job Workbench</h1>
+              <h1>逐鏡生成</h1>
               <p class="muted">
                 {done}/{len(views)} 份派工已有匯入的影片。
                 每一份都對應平台上的一次生成，從這裡複製提示詞、下載首幀，
@@ -788,7 +790,7 @@ def jobs_page(settings: Settings = Depends(settings_dep)) -> str:
               </p>
             </div>
             <div class="actions">
-              <a class="ghost-button" href="/benchmark">返回 Benchmark</a>
+              <a class="ghost-button" href="/benchmark">返回總覽</a>
             </div>
           </header>
           <section class="panel">
@@ -883,8 +885,8 @@ def job_workbench(
         f"<div><span class='muted'>{escape(label)}</span>"
         f"<b class='mono'>{escape(value)}</b></div>"
         for label, value in (
-            ("情境", view.scenario or "—"),
-            ("鏡頭", view.shot_id),
+            ("情境", scenario_name(view.scenario) if view.scenario else "—"),
+            ("鏡頭", shot_name(view.shot_id)),
             ("比較對象", view.target_id or "—"),
             ("平台", view.provider),
             ("模型", view.model_id or "—"),
@@ -893,7 +895,7 @@ def job_workbench(
             ("片長", f"{view.duration_seconds}s" if view.duration_seconds else "—"),
             ("畫面比例", view.aspect_ratio or "—"),
             ("運鏡", view.camera or "—"),
-            ("狀態", view.status),
+            ("狀態", status_name(view.status)),
         )
     )
 
@@ -919,7 +921,7 @@ def job_workbench(
                  data-entity-id="{escape(job_id)}">
           <header class="project-hero">
             <div>
-              <h1>{escape(view.shot_id)}</h1>
+              <h1>{escape(shot_name(view.shot_id))}</h1>
               <p class="muted">
                 {escape(view.target_id or '未歸屬')} ·
                 {escape(view.provider)} · {escape(view.model_display)}
@@ -979,9 +981,9 @@ def job_workbench(
                 <div class="field">
                   <label for="status">結果</label>
                   <select id="status" name="status">
-                    <option value="success">success（有產出影片）</option>
-                    <option value="failed">failed（平台報錯或崩壞）</option>
-                    <option value="cancelled">cancelled（自行中斷）</option>
+                    <option value="success">成功　有產出影片</option>
+                    <option value="failed">失敗　平台報錯或畫面崩壞</option>
+                    <option value="cancelled">取消　自己中途停掉</option>
                   </select>
                 </div>
                 <div class="field">
@@ -1297,9 +1299,10 @@ def attempts_form(settings: Settings = Depends(settings_dep)) -> str:
     )
 
     recent = "".join(
-        f"<tr><td class='mono'>{escape(item.shot_id)}</td>"
+        f"<tr><td>{escape(shot_name(item.shot_id))}</td>"
         f"<td class='mono'>{escape(item.target_id)}</td>"
-        f"<td>{item.attempt_no}</td><td>{escape(item.status)}</td>"
+        f"<td>第 {item.attempt_no} 次</td>"
+        f"<td>{escape(status_name(item.status))}</td>"
         f"<td class='mono'>{escape(item.output_file or '—')}</td>"
         f"<td>{escape(item.failure_reason or '—')}</td></tr>"
         for item in reversed(ledger.attempts[-15:])
@@ -1320,7 +1323,7 @@ def attempts_form(settings: Settings = Depends(settings_dep)) -> str:
               </p>
             </div>
             <div class="actions">
-              <a class="ghost-button" href="/benchmark">返回 Benchmark</a>
+              <a class="ghost-button" href="/benchmark">返回總覽</a>
             </div>
           </header>
 
@@ -1340,9 +1343,9 @@ def attempts_form(settings: Settings = Depends(settings_dep)) -> str:
                 <div class="field">
                   <label for="status">結果</label>
                   <select id="status" name="status">
-                    <option value="success">success（有產出影片）</option>
-                    <option value="failed">failed（平台報錯或崩壞）</option>
-                    <option value="cancelled">cancelled（自行中斷）</option>
+                    <option value="success">成功　有產出影片</option>
+                    <option value="failed">失敗　平台報錯或畫面崩壞</option>
+                    <option value="cancelled">取消　自己中途停掉</option>
                   </select>
                 </div>
                 <div class="field">
@@ -1451,8 +1454,8 @@ def continuity_index(settings: Settings = Depends(settings_dep)) -> str:
     rows = "".join(
         f"<tr>"
         f"<td class='mono'>{escape(item.target_id)}</td>"
-        f"<td class='mono'>{escape(item.shot_id)} ↔ {escape(item.ref_shot_id)}</td>"
-        f"<td>{escape(item.scenario)}</td>"
+        f"<td>{escape(shot_name(item.shot_id))}<br />↔ {escape(shot_name(item.ref_shot_id))}</td>"
+        f"<td>{escape(scenario_name(item.scenario))}</td>"
         f"<td>{status_cell(item)}</td>"
         f"<td>{escape('；'.join(item.missing) or ('舊評分 ' + str(item.stale_scores) + ' 筆保留為歷史' if item.stale_scores else '—'))}</td>"
         f"<td>"
@@ -1492,7 +1495,7 @@ def continuity_index(settings: Settings = Depends(settings_dep)) -> str:
               </p>
             </div>
             <div class="actions">{cta}
-              <a class="ghost-button" href="/benchmark">返回 Benchmark</a>
+              <a class="ghost-button" href="/benchmark">返回總覽</a>
             </div>
           </header>
           <section class="panel">
@@ -1821,8 +1824,8 @@ def benchmark_results(settings: Settings = Depends(settings_dep)) -> str:
         f"""
         <div class="panel">
           <div class="section-head">
-            <h2>{escape(item.award.replace('best_for_', '').replace('_', ' ').title())}</h2>
-            <span class="muted">{escape(item.scope)}</span>
+            <h2>{escape(award_name(item.award))}</h2>
+            <span class="muted">{escape(scenario_name(item.scope))}</span>
           </div>
           <p><strong>{escape(item.winner or '資料不足')}</strong></p>
           <p class="muted">排序依據：{escape(_readable_criteria(item.reason))}</p>
@@ -1892,21 +1895,21 @@ def benchmark_results(settings: Settings = Depends(settings_dep)) -> str:
         )
 
     return page(
-        title="Benchmark 結果",
+        title="平台比較結果",
         active_nav="benchmark",
         body=f"""
         <section class="app-shell" data-route="/benchmark/results"
                  data-step="6" data-entity-type="benchmark_results">
           <header class="project-hero">
             <div>
-              <h1>Benchmark 結果</h1>
+              <h1>平台比較結果</h1>
               <p class="muted">
                 統計公式版本 {escape(report.aggregation_version)}，
                 於生成開始前即已固定。依情境分別評選，不產生總冠軍。
               </p>
             </div>
             <div class="actions">
-              <a class="ghost-button" href="/benchmark">返回 Benchmark</a>
+              <a class="ghost-button" href="/benchmark">返回總覽</a>
             </div>
           </header>
           {warnings}
