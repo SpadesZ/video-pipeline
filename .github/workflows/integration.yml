@@ -1,0 +1,116 @@
+# 檔案路徑: video-pipeline/.github/workflows/integration.yml
+# 產生時間: 2026-09-04 +08:00
+# 版本: v1.0
+# 模組定位:
+#   Docker 整合測試 CI。
+# 主要責任:
+#   1. 以 docker compose 建置服務並執行需要 Postgres / Redis / FFmpeg 的冒煙測試。
+#   2. 驗證 migration 在 Postgres 上可正確套用。
+# 說明:
+#   刻意不在每個 PR 自動執行，避免重建 ASR / FFmpeg 映像拖慢開發回饋。
+#   預設於 main 分支推送與手動觸發時執行；PR 需要時可手動 dispatch。
+# --------------------------------------------------------------------------
+
+name: Integration
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: Core services smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build api and worker images
+        run: docker compose build api worker
+
+      - name: Start postgres and redis
+        run: docker compose up -d postgres redis
+
+      - name: Apply migrations on postgres
+        run: docker compose run --rm api python scripts/migrate.py upgrade
+
+      - name: Schema check
+        run: docker compose run --rm api python scripts/migrate.py check
+
+      - name: smoke_test (api)
+        run: docker compose run --rm api python scripts/smoke_test.py
+
+      - name: smoke_navigation_ui (api)
+        run: docker compose run --rm api python scripts/smoke_navigation_ui.py
+
+      - name: smoke_narrative_models (api)
+        run: docker compose run --rm api python scripts/smoke_narrative_models.py
+
+      - name: smoke_capability_router (api)
+        run: docker compose run --rm api python scripts/smoke_capability_router.py
+
+      - name: smoke_manual_provider (api)
+        run: docker compose run --rm api python scripts/smoke_manual_provider.py
+
+      - name: smoke_variant_qc (api)
+        run: docker compose run --rm api python scripts/smoke_variant_qc.py
+
+      - name: smoke_shot_assembly (api)
+        run: docker compose run --rm api python scripts/smoke_shot_assembly.py
+
+      - name: smoke_benchmark_v1 (api)
+        run: docker compose run --rm api python scripts/smoke_benchmark_v1.py
+
+      - name: smoke_benchmark_web_v1c (api)
+        run: docker compose run --rm api python scripts/smoke_benchmark_web_v1c.py
+
+      - name: smoke_benchmark_version_drift (api)
+        run: docker compose run --rm api python scripts/smoke_benchmark_version_drift.py
+
+      - name: smoke_benchmark_continuity_identity (api)
+        run: docker compose run --rm api python scripts/smoke_benchmark_continuity_identity.py
+
+      - name: smoke_project_store (worker)
+        run: docker compose run --rm worker python scripts/smoke_project_store.py
+
+      - name: smoke_lava_settings (worker)
+        run: docker compose run --rm worker python scripts/smoke_lava_settings.py
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --tail=100
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  asr:
+    name: CPU ASR smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build asr worker image
+        run: docker compose --profile asr build asr-worker
+
+      - name: Start postgres and redis
+        run: docker compose up -d postgres redis
+
+      - name: smoke_asr (asr-worker)
+        run: docker compose --profile asr run --rm asr-worker python scripts/smoke_asr.py
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --tail=100
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

@@ -9,57 +9,27 @@
 # --------------------------------------------------------------------------
 
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional, List, Dict, Any, Type
 
 from sqlmodel import Field, SQLModel
 from sqlalchemy import Column, JSON
-from sqlalchemy.types import TypeDecorator
-from pydantic import BaseModel
 
 from pipeline.models.asset_manifest import AssetManifest
 from pipeline.models.compliance import ComplianceReport
 from pipeline.models.cue_ledger import CueLedger
+from pipeline.models.json_column import PydanticJSON
 from pipeline.models.metrics import MetricsDecision
+from pipeline.models.narrative import NarrativeIR
+from pipeline.models.production_profile import ProductionProfile
 from pipeline.models.review import DecisionLogEntry, ReviewStatus
+from pipeline.models.shorts_manifest import ShortsManifest
+from pipeline.models.shot import CharacterIdentityPack, ShotPlan
+from pipeline.models.timeline import EditDecision
 from pipeline.models.transcript import TranscriptImport
 from pipeline.models.visual_contract import VisualQualityContract, VisualQualityReport
 
-
-class PydanticJSON(TypeDecorator):
-    """
-    SQLAlchemy TypeDecorator that transparently serializes/deserializes Pydantic models
-    to/from JSON columns. Supports both single models and lists of models.
-    """
-    impl = JSON
-    cache_ok = True
-
-    def __init__(self, pydantic_model: Type[BaseModel], is_list: bool = False):
-        super().__init__()
-        self.pydantic_model = pydantic_model
-        self.is_list = is_list
-
-    def process_bind_param(self, value, dialect):
-        if value is None:
-            return None
-        if self.is_list:
-            if isinstance(value, list):
-                return [item.model_dump(mode='json') if isinstance(item, BaseModel) else item for item in value]
-        else:
-            if isinstance(value, BaseModel):
-                return value.model_dump(mode='json')
-        return value
-
-    def process_result_value(self, value, dialect):
-        if value is None:
-            return None
-        if self.is_list:
-            if isinstance(value, list):
-                return [self.pydantic_model.model_validate(item) for item in value]
-        else:
-            if isinstance(value, dict):
-                return self.pydantic_model.model_validate(value)
-        return value
+# PydanticJSON 已移至 pipeline.models.json_column 以避免循環相依。
+# 此處 re-export 以維持既有 import 路徑。
+__all__ = ["PydanticJSON", "ProductionArtifact"]
 
 
 class ProductionArtifact(SQLModel, table=True):
@@ -104,6 +74,36 @@ class ProductionArtifact(SQLModel, table=True):
         default=None,
         sa_column=Column(PydanticJSON(MetricsDecision))
     )
+    shorts_manifest: ShortsManifest | None = Field(
+        default=None,
+        sa_column=Column(PydanticJSON(ShortsManifest))
+    )
+
+    # Narrative/Shot 層。皆為一次讀寫的 project document，故以 JSON 欄位保存。
+    # 大量累積且需統計的 operational data（AssetVariant / QC / CapabilityJob）
+    # 另存於各自的資料表，不放在此處。
+    production_profile: ProductionProfile | None = Field(
+        default=None,
+        sa_column=Column(PydanticJSON(ProductionProfile))
+    )
+    narrative_ir: NarrativeIR | None = Field(
+        default=None,
+        sa_column=Column(PydanticJSON(NarrativeIR))
+    )
+    character_packs: list[CharacterIdentityPack] = Field(
+        default_factory=list,
+        sa_column=Column(PydanticJSON(CharacterIdentityPack, is_list=True))
+    )
+    shot_plans: list[ShotPlan] = Field(
+        default_factory=list,
+        sa_column=Column(PydanticJSON(ShotPlan, is_list=True))
+    )
+    # 剪輯決策是人工調整的成果，必須持久化而非每次由選定候選重新推導
+    edit_decisions: list[EditDecision] = Field(
+        default_factory=list,
+        sa_column=Column(PydanticJSON(EditDecision, is_list=True))
+    )
+
     review_status: ReviewStatus = ReviewStatus.CUES_READY
 
     preview_mp4: str | None = None

@@ -1,0 +1,86 @@
+# AI 助手的系統知識庫：錯誤與 fail-closed 原因。
+#
+# 每一則說明「發生什麼、為什麼、怎麼修、修完去哪裡繼續」。
+# code 由後端在 blocker 與錯誤頁上帶出，助手據此給出確定的答案，
+# 而不是從錯誤訊息的字面重新猜一次。
+
+errors:
+  - code: asset_not_ready
+    title: 參考素材尚未就緒
+    what: 有素材欄位還沒上傳，或上傳的圖片沒有通過驗證。
+    why: >
+      首幀會實際送到各平台。比例錯誤會讓每個平台各自裁切或補邊，
+      解析度太低則細節不足以判讀身份，兩者都會讓比較結果失去意義。
+      因此素材未就緒時不允許建立正式派工。
+    fix: 到 Step 1 參考素材頁，逐格上傳或更換未通過的圖片。
+    next: /benchmark/assets
+
+  - code: target_provisional
+    title: 比較對象的版本尚未確認
+    what: 有比較對象還標記為 provisional，代表沒有真人在平台上確認過實際版本。
+    why: >
+      同一個平台會同時提供多個版本。若在版本不明的情況下跑完整輪比較，
+      事後無從得知當時用的是哪一版，整輪資料只能作廢重跑。
+    fix: 到 Step 2，填入平台上顯示的版本字串與選項名稱，並勾選確認。
+    next: /benchmark/targets
+
+  - code: target_invalid
+    title: 比較對象未通過 catalog 驗證
+    what: 這個對象指定的 model_id 不存在、不由該平台託管，或不支援所需能力。
+    why: >
+      只在請求上貼標籤而不限制路由，標籤與實際生成的模型可能不同，
+      比較結果就會歸錯對象。因此派工前必須先驗證。
+    fix: 到 Step 2 改選一個該平台實際託管的模型。
+    next: /benchmark/targets
+
+  - code: no_lineage
+    title: 候選沒有派工來源
+    what: 這支影片沒有關聯到任何 CapabilityJob，因此無法歸屬到比較對象。
+    why: >
+      歸屬只認派工血緣。以 shot_id 加平台去猜是不安全的：同一平台可能
+      同時測多個版本，兩個對象的候選會被混為一談。沒有血緣的候選一律
+      排除於 benchmark 之外，而不是猜一個。
+    fix: 從 Job Workbench 對應的派工頁重新匯入這支影片。
+    next: /benchmark/jobs
+
+  - code: attempt_unresolved
+    title: 嘗試紀錄找不到對應的候選
+    what: 某一列成功的嘗試，其產出檔名對不到任何已匯入的影片。
+    why: >
+      對應依據是 target + shot + 平台的產出檔名三者精確相符。
+      刻意不以匯入順序推測：一旦某次生成沒有匯入，後續整批都會錯位，
+      而錯位不會有任何徵兆。
+    fix: 確認嘗試紀錄裡填的是平台下載時的檔名，並確認該影片已經匯入。
+    next: /benchmark/jobs
+
+  - code: pair_mismatch
+    title: 連戲配對不合法
+    what: 這兩支影片不屬於同一個比較對象，或鏡頭與指定的不符。
+    why: >
+      連戲評的是兩支實際影片的關係。跨平台或跨版本的配對，
+      得到的分數無法歸因給任何一個對象，統計就失去意義。
+    fix: 從連戲評分頁選擇同一個比較對象的配對。
+    next: /benchmark/continuity
+
+  - code: job_link_error
+    title: request_hash 對應的派工不符
+    what: 提供的 hash 找不到派工，或該派工的專案、鏡頭、平台與匯入目標不一致。
+    why: >
+      刻意不提供「找不到就退回最近一筆」的行為：那會把貼錯的 hash
+      悄悄接到別的工作上，讓後續統計全部失真。
+    fix: 改從 Job Workbench 的該份派工頁匯入，系統會自動帶入正確的識別。
+    next: /benchmark/jobs
+
+  - code: shot_not_ready
+    title: 鏡頭尚未就緒，無法派工
+    what: 這顆鏡頭缺少首幀或參考素材，完備度檢查沒有通過。
+    why: 缺素材就派工會得到與其他鏡頭不可比的結果。
+    fix: 補齊該鏡頭的參考素材後重新建立派工。
+    next: /benchmark/assets
+
+  - code: assistant_unavailable
+    title: AI 助手暫時無法使用
+    what: 文字模型沒有設定，或呼叫失敗。
+    why: 助手是輔助功能，刻意不影響主流程。
+    fix: 到 LAVA 設定確認文字模型連線。核心 benchmark 流程不受影響，可以繼續操作。
+    next: /settings/lava

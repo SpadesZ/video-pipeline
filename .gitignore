@@ -13,7 +13,21 @@ data/projects/*
 data/assets/*
 data/temp/*
 data/exports/*
+data/lava_settings.json
+# Benchmark 執行時產物：人工準備的參考素材與填寫中的評分表。
+# 素材屬於各自的專案內容，評分表是進行中的工作資料，都不進版控。
+data/benchmark/*
+# 本機 UI 稽核時起服務用的暫存資料庫與素材
+data/audit/*
+data/visual_audit/*
 !data/projects/.gitkeep
 !data/assets/.gitkeep
 !data/temp/.gitkeep
 !data/exports/.gitkeep
+
+# Local SQLite artifacts
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal

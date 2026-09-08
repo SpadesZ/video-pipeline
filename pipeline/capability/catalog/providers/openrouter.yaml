@@ -1,0 +1,24 @@
+# 平台規格：OpenRouter
+# 既有 LLM 路徑，以 OpenAI 相容介面提供文字推理。
+provider_id: openrouter
+label: OpenRouter
+transport: api
+
+supported_capabilities:
+  - text_reasoning
+
+api_key_env: OPENROUTER_API_KEY
+base_url: https://openrouter.ai/api/v1
+
+required_fields:
+  - messages
+
+parameter_mapping:
+  max_tokens: max_tokens
+  temperature: temperature
+
+human_instructions: |
+  以 API 呼叫，無需人工操作。
+
+notes: |
+  2026-09-04 實測回傳 402 Payment Required，帳戶額度已用盡。

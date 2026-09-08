@@ -1,0 +1,41 @@
+# 平台規格：Veo
+# 第一階段以人工操作驗證，不購買 API。
+#
+# 注意：以下數值為保守預設，尚未經實測確認。
+# 必須於 V1 真實測試時校正，校正前不得視為事實。
+provider_id: veo
+label: Veo
+# 人工生成時要開的頁面。僅供真人點擊，不呼叫任何 API。
+console_url: https://labs.google/fx/tools/flow
+transport: manual
+
+supported_capabilities:
+  - video_t2v
+  - video_i2v
+
+duration_limits:
+  min_ms: 4000
+  max_ms: 8000
+
+max_reference_assets: 1
+
+supported_aspect_ratios:
+  - "16:9"
+  - "9:16"
+
+required_fields:
+  - prompt
+
+parameter_mapping:
+  first_frame_ref: image
+  duration_ms: duration_seconds
+  aspect_ratio: aspect_ratio
+
+human_instructions: |
+  1. 於 Veo 介面選擇生成模式。
+  2. 貼上 prompt.txt 的內容。
+  3. 需要首幀時上傳 refs/ 中的圖片。
+  4. 下載產出並記錄實際片長與嘗試次數。
+
+notes: |
+  片長上限待 V1 實測校正。本平台對片長的控制粒度可能與其他平台不同。

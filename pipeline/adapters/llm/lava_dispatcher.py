@@ -1,14 +1,63 @@
-import os
-import asyncio
-import httpx
+# 檔案路徑: video-pipeline/pipeline/adapters/llm/lava_dispatcher.py
+# 產生時間: 2026-09-04 +08:00
+# 版本: v2.0
+# 模組定位:
+#   LAVA 文字任務派送的相容層。
+# 主要責任:
+#   1. 將 task_id 與其 binding 轉換為 CapabilityRequest，交由 Capability Router。
+#   2. 將 CapabilityResult 轉回既有回傳格式，使呼叫端不需修改。
+#   3. re-export chat 低階函式，供 lava_verifier 沿用。
+# 說明:
+#   派送邏輯已移至 pipeline/capability/。原先以 provider 名稱硬編碼的
+#   if-else 分支改為 (capability, provider) 查表，新增能力不必再擴充分支。
+#   本模組維持既有介面：dispatch_llm_task 的參數與回傳鍵值不變，
+#   pipeline/stages/llm_executors.py 的六個任務執行器一行未改。
+# --------------------------------------------------------------------------
+
+from __future__ import annotations
+
 import logging
 
-from pipeline.adapters.llm.lava_settings import binding_for_task, connection_by_id, default_connections
+from pipeline.adapters.llm.lava_settings import binding_for_task, default_connections
 from pipeline.adapters.llm.task_registry import TASK_IDS
+from pipeline.capability.adapters.chat import (  # noqa: F401 - 供 lava_verifier 沿用
+    google_chat,
+    google_chat_with_retry,
+    is_retryable_error,
+    openai_compatible_chat,
+    openai_compatible_chat_with_retry,
+    safe_error,
+)
+from pipeline.capability.base import CapabilityRequest, ChatPayload
+from pipeline.capability.router import dispatch_capability
+from pipeline.models.capability import Capability
 from pipeline.secrets import load_runtime_secrets
 
 logger = logging.getLogger("LAVA_Dispatcher")
 logger.setLevel(logging.INFO)
+
+# 轉接器回報的狀態碼對應至既有 fallback_order 的狀態字串
+_STATUS_ALIASES = {"missing_key": "missing_key", "no_adapter": "inactive"}
+
+
+def _connection_lookup() -> dict[str, str]:
+    """provider -> connection_id。既有 UI 以 connection 為單位呈現。"""
+    return {conn.provider: conn.connection_id for conn in default_connections()}
+
+
+def _legacy_fallback_order(result, providers: dict[str, str]) -> list[dict]:
+    order: list[dict] = []
+    for attempt in result.attempts:
+        connection_id = providers.get(attempt.provider, attempt.provider)
+        status = "attempted"
+        if attempt.error and "未設定" in attempt.error:
+            status = "missing_key"
+        status = _STATUS_ALIASES.get(attempt.status, status)
+        entry = {"connection_id": connection_id, "status": status}
+        if attempt.model_id:
+            entry["model"] = attempt.model_id
+        order.append(entry)
+    return order
 
 
 async def dispatch_llm_task(
@@ -20,224 +69,63 @@ async def dispatch_llm_task(
     load_runtime_secrets()
     if task_id not in TASK_IDS:
         return {"ok": False, "error": f"Unknown video LLM task: {task_id}"}
-    
-    # Get the primary connection bound to this task
+
     binding = binding_for_task(task_id)
-    primary_conn_id = binding.connection_id if binding else None
-    
     connections = default_connections()
-    
-    # Arrange connections to try the primary one first, then fallback to others
-    trial_conns = []
-    if primary_conn_id:
-        primary_conn = next((c for c in connections if c.connection_id == primary_conn_id), None)
-        if primary_conn:
-            trial_conns.append(primary_conn)
-            
-    for c in connections:
-        if c not in trial_conns:
-            trial_conns.append(c)
-            
-    last_error = None
-    for connection in trial_conns:
-        api_key = os.getenv(connection.api_key_env)
-        if not api_key:
-            # Skip if API key is not configured in secrets
-            continue
-            
-        res = {"ok": False}
-        try:
-            if connection.provider == "openrouter":
-                res = await openai_compatible_chat_with_retry(
-                    connection.base_url or "", 
-                    api_key, 
-                    connection.model_id, 
-                    messages, 
-                    temperature, 
-                    max_tokens
-                )
-            elif connection.provider == "google":
-                res = await google_chat_with_retry(
-                    api_key, 
-                    connection.model_id, 
-                    messages, 
-                    temperature, 
-                    max_tokens
-                )
-        except Exception as e:
-            res = {"ok": False, "error": str(e)}
-            
-        if res.get("ok"):
-            if connection.connection_id != primary_conn_id:
-                logger.info(f"Fallback active: Task '{task_id}' fell back from {primary_conn_id} to {connection.connection_id}")
-            return res
-        else:
-            last_error = res.get("error", "Unknown error")
-            logger.warning(f"Connection {connection.connection_id} failed for task '{task_id}': {last_error}")
-            
-    return {"ok": False, "error": f"All LLM connections failed for task '{task_id}'. Last error: {last_error}"}
+    providers = {conn.provider: conn.connection_id for conn in connections}
 
+    primary_connection = None
+    if binding:
+        primary_connection = next(
+            (c for c in connections if c.connection_id == binding.connection_id), None
+        )
+    preferred_provider = primary_connection.provider if primary_connection else None
 
-def is_retryable_error(err_msg: str) -> bool:
-    err_msg_lower = err_msg.lower()
-    return (
-        "429" in err_msg
-        or "408" in err_msg
-        or "502" in err_msg
-        or "503" in err_msg
-        or "504" in err_msg
-        or "too many requests" in err_msg_lower
-        or "timeout" in err_msg_lower
-        or "connection" in err_msg_lower
-        or "connecterror" in err_msg_lower
+    parameters: dict = {}
+    if binding and binding.model_id:
+        parameters["model_id"] = binding.model_id
+
+    request = CapabilityRequest(
+        request_id=f"llm_{task_id}",
+        capability=Capability.TEXT_REASONING,
+        chat=ChatPayload(
+            messages=messages, temperature=temperature, max_tokens=max_tokens
+        ),
+        parameters=parameters,
     )
 
+    result = await dispatch_capability(
+        request, preferred_provider=preferred_provider
+    )
+    fallback_order = _legacy_fallback_order(result, providers)
 
-async def openai_compatible_chat_with_retry(
-    base_url: str,
-    api_key: str,
-    model_id: str,
-    messages: list[dict],
-    temperature: float,
-    max_tokens: int,
-    max_retries: int = 3,
-    initial_delay: float = 2.0,
-) -> dict:
-    delay = initial_delay
-    for attempt in range(max_retries + 1):
-        res = await openai_compatible_chat(base_url, api_key, model_id, messages, temperature, max_tokens)
-        if res.get("ok"):
-            return res
-            
-        err_msg = str(res.get("error", ""))
-        if is_retryable_error(err_msg) and attempt < max_retries:
-            logger.warning(f"OpenRouter rate limit or temporary error. Retrying in {delay}s (attempt {attempt + 1}/{max_retries})...")
-            await asyncio.sleep(delay)
-            delay *= 2.0
-        else:
-            return res
-    return res
-
-
-async def openai_compatible_chat(
-    base_url: str,
-    api_key: str,
-    model_id: str,
-    messages: list[dict],
-    temperature: float,
-    max_tokens: int,
-) -> dict:
-    payload = {"model": model_id, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(f"{base_url.rstrip('/')}/chat/completions", headers=headers, json=payload)
-            response.raise_for_status()
-        data = response.json()
-        if "error" in data:
-            return {"ok": False, "error": f"OpenRouter API error: {data['error']}"}
-        choices = data.get("choices", [])
-        if not choices:
-            return {"ok": False, "error": f"OpenRouter returned no choices. Response: {data}"}
-        message = choices[0].get("message")
-        if not message or "content" not in message:
-            return {"ok": False, "error": f"OpenRouter returned empty message choices. Response: {data}"}
-        content = message["content"]
-        return {"ok": True, "content": content, "provider": "openrouter", "model": model_id}
-    except Exception as error:
-        return {"ok": False, "error": safe_error(error, api_key)}
-
-
-async def google_chat_with_retry(
-    api_key: str,
-    model_id: str,
-    messages: list[dict],
-    temperature: float,
-    max_tokens: int,
-    max_retries: int = 3,
-    initial_delay: float = 2.0,
-) -> dict:
-    delay = initial_delay
-    for attempt in range(max_retries + 1):
-        res = await google_chat(api_key, model_id, messages, temperature, max_tokens)
-        if res.get("ok"):
-            return res
-            
-        err_msg = str(res.get("error", ""))
-        if is_retryable_error(err_msg) and attempt < max_retries:
-            logger.warning(f"Google Gemini rate limit or temporary error. Retrying in {delay}s (attempt {attempt + 1}/{max_retries})...")
-            await asyncio.sleep(delay)
-            delay *= 2.0
-        else:
-            return res
-    return res
-
-
-async def google_chat(
-    api_key: str,
-    model_id: str,
-    messages: list[dict],
-    temperature: float,
-    max_tokens: int,
-) -> dict:
-    system_instruction = None
-    contents = []
-    
-    for message in messages:
-        role = message.get("role")
-        content = message.get("content", "")
-        if role == "system":
-            system_instruction = {"parts": [{"text": content}]}
-        else:
-            g_role = "user" if role == "user" else "model"
-            contents.append({"role": g_role, "parts": [{"text": content}]})
-            
-    # Ensure alternating roles for contents (must start with user)
-    if contents and contents[0]["role"] == "model":
-        contents[0]["role"] = "user"
-        
-    merged_contents = []
-    for msg in contents:
-        if merged_contents and merged_contents[-1]["role"] == msg["role"]:
-            merged_contents[-1]["parts"][0]["text"] += "\n" + msg["parts"][0]["text"]
-        else:
-            merged_contents.append(msg)
-            
-    payload = {
-        "contents": merged_contents,
-        "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": max_tokens
-        }
-    }
-    if system_instruction:
-        payload["systemInstruction"] = system_instruction
-
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}",
-                json=payload,
+    if result.ok:
+        connection_id = providers.get(result.provider, result.provider)
+        if preferred_provider and result.provider != preferred_provider:
+            logger.info(
+                f"Fallback active: Task '{task_id}' fell back from "
+                f"{binding.connection_id if binding else None} to {connection_id}"
             )
-            response.raise_for_status()
-        data = response.json()
-        candidates = data.get("candidates", [])
-        if not candidates:
-            return {"ok": False, "error": f"Google Gemini returned no candidates. Response: {data}"}
-        candidate = candidates[0]
-        content_obj = candidate.get("content")
-        if not content_obj:
-            finish_reason = candidate.get("finishReason", "UNKNOWN")
-            return {"ok": False, "error": f"Google Gemini response has no content. Finish reason: {finish_reason}"}
-        parts = content_obj.get("parts", [])
-        content = "\n".join(str(part.get("text", "")) for part in parts if part.get("text")).strip()
-        return {"ok": True, "content": content, "provider": "google", "model": model_id}
-    except Exception as error:
-        return {"ok": False, "error": safe_error(error, api_key)}
+        return {
+            "ok": True,
+            "content": result.content,
+            "provider": result.provider,
+            "model": result.model_id,
+            "connection_id": connection_id,
+            "fallback_order": fallback_order,
+        }
 
+    last_error = result.error_message or "Unknown error"
+    for attempt in reversed(result.attempts):
+        if attempt.error:
+            last_error = attempt.error
+            break
 
-def safe_error(error: Exception, api_key: str | None) -> str:
-    message = str(error)
-    if api_key:
-        message = message.replace(api_key, "[REDACTED_API_KEY]")
-    return message[:500]
+    return {
+        "ok": False,
+        "error": (
+            f"All LLM connections failed for task '{task_id}'. "
+            f"Last error: {last_error}"
+        ),
+        "fallback_order": fallback_order,
+    }

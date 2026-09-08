@@ -89,6 +89,7 @@ async def run_mvp_pipeline(
     write_json(project_dir / "visual_contract.json", artifact.visual_contract)
     write_json(project_dir / "visual_qc_report.json", artifact.visual_qc_report)
     write_json(project_dir / "compliance_report.json", artifact.compliance_report)
+    write_json(project_dir / "production_artifact.json", artifact)
 
     if session:
         session.add(artifact)

@@ -1,0 +1,97 @@
+# 檔案路徑: video-pipeline/.github/workflows/pr.yml
+# 產生時間: 2026-09-04 +08:00
+# 版本: v1.0
+# 模組定位:
+#   PR 快速回饋 CI。
+# 主要責任:
+#   1. 以 native Python 執行單元測試、schema 檢查與輕量確定性冒煙。
+#   2. 刻意不啟動 Docker，避免每次小改動都重建 ASR / FFmpeg / Postgres 映像。
+# 說明:
+#   需要 Docker 的完整整合測試由 integration.yml 負責。
+# --------------------------------------------------------------------------
+
+name: PR
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    name: Unit + schema + fast smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # 組裝與規格探測需要 ffmpeg/ffprobe。不依賴 runner 預裝。
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Compile check
+        run: python -m compileall -q apps pipeline scripts
+
+      - name: Unit tests
+        run: python -m pytest tests/ -q
+
+      - name: Migration smoke
+        run: python scripts/smoke_migrations.py
+
+      - name: Narrative models smoke
+        run: python scripts/smoke_narrative_models.py
+
+      - name: Capability router smoke (no API keys)
+        run: python scripts/smoke_capability_router.py
+
+      - name: Manual provider smoke (no API keys)
+        run: python scripts/smoke_manual_provider.py
+
+      - name: Variant import and QC smoke
+        run: python scripts/smoke_variant_qc.py
+
+      # 無 ffmpeg 時組裝會輸出清單檔，測試仍須通過
+      - name: Shot assembly smoke
+        run: python scripts/smoke_shot_assembly.py
+
+      - name: Benchmark pack smoke
+        run: python scripts/smoke_benchmark_v1.py
+
+      # 走完整 HTTP 路由，包含 AI 助手。助手以 mock adapter 驗證契約，
+      # 不需要金鑰，也不會呼叫真實 LLM。
+      - name: Benchmark web and assistant smoke (no API keys)
+        run: python scripts/smoke_benchmark_web_v1c.py
+
+      # 同一個 target 換版本後，兩輪資料不得互相污染
+      - name: Benchmark version drift smoke
+        run: python scripts/smoke_benchmark_version_drift.py
+
+      # 舊代表作與舊連戲評分不得進入目前這一輪
+      - name: Benchmark continuity identity smoke
+        run: python scripts/smoke_benchmark_continuity_identity.py
+
+      # 此腳本自行覆寫 DATA_DIR 與清空金鑰，不需外部環境變數
+      - name: LAVA settings smoke (no API keys)
+        run: python scripts/smoke_lava_settings.py
+
+      - name: Schema upgrade and check
+        env:
+          DATABASE_URL: sqlite:///${{ runner.temp }}/ci_schema.db
+        run: |
+          python scripts/migrate.py upgrade
+          python scripts/migrate.py check

@@ -23,3 +23,6 @@ celery_client = Celery(
 def enqueue_preview_job(project_id: str):
     return celery_client.send_task("video_pipeline.preview_project", args=[project_id])
 
+
+def enqueue_asr_job(project_id: str):
+    return celery_client.send_task("video_pipeline.run_asr_job", args=[project_id], queue="asr")

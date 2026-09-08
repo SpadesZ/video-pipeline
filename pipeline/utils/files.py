@@ -26,7 +26,7 @@ def ensure_project_dir(data_dir: Path, project_id: str) -> Path:
     return project_dir
 
 
-def write_json(path: Path, model: BaseModel | dict) -> None:
+def write_json(path: Path, model: BaseModel | dict | list) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if isinstance(model, BaseModel):
         payload = model.model_dump(mode="json")

@@ -1,0 +1,4 @@
+# 開發與 CI 專用依賴。執行期映像不安裝這些套件。
+# 安裝: pip install -r requirements.txt -r requirements-dev.txt
+
+pytest>=8.0,<9.0

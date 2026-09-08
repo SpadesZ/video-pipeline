@@ -1,0 +1,52 @@
+# V1 Benchmark 比較對象
+#
+# 只比較 provider 不足以支撐結論：同一平台同時提供多個版本，
+# 介面上的選項名稱也未必等同 catalog 的 model_id。
+#
+# 目前所有 model_id 都是通稱，model_version 尚未確認，
+# 因此 provisional 一律為 true。
+#
+# 真人登入平台後請更新：
+#   1. model_version 填入平台顯示的實際版本字串
+#   2. ui_label 填入介面上該選項的名稱
+#   3. 確認無誤後將 provisional 改為 false
+#
+# provisional 為 true 的 target 仍可生成與評分，
+# 但在跨輪次比較時必須視為「版本不明」。
+
+targets:
+  - target_id: kling_default
+    provider: kling
+    model_id: kling-video
+    model_version: null
+    ui_label: ""
+    transport: manual
+    provisional: true
+    notes: 版本待真人於平台確認。若平台提供多個版本，需為每個版本各建一個 target。
+
+  - target_id: seedance_default
+    provider: seedance
+    model_id: seedance-video
+    model_version: null
+    ui_label: ""
+    transport: manual
+    provisional: true
+    notes: 版本待真人於平台確認。
+
+  - target_id: veo_default
+    provider: veo
+    model_id: veo-video
+    model_version: null
+    ui_label: ""
+    transport: manual
+    provisional: true
+    notes: 版本待真人於平台確認。
+
+  - target_id: runway_default
+    provider: runway
+    model_id: runway-gen3
+    model_version: null
+    ui_label: ""
+    transport: manual
+    provisional: true
+    notes: model_id 為通稱，實際版本待真人於平台確認。
