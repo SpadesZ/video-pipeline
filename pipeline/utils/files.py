@@ -36,5 +36,6 @@ def write_json(path: Path, model: BaseModel | dict) -> None:
 
 
 def read_json_model(path: Path, model_type: type[ModelT]) -> ModelT:
-    return model_type.model_validate_json(path.read_text(encoding="utf-8"))
+    # SQLModel table 的 JSON 入口會保留巢狀 dict；走 model_validate 才重建型別並驗證。
+    return model_type.model_validate(json.loads(path.read_text(encoding="utf-8")))
 

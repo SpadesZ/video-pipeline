@@ -1,4 +1,37 @@
-# Video Pipeline MVP
+# Video Pipeline
+
+A local prototype that turns a reviewed script into timed cues, subtitles, a preview, and an upload package.
+It helps an editor inspect each step before approving media and publishing it.
+
+![Local project review and placeholder preview](docs/assets/project-preview.png)
+
+*Real English console with a local sample script and a two-segment SRT import. Preview frames are placeholders, media rights are not approved, and Upload Ready is No. No provider key or finished video is shown.*
+
+Script → cues and asset list → preview and review → upload instructions.
+The package is a file for review; it does not upload or publish a video. This remains a prototype, with separate file-based web review and database-backed API paths.
+
+[Run locally](#run-locally) · [Review flow](#review-flow) · [Transcript import](#external-asr-import)
+
+## Run locally
+
+Use Docker Compose with ports 5432, 6379, and 8010 free. For the offline demo, keep provider keys empty and do not add a secrets file.
+
+```powershell
+Copy-Item .env.example .env
+docker compose up -d --build
+docker compose run --rm api python scripts/smoke_test.py
+docker compose run --rm api python scripts/check_json_roundtrip.py
+```
+
+Open `http://localhost:8010/` and submit a short sample script. The console saves project files under `data/projects/<project_id>/`. Imported SRT, VTT, JSON, or text can replace rough script timing. Without supplied media, the MP4 uses placeholder frames.
+
+**Verified:** a fresh API image build, smoke artifacts, API project create/read through PostgreSQL, web project creation, SRT import with two segments, a real placeholder MP4, and browser rendering. The project JSON check verifies nested types and rejects invalid nested data. Worker dependencies used an existing image; asynchronous provider tasks, real ASR, licensed media, and publishing were not checked.
+
+## Technical details
+
+The original scope and operating notes follow, with completed import work and partial database support corrected.
+
+### MVP scope
 
 CPU-first Docker scaffold for a semi-automated video production pipeline.
 
@@ -9,7 +42,7 @@ approved script + optional voice/transcript
   -> cue_ledger.json
   -> asset_manifest.json
   -> subtitles.srt
-  -> preview manifest / preview.mp4 when ffmpeg inputs exist
+  -> placeholder preview.mp4 when FFmpeg is available
   -> upload_package.md
 ```
 
@@ -24,7 +57,7 @@ WhisperX/CUDA can be added later behind the same adapter interface.
 - `api`: FastAPI control plane.
 - `worker`: Celery worker for long-running pipeline jobs.
 - `redis`: Celery broker and result backend.
-- `postgres`: durable project/review state, planned for Phase 2.
+- `postgres`: SQLModel project persistence is used by the JSON API and smoke job. Web-console review state still uses project JSON files; a shared review store is not complete.
 
 ## Quick Start
 
@@ -75,8 +108,6 @@ Outputs land under:
 data/projects/<project_id>/
 ```
 
-## Next Build Steps
-
 ## Review Flow
 
 Projects move through:
@@ -104,8 +135,8 @@ returns review status to `cues_ready`.
 
 ## Next Build Steps
 
-1. Add transcript/SRT import so cue timing can come from real ASR output.
+1. SRT/VTT/JSON/text import is implemented. Improve import validation and source traceability; imported timing is not proof of local ASR accuracy.
 2. Replace rough cue timing with CPU-friendly faster-whisper output.
-3. Persist project state in Postgres instead of JSON files only.
+3. Unify web-console review state with API database persistence; the current paths use different stores.
 4. Add YouTube analytics CSV import for 24h, 7d, and 28d decisions.
 5. Add optional GPU/WhisperX profile only after the CPU workflow is stable.
