@@ -1,7 +1,12 @@
 # Video Pipeline
 
-A local prototype that turns a reviewed script into timed cues, subtitles, a preview, and an upload package.
-It helps an editor inspect each step before approving media and publishing it.
+Build review files from a script or an imported transcript.
+
+**Script/transcript → cue ledger → asset manifest → subtitles/preview → review → upload package.**
+
+This is a local prototype. Without supplied media, the preview uses placeholder
+frames. The package contains upload instructions; it does not upload or
+publish to YouTube.
 
 [Run locally](#run-locally) · [Review flow](#review-flow) · [Transcript import](#external-asr-import)
 
@@ -11,8 +16,11 @@ It helps an editor inspect each step before approving media and publishing it.
 
 In this sample, **00:00–00:02** contains “Imported local transcript example.” The next cue, **00:02–00:04**, contains “Placeholder preview, not a finished video.” These timings are written to `subtitles.srt` and `cue_ledger.json`.
 
-Script → cues and asset list → preview and review → upload instructions.
-The package is a file for review; it does not upload or publish a video. This remains a prototype, with separate file-based web review and database-backed API paths.
+The inspectable outputs are `cue_ledger.json`, `asset_manifest.json`,
+`subtitles.srt`, `preview.mp4` and `upload_package.md`. Review status and asset
+rights are separate gates; an existing package file does not mean upload
+approval. Web review uses JSON files, while the project API uses PostgreSQL;
+these paths do not yet share one review store.
 
 ## Run locally
 
@@ -31,7 +39,29 @@ Open `http://localhost:8010/` and submit a short sample script. The console save
 
 ## Verification scope
 
-**Verified:** a fresh API image build, smoke artifacts, API project create/read through PostgreSQL, web project creation, SRT import with two segments, a real placeholder MP4, and browser rendering. The project JSON check verifies nested types and rejects invalid nested data. Worker dependencies used an existing image; asynchronous provider tasks, real ASR, licensed media, and publishing were not checked.
+**2026-10-02 final batch:** reused the existing isolated API image with this
+checkout mounted; no fresh build was run. Smoke artifacts, API create/read
+through PostgreSQL, web project creation, two-segment SRT import and JSON
+nested-type/invalid-data checks passed. FFprobe confirmed a 4.04-second H.264
+placeholder preview at 1280×720; this is file/render verification, not final
+video-quality acceptance. The real Cue Ledger was recaptured.
+
+The worker stayed stopped. No asynchronous provider task, local ASR accuracy,
+licensed-media quality, upload or publishing was tested. SRT/VTT/JSON/text
+import exists in code; this review exercised SRT only. API and web persistence
+were checked as separate paths, not as a unified review system.
+
+<details>
+<summary>Earlier presentation-check record</summary>
+
+The earlier check recorded a fresh API image build, smoke artifacts, API
+project create/read through PostgreSQL, web project creation, two-segment SRT
+import, a placeholder MP4 and browser rendering. JSON checks verified nested
+types and rejected invalid nested data. Worker dependencies used an existing
+image; asynchronous provider tasks, real ASR, licensed media and publishing
+were not checked. This is the earlier record, not a new build in the final batch.
+
+</details>
 
 ## Technical details
 
